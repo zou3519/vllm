@@ -128,7 +128,7 @@ class Qwen2_5_VLVideoPixelInputs(TypedDict):
 
     second_per_grid_ts: torch.Tensor
     """
-    The video time interval (in seconds) for each grid along the temporal 
+    The video time interval (in seconds) for each grid along the temporal
     dimension in the 3D position IDs. Returned when `videos` is not `None`.
     """
 
@@ -725,7 +725,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 max_seqlen_now = max_seqlen_window
                 seqlens_now = seqlens_window
 
-            hidden_states = blk(
+            # TODO(rzou): this should really use support_torch_compile to
+            # integrate
+            # with vllm-compile but I'm just looking at what the potential
+            # speedups are like right now.
+            fn = torch.compile(blk, fullgraph=True)
+            # fn = blk
+            hidden_states = fn(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
                 rotary_pos_emb=rotary_pos_emb,

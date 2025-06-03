@@ -1306,6 +1306,14 @@ def main(args):
         req_data.lora_requests * args.num_prompts if req_data.lora_requests else None
     )
 
+    # Warm start: don't measure torch.compile time
+    outputs = llm.generate(
+        inputs,
+        sampling_params=sampling_params,
+        lora_request=lora_request,
+    )
+
+    # These numbers are now more accurate
     with time_counter(args.time_generate):
         outputs = llm.generate(
             inputs,
