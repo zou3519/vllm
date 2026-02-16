@@ -572,7 +572,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
 
         gm = getattr(self.module, target)
         outputs = gm.graph.output_node().args[0]
-        output = fx.map_arg(outputs, lambda node: node.meta["example_value"])
+        output = fx.map_arg(
+            outputs,
+            lambda node: node.meta.get("example_value", node.meta.get("val")),
+        )
 
         if target in self.compile_submod_names:
             index = self.compile_submod_names.index(target)
@@ -581,6 +584,24 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             sym_shape_indices = [
                 i for i, x in enumerate(args) if isinstance(x, torch.SymInt)
             ]
+
+            # If no SymInt args, detect which tensor arg has a symbolic
+            # dimension (make_fx graphs compute sym sizes internally
+            # via aten.sym_size.int rather than passing them as args).
+            sym_shape_tensor_info: tuple[int, int] | None = None
+            if not sym_shape_indices:
+                from torch.fx.experimental.symbolic_shapes import (
+                    free_symbols,
+                )
+
+                for i, x in enumerate(args):
+                    if isinstance(x, torch.Tensor) and hasattr(x, "shape"):
+                        for d, s in enumerate(x.shape):
+                            if free_symbols(s):
+                                sym_shape_tensor_info = (i, d)
+                                break
+                    if sym_shape_tensor_info is not None:
+                        break
 
             # Lazy import here to avoid circular import
             from torch._inductor.compile_fx import graph_returns_tuple
@@ -596,6 +617,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                 self.vllm_backend,
                 graph_returns_tuple(submod),
                 submod_name=target,
+                sym_shape_tensor_info=sym_shape_tensor_info,
             )
 
             self.module.__dict__[target] = wrap_with_cudagraph_if_needed(
@@ -989,8 +1011,15 @@ class VllmBackend:
         # called once
         assert not self._called, "VllmBackend can only be called once"
 
+        _t0 = time.time()
+
+        _t1 = time.time()
         self.graph = graph
+        _t_graph_assign = time.time() - _t1
+
+        _t1 = time.time()
         self.configure_post_pass()
+        _t_configure = time.time() - _t1
 
         if self.compilation_config.use_inductor_graph_partition:
             # Let Inductor decide partitioning; avoid FX-level pre-splitting.
@@ -998,18 +1027,23 @@ class VllmBackend:
         else:
             fx_split_ops = self.compilation_config.splitting_ops or []
 
+        _t1 = time.time()
         self.split_gm, self.piecewise_graphs = split_graph(graph, fx_split_ops)
+        _t_split = time.time() - _t1
 
         # keep a split_gm copy from BEFORE the interpreter replaces
         # submodules with PiecewiseBackend -- used for serialization
+        _t1 = time.time()
         original_split_gm = None
         if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
             original_split_gm = deepcopy(self.split_gm)
+        _t_deepcopy = time.time() - _t1
 
         from torch._dynamo.utils import lazy_format_graph_code
 
         # depyf will hook lazy_format_graph_code and dump the graph
         # for debugging, no need to print the graph here
+        _t1 = time.time()
         lazy_format_graph_code("before split", self.graph)
         lazy_format_graph_code("after split", self.split_gm)
 
@@ -1019,6 +1053,7 @@ class VllmBackend:
             metadata_fn=lambda: {"name": "vllm_piecewise_split_graph"},
             payload_fn=lambda: self.split_gm.print_readable(print_output=False),
         )
+        _t_logging = time.time() - _t1
 
         compilation_counter.num_piecewise_graphs_seen += len(self.piecewise_graphs)
         submod_names_to_compile = [
@@ -1028,20 +1063,29 @@ class VllmBackend:
         ]
 
         # Extract fake values from the graph to use them when needed.
+        _t1 = time.time()
         all_fake_values = []
         for i in graph.graph.find_nodes(op="placeholder"):
-            all_fake_values.append(i.meta["example_value"])
+            if "example_value" in i.meta:
+                all_fake_values.append(i.meta["example_value"])
+            elif "val" in i.meta:
+                all_fake_values.append(i.meta["val"])
+            else:
+                all_fake_values.append(None)
 
         fake_args = [
             all_fake_values[i] if isinstance(t, torch.Tensor) else t
             for i, t in enumerate(example_inputs)
         ]
+        _t_fake_extract = time.time() - _t1
 
+        _t2 = time.time()
         # propagate the split graph to the piecewise backend,
         # compile submodules with symbolic shapes
         PiecewiseCompileInterpreter(
             self.split_gm, submod_names_to_compile, self.vllm_config, self
         ).run(*fake_args)
+        _t_interpreter = time.time() - _t2
 
         from torch._guards import detect_fake_mode
 
@@ -1066,6 +1110,7 @@ class VllmBackend:
                 if r.lower == 2:
                     fake_mode.shape_env.var_to_range[s] = ValueRanges(0, r.upper)
 
+        _t1 = time.time()
         graph_path = os.path.join(local_cache_dir, "computation_graph.py")
         if not os.path.exists(graph_path):
             # code adapted from
@@ -1081,6 +1126,25 @@ class VllmBackend:
 
             logger.debug_once(
                 "Computation graph saved to %s", graph_path, scope="local"
+            )
+        _t_graph_save = time.time() - _t1
+
+        _t_total = time.time() - _t0
+        with open("/tmp/nonstrict_compile_timing.log", "a") as _f:
+            _f.write(
+                f"VllmBackend.__call__ breakdown "
+                f"(total={_t_total:.3f}s):\n"
+                f"  graph assignment: {_t_graph_assign:.3f}s\n"
+                f"  configure_post_pass: {_t_configure:.3f}s\n"
+                f"  split_graph: {_t_split:.3f}s\n"
+                f"  deepcopy: {_t_deepcopy:.3f}s\n"
+                f"  lazy_format + trace_structured: "
+                f"{_t_logging:.3f}s\n"
+                f"  fake value extraction: "
+                f"{_t_fake_extract:.3f}s\n"
+                f"  PiecewiseCompileInterpreter: "
+                f"{_t_interpreter:.3f}s\n"
+                f"  graph save to file: {_t_graph_save:.3f}s\n"
             )
 
         self._called = True

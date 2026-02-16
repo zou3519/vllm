@@ -107,29 +107,45 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
         VllmInductorPass.dump_prefix = None  # Cleanup index
 
     def configure(self, config: VllmConfig) -> None:
+        import time as _time
+
+        _t0 = _time.time()
+        _pass_times: list[tuple[str, float]] = []
         self.pass_config = config.compilation_config.pass_config
 
         # Set the current vllm config to allow tracing CustomOp instances
         with set_current_vllm_config(config, check_compile=False):
             if self.pass_config.eliminate_noops:
+                _t = _time.time()
                 self.passes += [NoOpEliminationPass(config)]
+                _pass_times.append(("NoOpEliminationPass", _time.time() - _t))
 
             if self.pass_config.enable_sp:
+                _t = _time.time()
                 self.passes += [SequenceParallelismPass(config)]
+                _pass_times.append(("SequenceParallelismPass", _time.time() - _t))
                 if self.pass_config.fuse_gemm_comms:
+                    _t = _time.time()
                     self.passes += [AsyncTPPass(config)]
+                    _pass_times.append(("AsyncTPPass", _time.time() - _t))
 
             if self.pass_config.fuse_allreduce_rms:
+                _t = _time.time()
                 self.passes += [AllReduceFusionPass(config)]
+                _pass_times.append(("AllReduceFusionPass", _time.time() - _t))
 
             if self.pass_config.fuse_norm_quant:
+                _t = _time.time()
                 self.passes += [RMSNormQuantFusionPass(config)]
+                _pass_times.append(("RMSNormQuantFusionPass", _time.time() - _t))
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [
                         RocmAiterRMSNormQuantFusionPass(config),
                     ]
             if self.pass_config.fuse_act_quant:
+                _t = _time.time()
                 self.passes += [ActivationQuantFusionPass(config)]
+                _pass_times.append(("ActivationQuantFusionPass", _time.time() - _t))
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
 
@@ -137,15 +153,34 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
             if self.pass_config.fuse_attn_quant:
+                _t = _time.time()
                 self.passes += [AttnFusionPass(config)]
+                _pass_times.append(("AttnFusionPass", _time.time() - _t))
 
             if self.pass_config.enable_qk_norm_rope_fusion:
+                _t = _time.time()
                 self.passes += [SplitCoalescingPass(config)]
+                _pass_times.append(("SplitCoalescingPass", _time.time() - _t))
+                _t = _time.time()
                 self.passes += [QKNormRoPEFusionPass(config)]
+                _pass_times.append(("QKNormRoPEFusionPass", _time.time() - _t))
 
             # needs a functional graph
+            _t = _time.time()
             self.post_cleanup = PostCleanupPass(config)
+            _pass_times.append(("PostCleanupPass", _time.time() - _t))
+            _t = _time.time()
             self.fix_functionalization = FixFunctionalizationPass(config)
+            _pass_times.append(("FixFunctionalizationPass", _time.time() - _t))
+
+        _t_total = _time.time() - _t0
+        with open("/tmp/nonstrict_compile_timing.log", "a") as _f:
+            _f.write(
+                f"  PassManager.configure: {_t_total:.3f}s "
+                f"({len(self.passes)} passes)\n"
+            )
+            for name, dur in _pass_times:
+                _f.write(f"    {name}: {dur:.3f}s\n")
 
     def add(self, pass_: InductorPass) -> None:
         assert isinstance(pass_, InductorPass)

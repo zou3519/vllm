@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import os
 import sys
 from abc import abstractmethod
@@ -131,70 +132,86 @@ class TorchCompileWithNoGuardsWrapper:
             raise RuntimeError("Compilation mode cannot be NO_COMPILATION")
 
         backend = vllm_config.compilation_config.init_backend(vllm_config)
-        options = {}
-
-        if isinstance(backend, str) and backend == "inductor":
-            options = vllm_config.compilation_config.inductor_compile_config
 
         self.first_compile = True
         self.evaluate_guards = (
             vllm_config.compilation_config.dynamic_shapes_config.evaluate_guards
         )
 
-        ds_type = vllm_config.compilation_config.dynamic_shapes_config.type
+        use_nonstrict = os.environ.get("VLLM_USE_NONSTRICT_COMPILE", "1") == "1"
 
-        if mode != CompilationMode.STOCK_TORCH_COMPILE:
-            # Drop all the guards.
-            if self.evaluate_guards:
+        if use_nonstrict:
+            self._forward_sig = inspect.signature(self.forward)
+            self._use_nonstrict = True
+
+            from nonstrict_compile import nonstrict_compile
+
+            if isinstance(backend, str) and backend == "eager":
+                ns_backend = lambda gm, example_inputs: gm  # noqa: E731
+            elif isinstance(backend, str):
+                ns_backend = None  # defaults to compile_fx (inductor)
+            else:
+                ns_backend = backend  # use vLLM's custom backend
+
+            self._compiled_callable = nonstrict_compile(self, backend=ns_backend)
+        else:
+            self._use_nonstrict = False
+            options = {}
+
+            if isinstance(backend, str) and backend == "inductor":
+                options = vllm_config.compilation_config.inductor_compile_config
+
+            ds_type = vllm_config.compilation_config.dynamic_shapes_config.type
+
+            if mode != CompilationMode.STOCK_TORCH_COMPILE:
+                if self.evaluate_guards:
+                    assert not envs.VLLM_USE_BYTECODE_HOOK, (
+                        "compilation_config.dynamic_shapes_config"
+                        ".evaluate_guards requires "
+                        "VLLM_USE_BYTECODE_HOOK=0. "
+                    )
+                    options["guard_filter_fn"] = lambda x: [
+                        entry.guard_type == "SHAPE_ENV" for entry in x
+                    ]
+                else:
+                    options["guard_filter_fn"] = lambda x: [False for _ in x]
+
+            compiled_ptr: Any = self.forward
+
+            if ds_type == DynamicShapesType.UNBACKED:
                 assert not envs.VLLM_USE_BYTECODE_HOOK, (
-                    "compilation_config.dynamic_shapes_config.evaluate_guards "
-                    "requires VLLM_USE_BYTECODE_HOOK=0. "
+                    "UNBACKED dynamic shapes requires VLLM_USE_BYTECODE_HOOK=0. "
+                )
+                assert not self.evaluate_guards, (
+                    "UNBACKED dynamic shapes do not add guards"
+                )
+                compiled_ptr = self.check_invariants_and_forward
+
+            aot_context = nullcontext()
+            if envs.VLLM_USE_AOT_COMPILE:
+                if hasattr(torch._dynamo.config, "enable_aot_compile"):
+                    aot_context = torch._dynamo.config.patch(enable_aot_compile=True)
+                else:
+                    logger.warning(
+                        "torch._dynamo.config.enable_aot_compile "
+                        "is not available. AOT compile is disabled."
+                    )
+
+            with aot_context:
+                self._compiled_callable = torch.compile(
+                    compiled_ptr,
+                    fullgraph=True,
+                    dynamic=False,
+                    backend=backend,
+                    options=options,
                 )
 
-                options["guard_filter_fn"] = lambda x: [
-                    entry.guard_type == "SHAPE_ENV" for entry in x
-                ]
-            else:
-                options["guard_filter_fn"] = lambda x: [False for _ in x]
-
-        compiled_ptr: Any = self.forward
-        # Validate that unbacked dynamic shapes require VLLM_USE_BYTECODE_HOOK=False
-
-        if ds_type == DynamicShapesType.UNBACKED:
-            # reason is that bytecode does torch._dynamo.eval_frame.
-            # remove_from_cache(self.original_code_object()) to force a new
-            # re-compilation. And if we use
-            # compiled_ptr = self.check_invariants_and_forward
-            # it will reset all entries.
-            assert not envs.VLLM_USE_BYTECODE_HOOK, (
-                "UNBACKED dynamic shapes requires VLLM_USE_BYTECODE_HOOK=0. "
-            )
-            assert not self.evaluate_guards, "UNBACKED dynamic shapes do not add guards"
-
-            compiled_ptr = self.check_invariants_and_forward
-
-        aot_context = nullcontext()
-        if envs.VLLM_USE_AOT_COMPILE:
-            if hasattr(torch._dynamo.config, "enable_aot_compile"):
-                aot_context = torch._dynamo.config.patch(enable_aot_compile=True)
-            else:
-                msg = "torch._dynamo.config.enable_aot_compile is not "
-                msg += "available. AOT compile is disabled and please "
-                msg += "upgrade PyTorch version to use AOT compile."
-                logger.warning(msg)
-
-        with aot_context:
-            self._compiled_callable = torch.compile(
-                compiled_ptr,
-                fullgraph=True,
-                dynamic=False,
-                backend=backend,
-                options=options,
-            )
-
-        if envs.VLLM_USE_BYTECODE_HOOK and mode != CompilationMode.STOCK_TORCH_COMPILE:
-            torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
-            self._compiled_bytecode: CodeType | None = None
+            if (
+                envs.VLLM_USE_BYTECODE_HOOK
+                and mode != CompilationMode.STOCK_TORCH_COMPILE
+            ):
+                torch._dynamo.convert_frame.register_bytecode_hook(self.bytecode_hook)
+                self._compiled_bytecode: CodeType | None = None
 
     def aot_compile(self, *args: Any, **kwargs: Any) -> Any:
         if not hasattr(self._compiled_callable, "aot_compile"):
@@ -206,36 +223,44 @@ class TorchCompileWithNoGuardsWrapper:
         return self._compiled_callable.aot_compile((args, kwargs))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if envs.VLLM_USE_BYTECODE_HOOK:
-            if (
-                self.vllm_config.compilation_config.mode
-                == CompilationMode.STOCK_TORCH_COMPILE
-            ):
-                return self._compiled_callable(*args, **kwargs)
-
-            if not self._compiled_bytecode:
-                # Make sure a compilation is triggered by clearing dynamo
-                # cache.
-                torch._dynamo.eval_frame.remove_from_cache(self.original_code_object())
-                return self._call_with_optional_nvtx_range(
-                    self._compiled_callable, *args, **kwargs
-                )
-            else:
-                with self._dispatch_to_compiled_code():
-                    return self._call_with_optional_nvtx_range(
-                        self.forward, *args, **kwargs
-                    )
+        if self._use_nonstrict:
+            if kwargs:
+                bound = self._forward_sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                args = tuple(bound.arguments.values())
+                kwargs = {}
+            return self._call_with_optional_nvtx_range(self._compiled_callable, *args)
         else:
-            ctx = (
-                nullcontext()
-                if self.first_compile or not self.evaluate_guards
-                else torch.compiler.set_stance("fail_on_recompile")
-            )
-            self.first_compile = False
-            with _compilation_context(), ctx:
-                return self._call_with_optional_nvtx_range(
-                    self._compiled_callable, *args, **kwargs
+            if envs.VLLM_USE_BYTECODE_HOOK:
+                if (
+                    self.vllm_config.compilation_config.mode
+                    == CompilationMode.STOCK_TORCH_COMPILE
+                ):
+                    return self._compiled_callable(*args, **kwargs)
+
+                if not self._compiled_bytecode:
+                    torch._dynamo.eval_frame.remove_from_cache(
+                        self.original_code_object()
+                    )
+                    return self._call_with_optional_nvtx_range(
+                        self._compiled_callable, *args, **kwargs
+                    )
+                else:
+                    with self._dispatch_to_compiled_code():
+                        return self._call_with_optional_nvtx_range(
+                            self.forward, *args, **kwargs
+                        )
+            else:
+                ctx = (
+                    nullcontext()
+                    if self.first_compile or not self.evaluate_guards
+                    else torch.compiler.set_stance("fail_on_recompile")
                 )
+                self.first_compile = False
+                with _compilation_context(), ctx:
+                    return self._call_with_optional_nvtx_range(
+                        self._compiled_callable, *args, **kwargs
+                    )
 
     @abstractmethod
     def forward(self, *args: Any, **kwargs: Any) -> Any: ...

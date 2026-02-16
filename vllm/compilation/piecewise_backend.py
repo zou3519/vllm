@@ -42,6 +42,7 @@ class PiecewiseBackend:
         returns_tuple: bool,
         compiled_runnables: dict[str, Callable[..., Any]] | None = None,
         submod_name: str = "",
+        sym_shape_tensor_info: tuple[int, int] | None = None,
     ):
         """
         The backend for piecewise compilation.
@@ -103,6 +104,7 @@ class PiecewiseBackend:
         logger.debug_once(log_string)
 
         self.sym_shape_indices = sym_shape_indices
+        self.sym_shape_tensor_info = sym_shape_tensor_info
         self.returns_tuple = returns_tuple
 
         # the entries for ranges that we need to either
@@ -322,7 +324,16 @@ class PiecewiseBackend:
         return None
 
     def __call__(self, *args: Any) -> Any:
-        runtime_shape = args[self.sym_shape_indices[0]]
+        if self.sym_shape_indices:
+            runtime_shape = args[self.sym_shape_indices[0]]
+        elif self.sym_shape_tensor_info is not None:
+            tensor_idx, dim = self.sym_shape_tensor_info
+            runtime_shape = args[tensor_idx].shape[dim]
+        else:
+            raise RuntimeError(
+                "PiecewiseBackend: cannot determine runtime shape — "
+                "no SymInt args and no sym_shape_tensor_info"
+            )
         range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (
