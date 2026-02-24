@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
+os.environ.setdefault("VLLM_USE_NONSTRICT_COMPILE", "1")
+
 from vllm import LLM, SamplingParams
 
 if __name__ == "__main__":

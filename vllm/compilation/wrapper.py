@@ -153,7 +153,9 @@ class TorchCompileWithNoGuardsWrapper:
             else:
                 ns_backend = backend  # use vLLM's custom backend
 
-            self._compiled_callable = nonstrict_compile(self, backend=ns_backend)
+            self._compiled_callable = nonstrict_compile(
+                self, backend=ns_backend, cache=False
+            )
         else:
             self._use_nonstrict = False
             options = {}

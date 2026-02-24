@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from nonstrict_compile import trace_region
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -312,6 +313,7 @@ class LlamaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    @trace_region
     def forward(
         self,
         positions: torch.Tensor,

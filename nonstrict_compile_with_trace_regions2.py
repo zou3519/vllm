@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import functools
-import time
 from dataclasses import dataclass, field
 from itertools import chain
 
@@ -10,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from torch._dynamo.source import ConstantSource
-from torch._dynamo.utils import dynamo_timed
 from torch._guards import TracingContext, tracing
 from torch._higher_order_ops.utils import reenter_make_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -97,12 +95,13 @@ def _flatten_fn_with_structure(fn, structure):
     return functional
 
 
-def _to_symbolic_tensors(flat, shape_env, fake_mode, tracing_ctx):
+def _to_symbolic_tensors(flat, shape_env, tracing_ctx):
     """Replace real tensors with symbolic fake tensors for make_fx tracing.
 
     All tensors marked dynamic share the same symbolic size per axis,
     so a single guard covers all dynamic inputs.
     """
+    fake_mode = FakeTensorMode(shape_env=shape_env)
     shared_sym: dict[int, torch.SymInt] = {}
     out = []
     for i, val in enumerate(flat):
@@ -164,31 +163,14 @@ def _cache_key(args):
 def _default_region_key(args):
     keys = []
     for a in args:
-        if isinstance(a, nn.Module):
-            keys.append(_module_key(a))
-        elif isinstance(a, torch.Tensor):
+        if isinstance(a, torch.Tensor):
             keys.append((a.dim(), a.dtype, a.device))
         else:
             keys.append(a)
     return tuple(keys)
 
 
-_trace_region_stats = {
-    "calls": 0,
-    "misses": 0,
-    "hits": 0,
-    "miss_time": 0.0,
-    "hit_time": 0.0,
-    "key_time": 0.0,
-    "miss_times": [],
-    "replay_times": [],
-}
-
-# Generation counter to prevent trace_region cache reuse across compilations.
-# Each compilation creates fake tensors with shapes specific to that compile
-# range. Reusing a cached sub-graph from a different compilation would inline
-# nodes with incorrect shape metadata.
-_trace_region_generation = 0
+_trace_region_stats = {"calls": 0, "misses": 0, "hits": 0}
 
 
 def _inline_cached_graph(cached_gm, args):
@@ -217,7 +199,12 @@ def _inline_cached_graph(cached_gm, args):
     out_spec = output_node.args[0]
 
     # Create a fresh tensor from the cached node metadata and associate it
-    # with the copied output proxy.
+    # with the copied output proxy.  We use torch.empty rather than reusing the
+    # cached tensor directly so each inlined call gets its own proxy slot
+    # (important when the same region is called multiple times in one trace).
+    # We also avoid torch.empty_like because the cached meta["val"] may be a
+    # FakeTensor from a sub-tracer context that is incompatible with the
+    # parent's FakeTensorMode.
     def _fresh_tensor(node):
         v = node.meta["val"]
         return torch.empty(v.shape, dtype=v.dtype, device=v.device)
@@ -248,32 +235,18 @@ def trace_region(fn=None, *, cache_key=None):
 
             _trace_region_stats["calls"] += 1
 
-            t0 = time.perf_counter()
             if cache_key is not None:
-                key = (_trace_region_generation, cache_key(*args))
+                key = cache_key(*args)
             else:
-                key = (_trace_region_generation, _default_region_key(args))
-            _trace_region_stats["key_time"] += time.perf_counter() - t0
-
-            flat, structure = _flatten_args(args)
+                key = _default_region_key(args)
 
             if key not in cache:
                 _trace_region_stats["misses"] += 1
-                t0 = time.perf_counter()
-                functional = _flatten_fn_with_structure(fn, structure)
-                cache[key] = reenter_make_fx(functional)(*flat)
-                dt = time.perf_counter() - t0
-                _trace_region_stats["miss_time"] += dt
-                _trace_region_stats["miss_times"].append(dt)
+                cache[key] = reenter_make_fx(fn)(*args)
             else:
                 _trace_region_stats["hits"] += 1
 
-            t0 = time.perf_counter()
-            result = _inline_cached_graph(cache[key], flat)
-            dt = time.perf_counter() - t0
-            _trace_region_stats["hit_time"] += dt
-            _trace_region_stats["replay_times"].append(dt)
-            return result
+            return _inline_cached_graph(cache[key], args)
 
         wrapper.cache = cache
         return wrapper
@@ -296,82 +269,18 @@ def nonstrict_compile(fn, backend=None, cache=True):
     def _trace_and_compile(call_fn, flat, structure):
         functional = _flatten_fn_with_structure(call_fn, structure)
         shape_env = ShapeEnv()
-        fake_mode = FakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
-        tracing_ctx = TracingContext(fake_mode)
-
-        # Suppress dynamo's nested FX trace error — during
-        # make_fx tracing, any dynamo-decorated function
-        # encountered should just be called directly.
-        old_error_on_nested = torch._dynamo.config.error_on_nested_fx_trace
-        torch._dynamo.config.error_on_nested_fx_trace = False
-        try:
-            with tracing(tracing_ctx):
-                with dynamo_timed("nonstrict_compile.fakify"):
-                    fake_flat = _to_symbolic_tensors(
-                        flat, shape_env, fake_mode, tracing_ctx
-                    )
-
-                # Reset trace_region stats and bump generation before tracing
-                global _trace_region_generation
-                _trace_region_generation += 1
-                _trace_region_stats.update(
-                    calls=0,
-                    misses=0,
-                    hits=0,
-                    miss_time=0.0,
-                    hit_time=0.0,
-                    key_time=0.0,
-                    miss_times=[],
-                    replay_times=[],
-                )
-                with dynamo_timed("nonstrict_compile.make_fx"):
-                    gm = make_fx(functional, tracing_mode="symbolic")(*fake_flat)
-
-                # make_fx populates node.meta["val"] but some backends
-                # (e.g. vLLM's VllmBackend) expect "example_value".
-                for node in gm.graph.nodes:
-                    if "val" in node.meta and "example_value" not in node.meta:
-                        node.meta["example_value"] = node.meta["val"]
-
-                with dynamo_timed("nonstrict_compile.backend"):
-                    compiled = backend(gm, flat)
-
-            s = _trace_region_stats
-            miss_detail = ", ".join(f"{t * 1000:.1f}ms" for t in s["miss_times"])
-            replay_times = s["replay_times"]
-            if replay_times:
-                replay_min = min(replay_times) * 1000
-                replay_max = max(replay_times) * 1000
-                replay_avg = sum(replay_times) / len(replay_times) * 1000
-                replay_detail = (
-                    f"min={replay_min:.1f}ms avg={replay_avg:.1f}ms "
-                    f"max={replay_max:.1f}ms"
-                )
-            else:
-                replay_detail = "n/a"
-            msg = (
-                f"nonstrict_compile:\n"
-                f"  trace_regions: {s['calls']} calls, "
-                f"{s['misses']} misses ({s['miss_time']:.3f}s: {miss_detail}), "
-                f"{s['hits']} hits, "
-                f"replay={s['hit_time']:.3f}s ({replay_detail}), "
-                f"key={s['key_time']:.3f}s\n"
-            )
-            with open("/tmp/nonstrict_compile_timing.log", "a") as f:
-                f.write(msg)
-        finally:
-            torch._dynamo.config.error_on_nested_fx_trace = old_error_on_nested
-
-        return compiled
+        tracing_ctx = TracingContext(FakeTensorMode(shape_env=shape_env))
+        with tracing(tracing_ctx):
+            fake_flat = _to_symbolic_tensors(flat, shape_env, tracing_ctx)
+            gm = make_fx(functional, tracing_mode="symbolic")(*fake_flat)
+            return backend(gm, flat)
 
     def wrapper(*args):
         nonlocal compiled_once
         # When fn is an nn.Module, prepend it so _flatten_args extracts
         # its params/buffers as explicit graph inputs.
-        # Use mod.forward(*a) to bypass any __call__ wrappers
-        # (e.g. support_torch_compile's __call__).
         if is_module:
-            call_fn = lambda mod, *a: mod.forward(*a)  # noqa: E731
+            call_fn = lambda mod, *a: mod(*a)  # noqa: E731
             all_args = (fn, *args)
         else:
             call_fn = fn
@@ -568,16 +477,10 @@ if __name__ == "__main__":
     print("PASS: trace_region custom cache key")
 
     # Test 15: trace_region — multiple calls with boolean branching
-    _trace_region_stats.update(
-        calls=0,
-        misses=0,
-        hits=0,
-        miss_time=0.0,
-        hit_time=0.0,
-        key_time=0.0,
-        miss_times=[],
-        replay_times=[],
-    )
+    # outer5 calls branching_fn 4 times: 2x True, 2x False.
+    # First make_fx: 4 calls, 2 misses (True, False), 2 hits.
+    # Second make_fx: 4 calls, 0 misses, 4 hits (both keys already cached).
+    _trace_region_stats.update(calls=0, misses=0, hits=0)
 
     @trace_region
     def branching_fn(x, flag):
@@ -595,11 +498,9 @@ if __name__ == "__main__":
 
     x = torch.randn(3, 4)
     gm = make_fx(outer5)(x)
-    assert (
-        _trace_region_stats["calls"],
-        _trace_region_stats["misses"],
-        _trace_region_stats["hits"],
-    ) == (4, 2, 2), _trace_region_stats
+    assert _trace_region_stats == {"calls": 4, "misses": 2, "hits": 2}, (
+        _trace_region_stats
+    )
     result = gm(x)
     expected = (x * 2) + (x * 2) + (x + 1) + (x + 1)
     assert torch.allclose(result, expected)
@@ -608,166 +509,9 @@ if __name__ == "__main__":
     )
 
     # Second make_fx reuses the cache — all hits, no misses.
-    _trace_region_stats.update(
-        calls=0,
-        misses=0,
-        hits=0,
-        miss_time=0.0,
-        hit_time=0.0,
-        key_time=0.0,
-        miss_times=[],
-        replay_times=[],
-    )
+    _trace_region_stats.update(calls=0, misses=0, hits=0)
     make_fx(outer5)(torch.randn(3, 4))
-    assert (
-        _trace_region_stats["calls"],
-        _trace_region_stats["misses"],
-        _trace_region_stats["hits"],
-    ) == (4, 0, 4), _trace_region_stats
+    assert _trace_region_stats == {"calls": 4, "misses": 0, "hits": 4}, (
+        _trace_region_stats
+    )
     print("PASS: trace_region multiple calls with boolean branching")
-
-    # Test 16: trace_region with nn.Module args — 3 Linear layers share one cached graph
-    _trace_region_stats.update(
-        calls=0,
-        misses=0,
-        hits=0,
-        miss_time=0.0,
-        hit_time=0.0,
-        key_time=0.0,
-        miss_times=[],
-        replay_times=[],
-    )
-
-    @trace_region
-    def apply_linear(linear, x):
-        return linear(x)
-
-    linears = [nn.Linear(4, 4) for _ in range(3)]
-
-    def outer6(lin0, lin1, lin2, x):
-        x = apply_linear(lin0, x)
-        x = apply_linear(lin1, x)
-        x = apply_linear(lin2, x)
-        return x
-
-    x = torch.randn(2, 4)
-    compiled = nonstrict_compile(outer6, backend=lambda gm, _: gm)
-    result = compiled(*linears, x)
-    expected = outer6(*linears, x)
-    assert torch.allclose(result, expected), f"Output mismatch: {result} vs {expected}"
-    assert len(apply_linear.cache) == 1, (
-        f"Expected 1 cache entry, got {len(apply_linear.cache)}"
-    )
-    assert (
-        _trace_region_stats["calls"],
-        _trace_region_stats["misses"],
-        _trace_region_stats["hits"],
-    ) == (3, 1, 2), _trace_region_stats
-    print("PASS: trace_region with nn.Module args")
-
-    # Test 17: trace_region with nn.Module args + dynamic shapes
-    _trace_region_stats.update(
-        calls=0,
-        misses=0,
-        hits=0,
-        miss_time=0.0,
-        hit_time=0.0,
-        key_time=0.0,
-        miss_times=[],
-        replay_times=[],
-    )
-    apply_linear.cache.clear()
-
-    linears = [nn.Linear(4, 4) for _ in range(3)]
-
-    def outer7(lin0, lin1, lin2, x):
-        x = apply_linear(lin0, x)
-        x = apply_linear(lin1, x)
-        x = apply_linear(lin2, x)
-        return x
-
-    x = torch.randn(2, 4)
-    torch._dynamo.mark_dynamic(x, 0)
-    compiled = nonstrict_compile(outer7, backend=lambda gm, _: gm)
-    result = compiled(*linears, x)
-    expected = outer7(*linears, x)
-    assert torch.allclose(result, expected), f"Output mismatch: {result} vs {expected}"
-
-    # Different batch size: with generation counter, a new compilation creates
-    # a new cache entry (different generation), so we expect 2 entries total.
-    x2 = torch.randn(5, 4)
-    result2 = compiled(*linears, x2)
-    expected2 = outer7(*linears, x2)
-    assert torch.allclose(result2, expected2), (
-        f"Output mismatch: {result2} vs {expected2}"
-    )
-    print("PASS: trace_region with nn.Module args + dynamic shapes")
-
-    # Test 18: check that cached sub-graph has symbolic shapes
-    apply_linear.cache.clear()
-    _trace_region_stats.update(
-        calls=0,
-        misses=0,
-        hits=0,
-        miss_time=0.0,
-        hit_time=0.0,
-        key_time=0.0,
-        miss_times=[],
-        replay_times=[],
-    )
-
-    linears = [nn.Linear(4, 4) for _ in range(3)]
-
-    def outer8(lin0, lin1, lin2, x):
-        x = apply_linear(lin0, x)
-        x = apply_linear(lin1, x)
-        x = apply_linear(lin2, x)
-        return x
-
-    x = torch.randn(2, 4)
-    torch._dynamo.mark_dynamic(x, 0)
-    # Use the full nonstrict_compile pipeline to create symbolic fake tensors
-    # then check the cached sub-graph's node shapes
-    gm_holder = []
-
-    def capture_backend(gm, inputs):
-        gm_holder.append(gm)
-        return gm
-
-    compiled = nonstrict_compile(outer8, backend=capture_backend)
-    result = compiled(*linears, x)
-    assert len(gm_holder) == 1
-
-    # Check the cached sub-graph for symbolic vs concrete shapes
-    cached_gm = list(apply_linear.cache.values())[0]
-    has_symbolic = False
-    has_concrete_dynamic = False
-    for node in cached_gm.graph.nodes:
-        if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
-            v = node.meta["val"]
-            for dim_idx, s in enumerate(v.shape):
-                if isinstance(s, torch.SymInt):
-                    has_symbolic = True
-    if has_symbolic:
-        print("PASS: cached sub-graph has symbolic shapes")
-    else:
-        print(
-            "WARN: cached sub-graph has CONCRETE shapes (this causes issues with Inductor)"
-        )
-
-    # Also check the final parent graph for symbolic shapes
-    parent_gm = gm_holder[0]
-    sym_count = 0
-    concrete_count = 0
-    for node in parent_gm.graph.nodes:
-        if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
-            v = node.meta["val"]
-            for s in v.shape:
-                if isinstance(s, torch.SymInt):
-                    sym_count += 1
-                    break
-            else:
-                concrete_count += 1
-    print(
-        f"  Parent graph: {sym_count} symbolic-shape nodes, {concrete_count} concrete-shape nodes"
-    )

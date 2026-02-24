@@ -603,6 +603,14 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                     if sym_shape_tensor_info is not None:
                         break
 
+            # Fallback for meta-tensor tracing path where all shapes
+            # are concrete: assume first tensor arg, dim 0 is dynamic.
+            if not sym_shape_indices and sym_shape_tensor_info is None:
+                for i, x in enumerate(args):
+                    if isinstance(x, torch.Tensor) and x.dim() > 0:
+                        sym_shape_tensor_info = (i, 0)
+                        break
+
             # Lazy import here to avoid circular import
             from torch._inductor.compile_fx import graph_returns_tuple
 
