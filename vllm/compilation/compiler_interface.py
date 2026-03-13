@@ -599,6 +599,31 @@ class InductorAdaptor(CompilerInterface):
             )
             stack.enter_context(_patch_constrain_to_fx_strides())
 
+            # Inductor's pre-grad passes don't do anything for vLLM.
+            # The pre-grad passes get run even on cache-hit and negatively
+            # impact vllm cold compile times by O(1s).
+            # Can remove this after the following issue gets fixed
+            # https://github.com/pytorch/pytorch/issues/174502
+            if not envs.VLLM_ENABLE_PREGRAD_PASSES:
+                current_config["use_pre_grad_passes"] = False
+
+            # Clear the tracing context before calling compile_fx.
+            # vLLM calls compile_fx from within a PiecewiseCompileInterpreter
+            # that runs under Dynamo's tracing context. The tracing context
+            # has a FakeTensorMode from Dynamo, but the example inputs for
+            # this subgraph have fake tensors from a different FakeTensorMode.
+            # compile_fx's _compile_fx_main calls detect_fake_mode() which
+            # asserts all FakeTensorModes match, causing a crash.
+            # Clearing the tracing context lets compile_fx create its own.
+            saved_tracing_context = torch._guards.TracingContext.try_get()
+            if saved_tracing_context is not None:
+                torch._guards._TLS.tracing_context = None
+
+                def _restore_tracing_context():
+                    torch._guards._TLS.tracing_context = saved_tracing_context
+
+                stack.callback(_restore_tracing_context)
+
             compiled_graph = compile_fx(
                 graph,
                 example_inputs,
