@@ -10,7 +10,7 @@
 set -euo pipefail
 
 MODEL="${1:-nvidia/Llama-3.3-70B-Instruct-NVFP4}"
-TP="${2:-4}"
+TP="${2:-1}"
 BATCH_SIZE="${3:-1}"
 INPUT_LEN="${4:-128}"
 OUTPUT_LEN="${5:-128}"
