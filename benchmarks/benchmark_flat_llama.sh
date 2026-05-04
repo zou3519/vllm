@@ -14,8 +14,8 @@ TP="${2:-4}"
 BATCH_SIZE="${3:-1}"
 INPUT_LEN="${4:-128}"
 OUTPUT_LEN="${5:-128}"
-NUM_ITERS="${6:-30}"
-NUM_WARMUP="${7:-10}"
+NUM_ITERS="${6:-10}"
+NUM_WARMUP="${7:-3}"
 
 COMMON_ARGS=(
     --model "$MODEL"
@@ -25,6 +25,7 @@ COMMON_ARGS=(
     --output-len "$OUTPUT_LEN"
     --num-iters "$NUM_ITERS"
     --num-iters-warmup "$NUM_WARMUP"
+    --max-model-len 4096
 )
 
 echo "============================================="
@@ -39,45 +40,85 @@ echo "Iterations: $NUM_ITERS (warmup: $NUM_WARMUP)"
 echo ""
 
 echo "---------------------------------------------"
-echo "[1/2] Baseline LlamaForCausalLM"
+echo "[1/4] Standard LlamaForCausalLM (default: compile + CG)"
 echo "---------------------------------------------"
 python -m vllm.entrypoints.cli.main bench latency \
     "${COMMON_ARGS[@]}" \
-    --output-json /tmp/bench_baseline.json
+    --output-json /tmp/bench_standard.json
 
 echo ""
 echo "---------------------------------------------"
-echo "[2/2] FlatLlamaForCausalLM (compile=none)"
+echo "[2/4] Standard LlamaForCausalLM (no compile, FULL CG)"
+echo "---------------------------------------------"
+python -m vllm.entrypoints.cli.main bench latency \
+    "${COMMON_ARGS[@]}" \
+    --compilation-config '{"mode": "none", "cudagraph_mode": "full"}' \
+    --output-json /tmp/bench_standard_nocg.json
+
+echo ""
+echo "---------------------------------------------"
+echo "[3/4] FlatLlamaForCausalLM (no compile, no CG)"
 echo "---------------------------------------------"
 python -m vllm.entrypoints.cli.main bench latency \
     "${COMMON_ARGS[@]}" \
     --hf-overrides '{"architectures": ["FlatLlamaForCausalLM"]}' \
     --compilation-config '{"mode": "none"}' \
-    --output-json /tmp/bench_flat.json
+    --output-json /tmp/bench_flat_nocg.json
+
+echo ""
+echo "---------------------------------------------"
+echo "[4/4] FlatLlamaForCausalLM (no compile, FULL CG)"
+echo "---------------------------------------------"
+python -m vllm.entrypoints.cli.main bench latency \
+    "${COMMON_ARGS[@]}" \
+    --hf-overrides '{"architectures": ["FlatLlamaForCausalLM"]}' \
+    --compilation-config '{"mode": "none", "cudagraph_mode": "full"}' \
+    --output-json /tmp/bench_flat_cg.json
 
 echo ""
 echo "============================================="
-echo "Results saved to:"
-echo "  Baseline: /tmp/bench_baseline.json"
-echo "  Flat:     /tmp/bench_flat.json"
+echo "Results Summary"
 echo "============================================="
 
 python3 -c "
-import json
-with open('/tmp/bench_baseline.json') as f:
-    baseline = json.load(f)
-with open('/tmp/bench_flat.json') as f:
-    flat = json.load(f)
+import json, os
 
-bl = baseline['avg_latency']
-fl = flat['avg_latency']
-speedup = bl / fl
+configs = [
+    ('Standard (compile+CG)',   '/tmp/bench_standard.json'),
+    ('Standard (no compile, CG)', '/tmp/bench_standard_nocg.json'),
+    ('Flat (no compile, no CG)', '/tmp/bench_flat_nocg.json'),
+    ('Flat (no compile, CG)',    '/tmp/bench_flat_cg.json'),
+]
+
+results = {}
+for name, path in configs:
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        results[name] = data
+
+if not results:
+    print('No results found')
+    exit()
+
+best = min(r['avg_latency'] for r in results.values())
 
 print()
-print(f'  Baseline avg latency:  {bl:.4f}s')
-print(f'  Flat avg latency:      {fl:.4f}s')
-print(f'  Speedup:               {speedup:.3f}x')
-print(f'  Baseline p50:          {baseline[\"percentiles\"][\"50\"]:.4f}s')
-print(f'  Flat p50:              {flat[\"percentiles\"][\"50\"]:.4f}s')
+print(f'  {\"Config\":<35s} {\"Avg (s)\":>10s} {\"p50 (s)\":>10s} {\"vs best\":>10s}')
+print(f'  {\"-\"*35} {\"-\"*10} {\"-\"*10} {\"-\"*10}')
+
+for name, data in results.items():
+    avg = data['avg_latency']
+    p50 = data['percentiles']['50']
+    ratio = avg / best
+    print(f'  {name:<35s} {avg:>10.3f} {p50:>10.3f} {ratio:>9.2f}x')
+
+# Per-decode-step estimate (total - ~prefill) / output_tokens
+output_len = $OUTPUT_LEN
+print()
+print(f'  Estimated per-decode-step (total / {output_len} output tokens):')
+for name, data in results.items():
+    ms_per_step = data['avg_latency'] / output_len * 1000
+    print(f'    {name:<35s} {ms_per_step:>8.1f} ms/step')
 print()
 "
