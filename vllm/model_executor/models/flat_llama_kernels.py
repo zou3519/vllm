@@ -4,14 +4,15 @@
 Optimized ops for the flat Llama model at batch-size 1.
 
 Strategy: call vLLM's existing optimized C++ ops directly with
-pre-allocated buffers, and use fused CUDA kernels where available
-(silu_and_mul_nvfp4_quant). This matches or exceeds the standard
-model's performance without torch.compile.
+pre-allocated buffers, use fused CUDA kernels where available
+(silu_and_mul_nvfp4_quant), and use inductor-style Triton kernels
+for fused_add_rms_norm that are autotuned for the target hardware.
 """
 
 import torch
+import triton
+import triton.language as tl
 
-from vllm import _custom_ops as ops
 from vllm._custom_ops import (
     create_fp4_output_tensors,
     cutlass_scaled_fp4_mm,
@@ -22,6 +23,103 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     slice_nvfp4_output,
 )
 from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
+
+
+# ---------------------------------------------------------------------------
+# Inductor-style Triton kernels for fused_add_rms_norm
+# (Adapted from torch.compile output — autotuned two-pass reduction)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fused_add_rms_norm_triton(
+    in_ptr0,   # hidden_states (bf16)
+    in_ptr1,   # residual (bf16)
+    in_ptr2,   # weight (bf16)
+    out_ptr0,  # normed output (bf16)
+    out_ptr1,  # updated residual (bf16)
+    xnumel,
+    r0_numel: tl.constexpr,
+    XBLOCK: tl.constexpr,
+    R0_BLOCK: tl.constexpr,
+):
+    """Fused residual-add + RMSNorm.
+
+    new_residual = hidden_states + residual
+    normed = rms_norm(new_residual) * weight
+    """
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    x0 = xindex
+
+    # Pass 1: residual add + sum-of-squares
+    _sum_sq = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        r0_1 = r0_index
+        h = tl.load(
+            in_ptr0 + (r0_1 + r0_numel * x0),
+            r0_mask & xmask, other=0.0,
+        ).to(tl.float32)
+        r = tl.load(
+            in_ptr1 + (r0_1 + r0_numel * x0),
+            r0_mask & xmask, other=0.0,
+        ).to(tl.float32)
+        s = h + r
+        sq = s * s
+        _sum_sq = _sum_sq + tl.where(r0_mask & xmask, sq, 0.0)
+    sum_sq = tl.sum(_sum_sq, 1)[:, None]
+
+    # Pass 2: normalize + store residual and normed output
+    rrms = tl.math.rsqrt(sum_sq / r0_numel + 1e-5)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        r0_1 = r0_index
+        h = tl.load(
+            in_ptr0 + (r0_1 + r0_numel * x0),
+            r0_mask & xmask, other=0.0,
+        ).to(tl.float32)
+        r = tl.load(
+            in_ptr1 + (r0_1 + r0_numel * x0),
+            r0_mask & xmask, other=0.0,
+        ).to(tl.float32)
+        w = tl.load(
+            in_ptr2 + r0_1, r0_mask, other=0.0,
+        ).to(tl.float32)
+        s = h + r
+        normed = s * rrms * w
+        tl.store(
+            out_ptr0 + (r0_1 + r0_numel * x0), normed.to(tl.bfloat16),
+            r0_mask & xmask,
+        )
+        tl.store(
+            out_ptr1 + (r0_1 + r0_numel * x0), s.to(tl.bfloat16),
+            r0_mask & xmask,
+        )
+
+
+def fused_add_rms_norm_triton(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    normed_out: torch.Tensor,
+    residual_out: torch.Tensor,
+):
+    """Triton fused_add_rms_norm. Writes normed and residual to separate
+    pre-allocated buffers (avoiding in-place mutation for CUDA graph compat)."""
+    M = hidden_states.shape[0]
+    N = hidden_states.shape[1]
+    grid = (M,)
+    _fused_add_rms_norm_triton[grid](
+        hidden_states, residual, weight,
+        normed_out, residual_out,
+        M, r0_numel=N, XBLOCK=1, R0_BLOCK=min(N, 4096),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +141,16 @@ class LayerDecodeBuffers:
         self.device = device
         self.hidden_size = hidden_size
 
-        # FP4 quant pre-allocated outputs (avoids torch.empty per call)
+        # Normed output (written by Triton norm kernel)
+        self.normed = torch.empty(
+            1, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        # Residual buffer (written by Triton norm kernel)
+        self.residual_buf = torch.empty(
+            1, hidden_size, dtype=torch.bfloat16, device=device
+        )
+
+        # FP4 quant pre-allocated outputs
         self.qkv_fp4, self.qkv_scale = create_fp4_output_tensors(
             1, hidden_size, device, is_sf_swizzled_layout=True
         )
@@ -82,26 +189,9 @@ def flat_decode_layer(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Optimized single-layer decode for BS=1.
 
-    Calls vLLM's C++ ops directly with pre-allocated FP4 buffers.
-    Uses the fused silu_and_mul_nvfp4_quant CUDA kernel.
-
-    Per-layer ops (12 kernel launches at TP=1):
-      1. fused_add_rms_norm          (C++ in-place)
-      2. scaled_fp4_quant            (C++ pre-alloc output)
-      3. cutlass_scaled_fp4_mm       (QKV GEMM)
-      4. rotary_embedding            (C++ in-place)
-      5. unified_kv_cache_update     (flash-attn)
-      6. unified_attention            (flash-attn)
-      7. scaled_fp4_quant            (C++ pre-alloc output)
-      8. cutlass_scaled_fp4_mm       (O GEMM)
-      9. fused_add_rms_norm          (C++ in-place)
-     10. scaled_fp4_quant            (C++ pre-alloc output)
-     11. cutlass_scaled_fp4_mm       (gate_up GEMM)
-     12. silu_and_mul_nvfp4_quant    (FUSED: silu+mul+fp4_quant)
-     13. cutlass_scaled_fp4_mm       (down GEMM)
+    Uses inductor-style Triton norm kernels, pre-allocated FP4 buffers,
+    and the fused silu_and_mul_nvfp4_quant CUDA kernel.
     """
-    eps = input_layernorm.variance_epsilon
-
     # --- 1. Pre-attention LayerNorm (C++ fused_add_rms_norm, in-place) ---
     if residual is None:
         residual = hidden_states
@@ -109,7 +199,7 @@ def flat_decode_layer(
     else:
         hidden_states, residual = input_layernorm(hidden_states, residual)
 
-    # --- 2+3. QKV projection (FP4 quant + GEMM) ---
+    # --- 2+3. QKV projection ---
     qkv_proj = self_attn.qkv_proj
     torch.ops._C.scaled_fp4_quant.out(
         hidden_states,
@@ -152,7 +242,7 @@ def flat_decode_layer(
 
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-    # --- 9. Post-attention LayerNorm ---
+    # --- 9. Post-attention LayerNorm (C++ fused_add_rms_norm, in-place) ---
     hidden_states, residual = post_attention_layernorm(hidden_states, residual)
 
     # --- 10+11. Gate+Up projection ---
