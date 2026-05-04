@@ -110,6 +110,161 @@ def _norm_fp4_quant_kernel(
     tl.store(scale_out_ptr + byte_offset, sf_fp8.to(tl.uint8, bitcast=True))
 
 
+# ---------------------------------------------------------------------------
+# Single fused kernel: residual-add + RMSNorm + FP4 quant in ONE launch.
+# Uses cooperative atomic reduction across programs (≤ SM count to avoid
+# deadlock on the spin-wait barrier).
+# ---------------------------------------------------------------------------
+
+# Number of programs for the fused kernel. Must be <= number of SMs (152 on
+# GB300) to guarantee all programs can run concurrently during the spin-wait.
+_FUSED_NUM_PROGRAMS: int = 128
+
+
+@triton.jit
+def _fused_add_rms_norm_fp4_quant_kernel(
+    hidden_ptr, residual_ptr, residual_out_ptr,
+    weight_ptr, sf_scale_ptr,
+    fp4_out_ptr, scale_out_ptr,
+    # Atomic reduction workspace
+    global_sum_ptr, counter_ptr, ready_ptr,
+    N: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
+):
+    """Fused residual-add + RMSNorm + FP4 quant for BS=1 decode.
+
+    Each of NUM_PROGRAMS programs handles GROUPS_PER_PROGRAM groups of 16
+    elements. Phase 1 does residual-add and accumulates a partial
+    sum-of-squares. Phase 2 synchronizes via an atomic barrier. Phase 3
+    applies RMSNorm + E2M1 FP4 quantization using inline PTX.
+    """
+    pid = tl.program_id(0)
+    row = 0  # BS=1
+
+    # Phase 1: residual add + partial sum-of-squares
+    base_group = pid * GROUPS_PER_PROGRAM
+    local_sum = tl.zeros([], dtype=tl.float32)
+
+    for g_off in tl.static_range(0, GROUPS_PER_PROGRAM):
+        g = base_group + g_off
+        elem_base = row * N + g * 16
+        idx = tl.arange(0, 16)
+
+        h = tl.load(hidden_ptr + elem_base + idx).to(tl.float32)
+        r = tl.load(residual_ptr + elem_base + idx).to(tl.float32)
+        s = h + r
+        tl.store(residual_out_ptr + elem_base + idx, s.to(tl.bfloat16))
+        local_sum += tl.sum(s * s)
+
+    # Phase 2: atomic reduction + spin-wait barrier
+    tl.atomic_add(global_sum_ptr, local_sum)
+    arrived = tl.atomic_add(counter_ptr, 1)
+
+    # Last program to arrive signals completion
+    if arrived == NUM_PROGRAMS - 1:
+        tl.store(ready_ptr, 1)
+
+    # All programs spin-wait until ready
+    while tl.load(ready_ptr, volatile=True) == 0:
+        pass
+
+    # Phase 3: read final variance, apply RMSNorm + FP4 quant
+    total_sum = tl.load(global_sum_ptr)
+    rrms = tl.math.rsqrt(total_sum / N + 1e-5)
+    sf_scale = tl.load(sf_scale_ptr).to(tl.float32)
+
+    for g_off in tl.static_range(0, GROUPS_PER_PROGRAM):
+        g = base_group + g_off
+        base = row * N + g * 16
+        pair_idx = tl.arange(0, 8)
+        even_offs = base + pair_idx * 2
+        odd_offs = even_offs + 1
+        w_even_offs = g * 16 + pair_idx * 2
+        w_odd_offs = w_even_offs + 1
+
+        even_res = tl.load(residual_out_ptr + even_offs).to(tl.float32)
+        odd_res = tl.load(residual_out_ptr + odd_offs).to(tl.float32)
+        even_w = tl.load(weight_ptr + w_even_offs).to(tl.float32)
+        odd_w = tl.load(weight_ptr + w_odd_offs).to(tl.float32)
+
+        even_normed = even_res * rrms * even_w
+        odd_normed = odd_res * rrms * odd_w
+
+        # FP4 quantization: compute per-group FP8 scale + E2M1 via PTX
+        block_max = tl.maximum(
+            tl.max(tl.abs(even_normed)), tl.max(tl.abs(odd_normed))
+        )
+        sf_val = sf_scale * (block_max / 6.0)
+        sf_fp8 = sf_val.to(tl.float8e4nv)
+        sf_f32 = sf_fp8.to(tl.float32)
+        quant_scale = tl.where(sf_f32 > 0.0, sf_scale / sf_f32, 0.0)
+
+        packed = tl.inline_asm_elementwise(
+            "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
+            " cvt.u16.u8 $0, tmp; }",
+            "=h, r, r",
+            [even_normed * quant_scale, odd_normed * quant_scale],
+            dtype=tl.int16,
+            is_pure=True,
+            pack=1,
+        )
+
+        fp4_base = row * (N // 2) + g * 8
+        tl.store(fp4_out_ptr + fp4_base + pair_idx, packed.to(tl.uint8))
+
+        kTileIdx = g // 4
+        innerKIdx = g % 4
+        byte_offset = (
+            row * SCALE_STRIDE + kTileIdx * SCALE_STRIDE + innerKIdx
+        )
+        tl.store(
+            scale_out_ptr + byte_offset, sf_fp8.to(tl.uint8, bitcast=True)
+        )
+
+
+def triton_fused_add_rms_norm_fp4_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    weight: torch.Tensor,
+    sf_scale_inv: torch.Tensor,
+    fp4_out: torch.Tensor,
+    scale_int32: torch.Tensor,
+    global_sum: torch.Tensor,
+    counter: torch.Tensor,
+    ready: torch.Tensor,
+) -> None:
+    """Single fused kernel: residual-add + RMSNorm + FP4 quant.
+
+    Replaces the two-kernel sequence of ``_add_variance_kernel`` +
+    ``_norm_fp4_quant_kernel``, saving one kernel launch per call site
+    (160 launches total across 80 layers × 2 norm+quant points).
+    """
+    N = hidden_states.shape[-1]
+    scale_bytes = scale_int32.view(torch.uint8)
+    scale_stride = scale_int32.shape[1] * 4
+    num_programs = _FUSED_NUM_PROGRAMS
+    groups_per_program = (N // 16) // num_programs
+
+    # Reset atomic workspace before launch
+    global_sum.zero_()
+    counter.zero_()
+    ready.zero_()
+
+    _fused_add_rms_norm_fp4_quant_kernel[(num_programs,)](
+        hidden_states, residual, residual_out,
+        weight, sf_scale_inv,
+        fp4_out, scale_bytes,
+        global_sum, counter, ready,
+        N=N,
+        SCALE_STRIDE=scale_stride,
+        NUM_PROGRAMS=num_programs,
+        GROUPS_PER_PROGRAM=groups_per_program,
+    )
+
+
 @triton.jit
 def _fp4_quant_kernel(
     input_ptr, sf_scale_ptr, fp4_out_ptr, scale_out_ptr,
@@ -170,6 +325,13 @@ def _fused_rope_kv_kernel(
     cos_sin_ptr, positions_ptr,
     kv_cache_ptr, slot_mapping_ptr,
     k_scale_ptr, v_scale_ptr,
+    # Strides of the 5D kv_cache tensor (in elements, not bytes).
+    # Shape: [num_blocks, 2, ?, ?, head_dim] — dims 2/3 are block_size and
+    # num_kv_heads but their order depends on NHD vs HND layout.
+    KV_STRIDE_BLOCK,   # stride for dim-0 (num_blocks)
+    KV_STRIDE_KV,      # stride for dim-1 (K=0 / V=1)
+    KV_STRIDE_BS,      # stride for the block_size dimension
+    KV_STRIDE_HEAD,    # stride for the num_kv_heads dimension
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -208,29 +370,35 @@ def _fused_rope_kv_kernel(
         tl.store(k_ptr + hd + d, k_rot1)
         tl.store(k_ptr + hd + HALF_ROT + d, k_rot2)
 
-        # Write to KV cache
+        # Write to KV cache using actual strides (supports NHD & HND layouts)
         slot = tl.load(slot_mapping_ptr)
         block_idx = slot // BLOCK_SIZE
         block_off = slot % BLOCK_SIZE
-        kv_s0 = 2 * BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM
-        kv_s1 = BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM
-        kv_s2 = NUM_KV_HEADS * HEAD_DIM
-        k_off = block_idx * kv_s0 + block_off * kv_s2 + hd
-        v_off = block_idx * kv_s0 + kv_s1 + block_off * kv_s2 + hd
+        k_base = (block_idx * KV_STRIDE_BLOCK
+                  + block_off * KV_STRIDE_BS
+                  + kv_h * KV_STRIDE_HEAD)
+        v_base = (block_idx * KV_STRIDE_BLOCK
+                  + KV_STRIDE_KV
+                  + block_off * KV_STRIDE_BS
+                  + kv_h * KV_STRIDE_HEAD)
         dd = tl.arange(0, HEAD_DIM)
 
         if KV_CACHE_IS_FP8:
+            # FP8 convention: fp8_val = bf16_val / scale (matches C++ cache
+            # kernels which call scaled_convert with value/scale).
             ks = tl.load(k_scale_ptr).to(tl.float32)
             vs = tl.load(v_scale_ptr).to(tl.float32)
             k_full = tl.load(k_ptr + hd + dd).to(tl.float32)
-            tl.store(kv_cache_ptr + k_off + dd, (k_full * ks).to(tl.float8e4nv))
+            tl.store(kv_cache_ptr + k_base + dd,
+                     (k_full / ks).to(tl.float8e4nv))
             v_vals = tl.load(v_ptr + hd + dd).to(tl.float32)
-            tl.store(kv_cache_ptr + v_off + dd, (v_vals * vs).to(tl.float8e4nv))
+            tl.store(kv_cache_ptr + v_base + dd,
+                     (v_vals / vs).to(tl.float8e4nv))
         else:
-            tl.store(kv_cache_ptr + k_off + d, k_rot1)
-            tl.store(kv_cache_ptr + k_off + HALF_ROT + d, k_rot2)
+            tl.store(kv_cache_ptr + k_base + d, k_rot1)
+            tl.store(kv_cache_ptr + k_base + HALF_ROT + d, k_rot2)
             v_vals = tl.load(v_ptr + hd + dd)
-            tl.store(kv_cache_ptr + v_off + dd, v_vals)
+            tl.store(kv_cache_ptr + v_base + dd, v_vals)
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +433,11 @@ class SharedDecodeBuffers:
     residual_buf: torch.Tensor
     variance: torch.Tensor
 
+    # Atomic workspace for single-kernel fused add+rms_norm+fp4_quant
+    global_sum: torch.Tensor   # f32 accumulator for sum-of-squares
+    counter: torch.Tensor      # i32 arrival counter
+    ready: torch.Tensor        # i32 ready flag
+
     @staticmethod
     def create(
         hidden_size: int,
@@ -280,6 +453,9 @@ class SharedDecodeBuffers:
             qkv_fp4, qkv_sc, o_fp4, o_sc, gu_fp4, gu_sc, d_fp4, d_sc,
             residual_buf=torch.empty(1, hidden_size, dtype=torch.bfloat16, device=device),
             variance=torch.empty(1, dtype=torch.float32, device=device),
+            global_sum=torch.zeros(1, dtype=torch.float32, device=device),
+            counter=torch.zeros(1, dtype=torch.int32, device=device),
+            ready=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
 
@@ -391,26 +567,24 @@ def transformer_layer(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One decoder layer. Every input is an explicit parameter — no hidden state.
 
-    With fused norm+quant kernels: 11 kernel launches (down from 13):
-      1. _add_variance_kernel (residual add + variance)
-      2. _norm_fp4_quant_kernel (normalize + E2M1 quantize via PTX)
-      3. GEMM (QKV)
-      4. RoPE
-      5. KV cache write
-      6. Attention
-      7. scaled_fp4_quant (O input — not fused, different input size)
-      8. GEMM (O)
-      9-10. fused norm+quant (post-attention: 2 kernels)
-      11. GEMM (gate_up)
-      12. silu_and_mul_nvfp4_quant (fused)
-      13. GEMM (down)
-    = 11 unique kernel launches (steps 1+2 and 9+10 each replace 3 separate ops)
+    With single-kernel fused norm+quant: 9 kernel launches (down from 13):
+      1. _fused_add_rms_norm_fp4_quant (residual add + norm + FP4 quant)
+      2. GEMM (QKV)
+      3. Fused RoPE + KV cache write
+      4. Attention
+      5. scaled_fp4_quant (O input — not fused, different input size)
+      6. GEMM (O)
+      7. _fused_add_rms_norm_fp4_quant (post-attention norm + quant)
+      8. GEMM (gate_up)
+      9. silu_and_mul_nvfp4_quant (fused)
+      10. GEMM (down)
+    = 9 unique kernel launches (steps 1 and 7 each replace 3 separate ops)
     """
     N = hidden_states.shape[-1]
     M = hidden_states.shape[0]
     scale_stride = bufs.qkv_scale.view(torch.uint8).shape[-1]
 
-    # 1+2. Fused pre-attention norm + FP4 quant (2 kernels instead of 3)
+    # 1. Fused pre-attention: residual-add + RMSNorm + FP4 quant (1 kernel)
     if residual is None:
         residual = hidden_states
         from vllm.model_executor.layers.layernorm import ir
@@ -437,12 +611,61 @@ def transformer_layer(
         bufs.qkv_fp4, bufs.qkv_scale.view(torch.float8_e4m3fn), qkv, backend,
     )
 
-    # 3. Split Q/K/V + RoPE
+    # 3. Split Q/K/V
     q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
-    q, k = rotary_emb(positions, q, k)
 
-    # 4. Attention (KV cache write + compute)
-    attn_output = attn(q, k, v)
+    # 4. Fused RoPE + KV cache write (1 kernel instead of 2)
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+    kv_cache = attn.kv_cache
+    can_fuse = (
+        is_forward_context_available()
+        and kv_cache.numel() > 0
+        and isinstance(getattr(get_forward_context(), "slot_mapping", None), dict)
+        and attn.layer_name in get_forward_context().slot_mapping
+    )
+
+    if can_fuse:
+        fwd_ctx = get_forward_context()
+        slot_mapping = fwd_ctx.slot_mapping[attn.layer_name]
+        cos_sin_cache = rotary_emb.cos_sin_cache
+        head_dim = attn.head_size
+        is_fp8 = kv_cache.dtype == torch.float8_e4m3fn
+        gqa = attn.num_heads // attn.num_kv_heads
+
+        # Map strides for NHD [B,2,BS,H,D] vs HND [B,2,H,BS,D]
+        strides = kv_cache.stride()
+        nkv = attn.num_kv_heads
+        if kv_cache.shape[2] == nkv:
+            # HND layout: dim2=heads, dim3=block_size
+            head_stride, bs_stride = strides[2], strides[3]
+            block_size = kv_cache.shape[3]
+        else:
+            # NHD layout: dim2=block_size, dim3=heads
+            bs_stride, head_stride = strides[2], strides[3]
+            block_size = kv_cache.shape[2]
+
+        _fused_rope_kv_kernel[(attn.num_heads,)](
+            q, k, v,
+            cos_sin_cache, positions,
+            kv_cache, slot_mapping,
+            attn._k_scale, attn._v_scale,
+            KV_STRIDE_BLOCK=strides[0],
+            KV_STRIDE_KV=strides[1],
+            KV_STRIDE_BS=bs_stride,
+            KV_STRIDE_HEAD=head_stride,
+            NUM_Q_HEADS=attn.num_heads, NUM_KV_HEADS=attn.num_kv_heads,
+            HEAD_DIM=head_dim, HALF_ROT=head_dim // 2,
+            CS_STRIDE=cos_sin_cache.stride(0),
+            BLOCK_SIZE=block_size,
+            KV_CACHE_IS_FP8=is_fp8,
+            GQA_RATIO=gqa,
+        )
+        # Attention reads from cache (KV write already done by fused kernel;
+        # kv_sharing_target_layer_name was set permanently in extract_all_layer_params)
+        attn_output = attn(q, k, v)
+    else:
+        q, k = rotary_emb(positions, q, k)
+        attn_output = attn(q, k, v)
 
     # 5. O projection (Triton FP4 quant — faster than C++ at BS=1)
     triton_fp4_quant(attn_output, o.input_scale_inv, bufs.o_fp4, bufs.o_scale)
@@ -450,7 +673,7 @@ def transformer_layer(
         bufs.o_fp4, bufs.o_scale.view(torch.float8_e4m3fn), o, backend,
     )
 
-    # 6+7. Fused post-attention norm + FP4 quant (2 kernels instead of 3)
+    # 7. Post-attention norm + FP4 quant (2 kernels)
     _add_variance_kernel[(M,)](
         hidden_states, residual, bufs.residual_buf, bufs.variance,
         N=N, BLOCK=min(N, 4096),
@@ -525,7 +748,11 @@ def flat_forward(
     num_tokens = hidden_states.shape[0]
 
     if num_tokens == 1 and bufs is not None:
-        # BS=1 decode: use fused Triton kernels + pre-allocated buffers
+        # BS=1 decode: use fused Triton kernels + pre-allocated buffers.
+        # Mark attention layers to skip KV cache write (fused kernel handles it).
+        # Must be set BEFORE graph capture and stay set during replay.
+        for i in range(start_layer, end_layer):
+            attns[i].kv_sharing_target_layer_name = attns[i].layer_name
         for i in range(start_layer, end_layer):
             hidden_states, residual = transformer_layer(
                 positions, hidden_states, residual,
@@ -536,7 +763,10 @@ def flat_forward(
                 bufs, backend,
             )
     else:
-        # General path: direct C++ ops, no nn.Module dispatch
+        # General path: direct C++ ops, no nn.Module dispatch.
+        # Ensure attention layers DO write to KV cache (clear the flag).
+        for i in range(start_layer, end_layer):
+            attns[i].kv_sharing_target_layer_name = None
         for i in range(start_layer, end_layer):
             hidden_states, residual = transformer_layer_general(
                 positions, hidden_states, residual,
@@ -589,7 +819,8 @@ def extract_all_layer_params(layers, start_layer, end_layer):
         gate_up_projs.append(extract_nvfp4_proj(layer.mlp.gate_up_proj))
         down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj))
         rotary_embs.append(layer.self_attn.rotary_emb)
-        attns.append(layer.self_attn.attn)
+        attn_layer = layer.self_attn.attn
+        attns.append(attn_layer)
 
     return (
         input_ln_weights, post_attn_ln_weights,
