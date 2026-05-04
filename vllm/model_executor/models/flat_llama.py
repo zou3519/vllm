@@ -291,6 +291,8 @@ class FlatLlamaDecoderLayer(nn.Module):
         )
 
         self._nvfp4_backend = None
+        self._decode_bufs = None
+        self._config = config
 
     @property
     def nvfp4_backend(self):
@@ -300,12 +302,48 @@ class FlatLlamaDecoderLayer(nn.Module):
                 self._nvfp4_backend = qm.backend
         return self._nvfp4_backend
 
+    def _get_decode_bufs(self, device):
+        if self._decode_bufs is None:
+            from .flat_llama_kernels import LayerDecodeBuffers
+
+            tp = self.tp_size
+            intermediate = self._config.intermediate_size // tp
+            self._decode_bufs = LayerDecodeBuffers(
+                hidden_size=self._config.hidden_size,
+                q_size=self.self_attn.q_size,
+                kv_size=self.self_attn.kv_size,
+                intermediate_size_per_tp=intermediate,
+                device=device,
+            )
+        return self._decode_bufs
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+
+        if num_tokens == 1 and self.nvfp4_backend is not None:
+            from .flat_llama_kernels import flat_decode_layer
+
+            bufs = self._get_decode_bufs(hidden_states.device)
+            return flat_decode_layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                self_attn=self.self_attn,
+                mlp=self.mlp,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                q_size=self.self_attn.q_size,
+                kv_size=self.self_attn.kv_size,
+                nvfp4_backend=self.nvfp4_backend,
+                tp_size=self.tp_size,
+                bufs=bufs,
+            )
+
         return flat_decoder_layer_forward(
             positions=positions,
             hidden_states=hidden_states,
