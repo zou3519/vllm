@@ -234,96 +234,46 @@ class FlatLlamaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        num_tokens = hidden_states.shape[0]
+        # Always use flat_forward — handles both BS=1 (fused kernels)
+        # and general batch sizes (direct C++ ops, no nn.Module dispatch)
+        from .flat_llama_kernels import SharedDecodeBuffers, flat_forward
 
-        # Optimized path: BS=1 decode with NVFP4
-        if num_tokens == 1 and self._nvfp4_backend is not None:
-            from .flat_llama_kernels import SharedDecodeBuffers, flat_forward
+        if not hasattr(self, "_shared_bufs") and self._nvfp4_backend is not None:
+            self._shared_bufs = SharedDecodeBuffers.create(
+                self.config.hidden_size,
+                self._q_size,
+                self._intermediate_size,
+                hidden_states.device,
+            )
 
-            if not hasattr(self, "_shared_bufs"):
-                self._shared_bufs = SharedDecodeBuffers.create(
-                    self.config.hidden_size,
-                    self._q_size,
-                    self._intermediate_size,
-                    hidden_states.device,
-                )
+        bufs = getattr(self, "_shared_bufs", None)
 
-            hidden_states = flat_forward(
-                input_ids=None,
-                positions=positions,
-                embed_fn=None,
-                input_ln_weights=self._input_ln_weights,
-                post_attn_ln_weights=self._post_attn_ln_weights,
-                eps=self._eps,
-                qkv_projs=self._qkv_projs,
-                o_projs=self._o_projs,
-                gate_up_projs=self._gate_up_projs,
-                down_projs=self._down_projs,
-                rotary_embs=self._rotary_embs,
-                attns=self._attns,
-                q_size=self._q_size,
-                kv_size=self._kv_size,
-                final_norm_w=self._final_norm_w,
-                bufs=self._shared_bufs,
-                backend=self._nvfp4_backend,
-                start_layer=0,
-                end_layer=len(self._qkv_projs),
-                hidden_states_in=hidden_states,
-            )
-            return hidden_states
-
-        # Fallback: generic path (prefill or non-NVFP4)
-        residual = None
-        if not get_pp_group().is_first_rank:
-            residual = intermediate_tensors["residual"]
-
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            if residual is None:
-                residual = hidden_states
-                hidden_states = layer.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = layer.input_layernorm(
-                    hidden_states, residual,
-                )
-            # Attention
-            sa = layer.self_attn
-            qkv, _ = sa.qkv_proj(hidden_states)
-            q, k, v = qkv.split(
-                [sa.q_size, sa.kv_size, sa.kv_size], dim=-1,
-            )
-            q, k = sa.rotary_emb(positions, q, k)
-            attn_out = sa.attn(q, k, v)
-            hidden_states, _ = sa.o_proj(attn_out)
-            if self._tp_size > 1:
-                from vllm.distributed import tensor_model_parallel_all_reduce
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            # Post-norm + MLP
-            hidden_states, residual = layer.post_attention_layernorm(
-                hidden_states, residual,
-            )
-            gate_up, _ = layer.mlp.gate_up_proj(hidden_states)
-            from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-                apply_nvfp4_linear,
-            )
-            d = gate_up.shape[-1] // 2
-            out = torch.empty(
-                gate_up.shape[:-1] + (d,),
-                dtype=gate_up.dtype, device=gate_up.device,
-            )
-            torch.ops._C.silu_and_mul(out, gate_up)
-            hidden_states = out
-            hidden_states, _ = layer.mlp.down_proj(hidden_states)
-            if self._tp_size > 1:
-                from vllm.distributed import tensor_model_parallel_all_reduce
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = flat_forward(
+            input_ids=None,
+            positions=positions,
+            embed_fn=None,
+            input_ln_weights=self._input_ln_weights,
+            post_attn_ln_weights=self._post_attn_ln_weights,
+            eps=self._eps,
+            qkv_projs=self._qkv_projs,
+            o_projs=self._o_projs,
+            gate_up_projs=self._gate_up_projs,
+            down_projs=self._down_projs,
+            rotary_embs=self._rotary_embs,
+            attns=self._attns,
+            q_size=self._q_size,
+            kv_size=self._kv_size,
+            final_norm_w=self._final_norm_w,
+            bufs=bufs,
+            backend=self._nvfp4_backend,
+            start_layer=0,
+            end_layer=len(self._qkv_projs),
+            hidden_states_in=hidden_states,
+        )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual},
-            )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
-        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def load_weights(

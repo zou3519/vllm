@@ -234,6 +234,58 @@ def nvfp4_gemm(
     return slice_nvfp4_output(out, proj.output_size)
 
 
+def nvfp4_linear(x: torch.Tensor, proj: NvFp4Proj, backend) -> torch.Tensor:
+    """Full NVFP4 linear: quantize input + GEMM. Works for any batch size."""
+    from vllm._custom_ops import scaled_fp4_quant
+    x_fp4, x_scale = scaled_fp4_quant(
+        x, proj.input_scale_inv, is_sf_swizzled_layout=True,
+        backend=backend.value,
+    )
+    return nvfp4_gemm(x_fp4, x_scale, proj, backend)
+
+
+def transformer_layer_general(
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    input_ln_w: torch.Tensor,
+    post_attn_ln_w: torch.Tensor,
+    eps: float,
+    qkv: NvFp4Proj, o: NvFp4Proj,
+    gate_up: NvFp4Proj, down: NvFp4Proj,
+    rotary_emb, attn,
+    q_size: int, kv_size: int,
+    backend,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """General-purpose transformer layer (any batch size). Uses flat params
+    with C++ ops — no nn.Module dispatch overhead."""
+    if residual is None:
+        residual = hidden_states
+        from vllm.model_executor.layers.layernorm import ir
+        hidden_states = ir.ops.rms_norm(hidden_states, input_ln_w, eps)
+    else:
+        ops.fused_add_rms_norm(hidden_states, residual, input_ln_w, eps)
+
+    qkv_out = nvfp4_linear(hidden_states, qkv, backend)
+    q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
+    q, k = rotary_emb(positions, q, k)
+    attn_output = attn(q, k, v)
+    hidden_states = nvfp4_linear(attn_output, o, backend)
+
+    ops.fused_add_rms_norm(hidden_states, residual, post_attn_ln_w, eps)
+
+    gate_up_out = nvfp4_linear(hidden_states, gate_up, backend)
+    d = gate_up_out.shape[-1] // 2
+    silu_out = torch.empty(
+        gate_up_out.shape[:-1] + (d,),
+        dtype=gate_up_out.dtype, device=gate_up_out.device,
+    )
+    torch.ops._C.silu_and_mul(silu_out, gate_up_out)
+    hidden_states = nvfp4_linear(silu_out, down, backend)
+
+    return hidden_states, residual
+
+
 # ---------------------------------------------------------------------------
 # Core: transformer_layer — one decoder block, all params explicit
 # ---------------------------------------------------------------------------
@@ -396,16 +448,30 @@ def flat_forward(
     else:
         hidden_states = embed_fn(input_ids)
     residual = None
+    num_tokens = hidden_states.shape[0]
 
-    for i in range(start_layer, end_layer):
-        hidden_states, residual = transformer_layer(
-            positions, hidden_states, residual,
-            input_ln_weights[i], post_attn_ln_weights[i], eps,
-            qkv_projs[i], o_projs[i], gate_up_projs[i], down_projs[i],
-            rotary_embs[i], attns[i],
-            q_size, kv_size,
-            bufs, backend,
-        )
+    if num_tokens == 1 and bufs is not None:
+        # BS=1 decode: use fused Triton kernels + pre-allocated buffers
+        for i in range(start_layer, end_layer):
+            hidden_states, residual = transformer_layer(
+                positions, hidden_states, residual,
+                input_ln_weights[i], post_attn_ln_weights[i], eps,
+                qkv_projs[i], o_projs[i], gate_up_projs[i], down_projs[i],
+                rotary_embs[i], attns[i],
+                q_size, kv_size,
+                bufs, backend,
+            )
+    else:
+        # General path: direct C++ ops, no nn.Module dispatch
+        for i in range(start_layer, end_layer):
+            hidden_states, residual = transformer_layer_general(
+                positions, hidden_states, residual,
+                input_ln_weights[i], post_attn_ln_weights[i], eps,
+                qkv_projs[i], o_projs[i], gate_up_projs[i], down_projs[i],
+                rotary_embs[i], attns[i],
+                q_size, kv_size,
+                backend,
+            )
 
     # Final norm
     ops.fused_add_rms_norm(hidden_states, residual, final_norm_w, eps)
