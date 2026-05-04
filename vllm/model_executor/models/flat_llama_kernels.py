@@ -110,6 +110,55 @@ def _norm_fp4_quant_kernel(
     tl.store(scale_out_ptr + byte_offset, sf_fp8.to(tl.uint8, bitcast=True))
 
 
+@triton.jit
+def _fp4_quant_kernel(
+    input_ptr, sf_scale_ptr, fp4_out_ptr, scale_out_ptr,
+    N: tl.constexpr, SCALE_STRIDE: tl.constexpr,
+):
+    """Standalone FP4 quant (no norm). One group of 16 per program.
+    Uses PTX E2M1 — faster than C++ scaled_fp4_quant at BS=1."""
+    pid = tl.program_id(0)
+    num_groups_per_row = N // 16
+    row = pid // num_groups_per_row
+    g = pid % num_groups_per_row
+    sf_scale = tl.load(sf_scale_ptr).to(tl.float32)
+
+    base = row * N + g * 16
+    pair_idx = tl.arange(0, 8)
+    even = tl.load(input_ptr + base + pair_idx * 2).to(tl.float32)
+    odd = tl.load(input_ptr + base + pair_idx * 2 + 1).to(tl.float32)
+
+    block_max = tl.maximum(tl.max(tl.abs(even)), tl.max(tl.abs(odd)))
+    sf_val = sf_scale * (block_max / 6.0)
+    sf_fp8 = sf_val.to(tl.float8e4nv)
+    sf_f32 = sf_fp8.to(tl.float32)
+    qs = tl.where(sf_f32 > 0.0, sf_scale / sf_f32, 0.0)
+
+    packed = tl.inline_asm_elementwise(
+        "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
+        " cvt.u16.u8 $0, tmp; }",
+        "=h, r, r", [even * qs, odd * qs],
+        dtype=tl.int16, is_pure=True, pack=1,
+    )
+    fp4_base = row * (N // 2) + g * 8
+    tl.store(fp4_out_ptr + fp4_base + pair_idx, packed.to(tl.uint8))
+
+    kTileIdx = g // 4
+    innerKIdx = g % 4
+    byte_offset = row * SCALE_STRIDE + kTileIdx * SCALE_STRIDE + innerKIdx
+    tl.store(scale_out_ptr + byte_offset, sf_fp8.to(tl.uint8, bitcast=True))
+
+
+def triton_fp4_quant(x, gs_inv, fp4_out, scale_int32):
+    """Triton FP4 quant — drop-in replacement for scaled_fp4_quant.out."""
+    M, N = x.shape
+    scale_bytes = scale_int32.view(torch.uint8)
+    scale_stride = scale_int32.shape[1] * 4
+    _fp4_quant_kernel[(M * (N // 16),)](
+        x, gs_inv, fp4_out, scale_bytes, N=N, SCALE_STRIDE=scale_stride,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Data structures — hold extracted params for one NVFP4 linear projection
 # ---------------------------------------------------------------------------
@@ -269,11 +318,8 @@ def transformer_layer(
     # 4. Attention (KV cache write + compute)
     attn_output = attn(q, k, v)
 
-    # 5. O projection
-    torch.ops._C.scaled_fp4_quant.out(
-        attn_output, o.input_scale_inv, True,
-        output=bufs.o_fp4, output_scale=bufs.o_scale,
-    )
+    # 5. O projection (Triton FP4 quant — faster than C++ at BS=1)
+    triton_fp4_quant(attn_output, o.input_scale_inv, bufs.o_fp4, bufs.o_scale)
     hidden_states = nvfp4_gemm(
         bufs.o_fp4, bufs.o_scale.view(torch.float8_e4m3fn), o, backend,
     )
