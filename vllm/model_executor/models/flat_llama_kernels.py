@@ -160,6 +160,80 @@ def triton_fp4_quant(x, gs_inv, fp4_out, scale_int32):
 
 
 # ---------------------------------------------------------------------------
+# Triton: fused RoPE + KV cache write (1 kernel instead of 2)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fused_rope_kv_kernel(
+    q_ptr, k_ptr, v_ptr,
+    cos_sin_ptr, positions_ptr,
+    kv_cache_ptr, slot_mapping_ptr,
+    k_scale_ptr, v_scale_ptr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HALF_ROT: tl.constexpr,
+    CS_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    KV_CACHE_IS_FP8: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+):
+    """Fused RoPE(Q,K) + KV cache write. Grid = (NUM_Q_HEADS,).
+    Each program handles one Q head's RoPE. Programs where
+    head_id < NUM_KV_HEADS also handle K rotation + KV cache write."""
+    head_id = tl.program_id(0)
+    pos = tl.load(positions_ptr)
+    d = tl.arange(0, HALF_ROT)
+
+    cos = tl.load(cos_sin_ptr + pos * CS_STRIDE + d).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * CS_STRIDE + HALF_ROT + d).to(tl.float32)
+
+    # RoPE on this Q head
+    q_base = head_id * HEAD_DIM
+    x1 = tl.load(q_ptr + q_base + d).to(tl.float32)
+    x2 = tl.load(q_ptr + q_base + HALF_ROT + d).to(tl.float32)
+    tl.store(q_ptr + q_base + d, (x1 * cos - x2 * sin).to(tl.bfloat16))
+    tl.store(q_ptr + q_base + HALF_ROT + d, (x2 * cos + x1 * sin).to(tl.bfloat16))
+
+    # First GQA_RATIO programs also handle K rotation + KV cache write
+    # (one KV head per GQA_RATIO Q heads)
+    if head_id % GQA_RATIO == 0 and head_id // GQA_RATIO < NUM_KV_HEADS:
+        kv_h = head_id // GQA_RATIO
+        hd = kv_h * HEAD_DIM
+        k1 = tl.load(k_ptr + hd + d).to(tl.float32)
+        k2 = tl.load(k_ptr + hd + HALF_ROT + d).to(tl.float32)
+        k_rot1 = (k1 * cos - k2 * sin).to(tl.bfloat16)
+        k_rot2 = (k2 * cos + k1 * sin).to(tl.bfloat16)
+        tl.store(k_ptr + hd + d, k_rot1)
+        tl.store(k_ptr + hd + HALF_ROT + d, k_rot2)
+
+        # Write to KV cache
+        slot = tl.load(slot_mapping_ptr)
+        block_idx = slot // BLOCK_SIZE
+        block_off = slot % BLOCK_SIZE
+        kv_s0 = 2 * BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM
+        kv_s1 = BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM
+        kv_s2 = NUM_KV_HEADS * HEAD_DIM
+        k_off = block_idx * kv_s0 + block_off * kv_s2 + hd
+        v_off = block_idx * kv_s0 + kv_s1 + block_off * kv_s2 + hd
+        dd = tl.arange(0, HEAD_DIM)
+
+        if KV_CACHE_IS_FP8:
+            ks = tl.load(k_scale_ptr).to(tl.float32)
+            vs = tl.load(v_scale_ptr).to(tl.float32)
+            k_full = tl.load(k_ptr + hd + dd).to(tl.float32)
+            tl.store(kv_cache_ptr + k_off + dd, (k_full * ks).to(tl.float8e4nv))
+            v_vals = tl.load(v_ptr + hd + dd).to(tl.float32)
+            tl.store(kv_cache_ptr + v_off + dd, (v_vals * vs).to(tl.float8e4nv))
+        else:
+            tl.store(kv_cache_ptr + k_off + d, k_rot1)
+            tl.store(kv_cache_ptr + k_off + HALF_ROT + d, k_rot2)
+            v_vals = tl.load(v_ptr + hd + dd)
+            tl.store(kv_cache_ptr + v_off + dd, v_vals)
+
+
+# ---------------------------------------------------------------------------
 # Data structures — hold extracted params for one NVFP4 linear projection
 # ---------------------------------------------------------------------------
 
