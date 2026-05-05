@@ -246,6 +246,11 @@ class FlatLlamaModel(nn.Module):
                 hidden_states.device,
             )
 
+        # Prefill buffer cache: mutable list used by flat_forward to
+        # lazily create and reuse pre-allocated FP4 buffers for prefill
+        if not hasattr(self, "_prefill_bufs_cache"):
+            self._prefill_bufs_cache: list = []
+
         bufs = getattr(self, "_shared_bufs", None)
 
         hidden_states = flat_forward(
@@ -269,6 +274,9 @@ class FlatLlamaModel(nn.Module):
             start_layer=0,
             end_layer=len(self._qkv_projs),
             hidden_states_in=hidden_states,
+            prefill_bufs_cache=self._prefill_bufs_cache,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self._intermediate_size,
         )
 
         if not get_pp_group().is_last_rank:

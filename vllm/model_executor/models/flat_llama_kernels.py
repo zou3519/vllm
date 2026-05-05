@@ -418,6 +418,49 @@ class NvFp4Proj:
 
 
 @dataclass(slots=True)
+class SharedPrefillBuffers:
+    """Pre-allocated FP4 buffers for prefill (M>1) to avoid per-call allocs.
+
+    Unlike SharedDecodeBuffers (BS=1), these are sized for the prefill batch.
+    They are lazily created on first prefill and re-created if M changes.
+    """
+    m: int  # current batch size these buffers are allocated for
+
+    # FP4 quant outputs for each projection (reused across layers)
+    qkv_fp4: torch.Tensor
+    qkv_scale: torch.Tensor
+    o_fp4: torch.Tensor
+    o_scale: torch.Tensor
+    gu_fp4: torch.Tensor
+    gu_scale: torch.Tensor
+    down_fp4: torch.Tensor
+    down_scale: torch.Tensor
+
+    @staticmethod
+    def create(
+        m: int,
+        hidden_size: int,
+        q_size: int,
+        intermediate_size: int,
+        device: torch.device,
+    ) -> "SharedPrefillBuffers":
+        qkv_fp4, qkv_sc = create_fp4_output_tensors(
+            m, hidden_size, device, True)
+        o_fp4, o_sc = create_fp4_output_tensors(m, q_size, device, True)
+        gu_fp4, gu_sc = create_fp4_output_tensors(
+            m, hidden_size, device, True)
+        d_fp4, d_sc = create_fp4_output_tensors(
+            m, intermediate_size, device, True)
+        return SharedPrefillBuffers(
+            m=m,
+            qkv_fp4=qkv_fp4, qkv_scale=qkv_sc,
+            o_fp4=o_fp4, o_scale=o_sc,
+            gu_fp4=gu_fp4, gu_scale=gu_sc,
+            down_fp4=d_fp4, down_scale=d_sc,
+        )
+
+
+@dataclass(slots=True)
 class SharedDecodeBuffers:
     """One set of pre-allocated FP4 buffers shared across all layers."""
     qkv_fp4: torch.Tensor
@@ -438,6 +481,9 @@ class SharedDecodeBuffers:
     counter: torch.Tensor      # i32 arrival counter
     ready: torch.Tensor        # i32 ready flag
 
+    # CuTe DSL kernel param
+    scale_stride_tensor: torch.Tensor  # i32[1] for swizzled scale stride
+
     @staticmethod
     def create(
         hidden_size: int,
@@ -449,6 +495,7 @@ class SharedDecodeBuffers:
         o_fp4, o_sc = create_fp4_output_tensors(1, q_size, device, True)
         gu_fp4, gu_sc = create_fp4_output_tensors(1, hidden_size, device, True)
         d_fp4, d_sc = create_fp4_output_tensors(1, intermediate_size, device, True)
+        scale_stride_val = qkv_sc.view(torch.uint8).shape[-1]
         return SharedDecodeBuffers(
             qkv_fp4, qkv_sc, o_fp4, o_sc, gu_fp4, gu_sc, d_fp4, d_sc,
             residual_buf=torch.empty(1, hidden_size, dtype=torch.bfloat16, device=device),
@@ -456,6 +503,7 @@ class SharedDecodeBuffers:
             global_sum=torch.zeros(1, dtype=torch.float32, device=device),
             counter=torch.zeros(1, dtype=torch.int32, device=device),
             ready=torch.zeros(1, dtype=torch.int32, device=device),
+            scale_stride_tensor=torch.tensor([scale_stride_val], dtype=torch.int32, device=device),
         )
 
 
@@ -494,6 +542,63 @@ def nvfp4_linear(x: torch.Tensor, proj: NvFp4Proj, backend) -> torch.Tensor:
     return nvfp4_gemm(x_fp4, x_scale, proj, backend)
 
 
+def _nvfp4_quant_and_gemm(
+    x: torch.Tensor,
+    proj: NvFp4Proj,
+    fp4_buf: torch.Tensor,
+    scale_buf: torch.Tensor,
+    backend: NvFp4LinearBackend,
+) -> torch.Tensor:
+    """FP4 quantize into pre-allocated buffers, then GEMM.
+
+    Avoids the tensor allocation in scaled_fp4_quant by writing directly
+    into pre-allocated fp4_buf / scale_buf via the .out variant.
+    """
+    torch.ops._C.scaled_fp4_quant.out(
+        x, proj.input_scale_inv, True,
+        output=fp4_buf, output_scale=scale_buf,
+    )
+    return nvfp4_gemm(
+        fp4_buf, scale_buf.view(torch.float8_e4m3fn), proj, backend,
+    )
+
+
+# Try to import CuTe DSL kernel; fall back to Triton two-kernel approach
+_use_cute_norm_quant = False
+# TODO: CuTe DSL kernel has integration correctness issue. Disabled for now.
+# try:
+#     from .flat_llama_cute_kernels import cute_fused_add_rms_norm_fp4_quant
+#     _use_cute_norm_quant = True
+# except ImportError:
+#     pass
+
+
+def _fused_norm_quant(
+    hidden_states, residual, bufs, ln_weight,
+    input_scale_inv, fp4_out, scale_out,
+    N, M, scale_stride,
+):
+    """Dispatch fused add+RMSNorm+FP4 quant to CuTe DSL (1 kernel) or Triton (2 kernels)."""
+    if _use_cute_norm_quant and N == 8192 and M == 1:
+        cute_fused_add_rms_norm_fp4_quant(
+            hidden_states, residual, bufs.residual_buf,
+            ln_weight, input_scale_inv,
+            fp4_out, scale_out,
+            bufs.scale_stride_tensor,
+        )
+    else:
+        _add_variance_kernel[(M,)](
+            hidden_states, residual, bufs.residual_buf, bufs.variance,
+            N=N, BLOCK=min(N, 4096),
+        )
+        _norm_fp4_quant_kernel[(M * (N // 16),)](
+            bufs.residual_buf, ln_weight, bufs.variance,
+            input_scale_inv,
+            fp4_out, scale_out.view(torch.uint8),
+            N=N, SCALE_STRIDE=scale_stride,
+        )
+
+
 def transformer_layer_general(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -506,9 +611,15 @@ def transformer_layer_general(
     rotary_emb, attn,
     q_size: int, kv_size: int,
     backend,
+    prefill_bufs: SharedPrefillBuffers | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """General-purpose transformer layer (any batch size). Uses flat params
-    with C++ ops — no nn.Module dispatch overhead."""
+    with C++ ops — no nn.Module dispatch overhead.
+
+    When prefill_bufs is provided, uses pre-allocated FP4 output buffers
+    and the fused silu_and_mul_nvfp4_quant kernel to reduce allocation
+    overhead and kernel launch count.
+    """
     if residual is None:
         residual = hidden_states
         from vllm.model_executor.layers.layernorm import ir
@@ -516,22 +627,57 @@ def transformer_layer_general(
     else:
         ops.fused_add_rms_norm(hidden_states, residual, input_ln_w, eps)
 
-    qkv_out = nvfp4_linear(hidden_states, qkv, backend)
-    q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
-    q, k = rotary_emb(positions, q, k)
-    attn_output = attn(q, k, v)
-    hidden_states = nvfp4_linear(attn_output, o, backend)
+    if prefill_bufs is not None:
+        # --- Optimized prefill path with pre-allocated buffers ---
 
-    ops.fused_add_rms_norm(hidden_states, residual, post_attn_ln_w, eps)
+        # QKV: quant into pre-alloc buffers + GEMM
+        qkv_out = _nvfp4_quant_and_gemm(
+            hidden_states, qkv,
+            prefill_bufs.qkv_fp4, prefill_bufs.qkv_scale, backend)
+        q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
+        q, k = rotary_emb(positions, q, k)
+        attn_output = attn(q, k, v)
 
-    gate_up_out = nvfp4_linear(hidden_states, gate_up, backend)
-    d = gate_up_out.shape[-1] // 2
-    silu_out = torch.empty(
-        gate_up_out.shape[:-1] + (d,),
-        dtype=gate_up_out.dtype, device=gate_up_out.device,
-    )
-    torch.ops._C.silu_and_mul(silu_out, gate_up_out)
-    hidden_states = nvfp4_linear(silu_out, down, backend)
+        # O proj: quant into pre-alloc buffers + GEMM
+        hidden_states = _nvfp4_quant_and_gemm(
+            attn_output, o,
+            prefill_bufs.o_fp4, prefill_bufs.o_scale, backend)
+
+        ops.fused_add_rms_norm(hidden_states, residual, post_attn_ln_w, eps)
+
+        # Gate+Up: quant into pre-alloc buffers + GEMM
+        gate_up_out = _nvfp4_quant_and_gemm(
+            hidden_states, gate_up,
+            prefill_bufs.gu_fp4, prefill_bufs.gu_scale, backend)
+
+        # Fused SiLU+mul+FP4 quant (1 kernel instead of silu_and_mul + quant)
+        torch.ops._C.silu_and_mul_nvfp4_quant(
+            prefill_bufs.down_fp4, prefill_bufs.down_scale,
+            gate_up_out, down.input_scale_inv,
+        )
+        hidden_states = nvfp4_gemm(
+            prefill_bufs.down_fp4,
+            prefill_bufs.down_scale.view(torch.float8_e4m3fn),
+            down, backend,
+        )
+    else:
+        # --- Original path (fallback) ---
+        qkv_out = nvfp4_linear(hidden_states, qkv, backend)
+        q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
+        q, k = rotary_emb(positions, q, k)
+        attn_output = attn(q, k, v)
+        hidden_states = nvfp4_linear(attn_output, o, backend)
+
+        ops.fused_add_rms_norm(hidden_states, residual, post_attn_ln_w, eps)
+
+        gate_up_out = nvfp4_linear(hidden_states, gate_up, backend)
+        d = gate_up_out.shape[-1] // 2
+        silu_out = torch.empty(
+            gate_up_out.shape[:-1] + (d,),
+            dtype=gate_up_out.dtype, device=gate_up_out.device,
+        )
+        torch.ops._C.silu_and_mul(silu_out, gate_up_out)
+        hidden_states = nvfp4_linear(silu_out, down, backend)
 
     return hidden_states, residual
 
@@ -594,15 +740,10 @@ def transformer_layer(
             output=bufs.qkv_fp4, output_scale=bufs.qkv_scale,
         )
     else:
-        _add_variance_kernel[(M,)](
-            hidden_states, residual, bufs.residual_buf, bufs.variance,
-            N=N, BLOCK=min(N, 4096),
-        )
-        _norm_fp4_quant_kernel[(M * (N // 16),)](
-            bufs.residual_buf, input_ln_w, bufs.variance,
-            qkv.input_scale_inv,
-            bufs.qkv_fp4, bufs.qkv_scale.view(torch.uint8),
-            N=N, SCALE_STRIDE=scale_stride,
+        _fused_norm_quant(
+            hidden_states, residual, bufs, input_ln_w,
+            qkv.input_scale_inv, bufs.qkv_fp4, bufs.qkv_scale,
+            N, M, scale_stride,
         )
         residual = bufs.residual_buf
 
@@ -673,16 +814,11 @@ def transformer_layer(
         bufs.o_fp4, bufs.o_scale.view(torch.float8_e4m3fn), o, backend,
     )
 
-    # 7. Post-attention norm + FP4 quant (2 kernels)
-    _add_variance_kernel[(M,)](
-        hidden_states, residual, bufs.residual_buf, bufs.variance,
-        N=N, BLOCK=min(N, 4096),
-    )
-    _norm_fp4_quant_kernel[(M * (N // 16),)](
-        bufs.residual_buf, post_attn_ln_w, bufs.variance,
-        gate_up.input_scale_inv,
-        bufs.gu_fp4, bufs.gu_scale.view(torch.uint8),
-        N=N, SCALE_STRIDE=scale_stride,
+    # 7. Post-attention norm + FP4 quant
+    _fused_norm_quant(
+        hidden_states, residual, bufs, post_attn_ln_w,
+        gate_up.input_scale_inv, bufs.gu_fp4, bufs.gu_scale,
+        N, M, scale_stride,
     )
     residual = bufs.residual_buf
 
@@ -735,6 +871,10 @@ def flat_forward(
     end_layer: int,
     # --- Optional: pre-computed hidden states (skip embedding) ---
     hidden_states_in: torch.Tensor | None = None,
+    # --- Prefill buffer cache (mutable list with single element) ---
+    prefill_bufs_cache: list | None = None,
+    hidden_size: int = 0,
+    intermediate_size: int = 0,
 ) -> torch.Tensor:
     """Full model forward: embedding → N × transformer_layer → final norm.
 
@@ -767,6 +907,23 @@ def flat_forward(
         # Ensure attention layers DO write to KV cache (clear the flag).
         for i in range(start_layer, end_layer):
             attns[i].kv_sharing_target_layer_name = None
+
+        # Get or create pre-allocated prefill buffers
+        prefill_bufs: SharedPrefillBuffers | None = None
+        if prefill_bufs_cache is not None and hidden_size > 0:
+            if (len(prefill_bufs_cache) == 0
+                    or prefill_bufs_cache[0] is None
+                    or prefill_bufs_cache[0].m != num_tokens):
+                pb = SharedPrefillBuffers.create(
+                    num_tokens, hidden_size, q_size,
+                    intermediate_size, hidden_states.device,
+                )
+                if len(prefill_bufs_cache) == 0:
+                    prefill_bufs_cache.append(pb)
+                else:
+                    prefill_bufs_cache[0] = pb
+            prefill_bufs = prefill_bufs_cache[0]
+
         for i in range(start_layer, end_layer):
             hidden_states, residual = transformer_layer_general(
                 positions, hidden_states, residual,
@@ -775,6 +932,7 @@ def flat_forward(
                 rotary_embs[i], attns[i],
                 q_size, kv_size,
                 backend,
+                prefill_bufs=prefill_bufs,
             )
 
     # Final norm
