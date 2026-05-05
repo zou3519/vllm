@@ -3,7 +3,7 @@
 ## What this is
 
 A hand-optimized "flat" model definition for `nvidia/Llama-3.3-70B-Instruct-NVFP4`
-that beats vLLM's torch.compile'd model by 4-6% on BS=1 decode latency.
+that beats vLLM's torch.compile'd model by ~8% on BS=1 decode latency.
 
 The model bypasses vLLM's nn.Module hierarchy — the forward pass is a single
 `flat_forward()` function that calls `transformer_layer()` in a loop with all
@@ -82,113 +82,132 @@ torch.compile which we want to compare against).
 ## Current results (GB300, TP=1, BS=1)
 
 ```
-         TTFT       TPIT       Total (128in+128out)
-Flat:    85ms       12.2ms     1629ms
-Compiled: 107ms     12.5ms     1696ms
-Flat wins: 20%      2.9%       3.9%
+             TTFT       TPIT       Total (128in+128out)
+Compiled:    107ms      12.50ms    1696ms
+Flat+GEMV:   80ms       11.64ms    1559ms
+Flat wins:   25%        6.9%       8.1%
 ```
 
 ## Files
 
 - `vllm/model_executor/models/flat_llama.py` — model class (nn.Module for weight loading)
 - `vllm/model_executor/models/flat_llama_kernels.py` — `flat_forward()`, `transformer_layer()`, Triton kernels
-- `vllm/model_executor/models/flat_llama_cute_kernels.py` — CuTe DSL single-kernel norm+quant (WIP)
+- `vllm/model_executor/models/flat_llama_gemv.py` — NVFP4 GEMV kernel (raw CUDA via load_inline)
+- `vllm/model_executor/models/flat_llama_cute_kernels.py` — CuTe DSL kernels (deprecated, not used)
 - `vllm/model_executor/models/registry.py` — `FlatLlamaForCausalLM` registration
 - `benchmarks/benchmark_flat_llama.sh` — benchmark script
-- `flat_llama_perf_analysis.md` — detailed per-op breakdown
-- `flat_llama_dev_log.md` — development history
-- `cute_dsl_cuda_graph_issue.md` — CuTe DSL integration issues
+- `tests/bench_fp4_gemv.py` — GEMV tuning benchmark
+- `tests/test_single_cta_fused_kernel.py` — single-CTA norm+quant test
 
 ## Current optimization status
 
 ### What's integrated and working
-- Fused norm+FP4 quant (Triton 2-kernel with PTX E2M1) — saves 1 kernel/norm
+- Fused norm+FP4 quant (single-CTA Triton kernel) — 1 kernel per norm site (was 2)
 - Fused RoPE+KV cache write (Triton, 64 programs) — saves 1 kernel/layer
-- Fused silu+mul+FP4 quant (C++ built-in) — saves 2 kernels/layer
+- Fused silu+mul+FP4 quant with row-major scales (Triton) — for GEMV path
+- NVFP4 GEMV for down projection (raw CUDA) — 22.8μs vs 48μs CUTLASS (2.1×)
 - Triton FP4 quant for O input (faster than C++ at BS=1)
 - Pre-allocated FP4 buffers (SharedDecodeBuffers, SharedPrefillBuffers)
-- FULL CUDA graphs (no torch.compile)
-
-### Active work: CuTe DSL single-kernel norm+quant
-- Kernel is correct and 1.28x faster than Triton 2-kernel (20.5μs vs 26μs)
-- CUDA graph stream issue fixed (was launching on stream 0)
-- Current blocker: `_compiled_fn(*args)` Python dispatch overhead (~40μs/call)
-- Tried `from_dlpack` (5.4μs × 8 = 43μs) and `make_ptr` — both have overhead
-- The CuTe compiled function's `__call__` itself may be the bottleneck
-- Potential fix: extract raw CUfunction and launch via cuLaunchKernel
+- Weight scale unswizzling at load time (CUTLASS → row-major for GEMV)
+- FULL CUDA graphs (all kernels graph-compatible, no CuTe DSL)
 
 ### Investigated but not actionable
-- Custom GEMV (Triton, CuTe DSL, raw CUDA) — cannot beat autotuned CUTLASS
-- Down GEMM at 42% BW efficiency — structural CUTLASS limitation (K=28672)
-- CuTe DSL GEMV — 46μs for QKV (break-even with CUTLASS+quant)
+- GEMV for gate+up: 43μs vs 46μs CUTLASS — only 6.5% faster, not worth complexity
+- GEMV for QKV/O: 8-10μs vs 9μs CUTLASS — marginal improvement
+- CuTe DSL fused kernel: correct and 1.28× faster than Triton, but incompatible
+  with CUDA graphs (uses non-standard launch mechanism)
+- Custom GEMV (Triton): couldn't match raw CUDA GEMV performance
+- Down GEMM at 42% BW efficiency was structural CUTLASS limitation (K=28672)
+  — solved by switching to GEMV (72% efficiency)
 
-## Per-layer decode breakdown (11 kernels, 138μs/layer)
+## Per-layer decode breakdown (11 kernels, ~113μs/layer)
 
 ```
-Op                               μs     Pct
-──────────────────────────────────────────────
-Norm+FP4 quant (pre-attn)        4.2    3.0%   ← CuTe DSL could make this 1 kernel
-QKV GEMM                         9.0    6.5%
-RoPE+KV write (fused)            2.5    1.8%
-Attention decode                  9.3    6.7%
-Merge states                      2.3    1.7%
-FP4 quant (O input)              1.9    1.4%
-O GEMM                           9.0    6.5%
-Norm+FP4 quant (post-attn)       4.2    3.0%   ← CuTe DSL could make this 1 kernel
-Gate+Up GEMM                    46.0   33.3%
-Fused silu+mul+FP4 quant         1.8    1.3%
-Down GEMM                       48.0   34.7%
-──────────────────────────────────────────────
-TOTAL per layer                138.2
-80 layers                       11.1ms
-CUDA graph overhead              1.1ms
-Measured TPIT                   12.2ms
+Op                                    μs     Pct   Status
+─────────────────────────────────────────────────────────────
+Gate+Up GEMM (CUTLASS)              46.0   40.7%   ← biggest bottleneck (72% BW eff)
+GEMV down projection                22.8   20.2%   ★ was 48μs CUTLASS
+QKV GEMM (CUTLASS)                   9.0    8.0%   66% BW efficiency
+Attention decode (FlashInfer)        9.3    8.2%   external
+O GEMM (CUTLASS)                     9.0    8.0%   52% BW efficiency
+Norm+FP4 quant (pre-attn)            4.2    3.7%   ● single-CTA Triton
+Norm+FP4 quant (post-attn)           4.2    3.7%   ● single-CTA Triton
+RoPE+KV write (fused)                2.5    2.2%   ● Triton fused
+Merge states                         2.3    2.0%   external (FlashInfer)
+FP4 quant (O input)                  1.9    1.7%   Triton PTX E2M1
+Fused silu+mul+FP4 quant             1.8    1.6%   ★ Triton, row-major scales
+─────────────────────────────────────────────────────────────
+TOTAL per layer                    113.0
+80 layers                            9.0ms
+CUDA graph + framework overhead     ~2.5ms
+Measured TPIT                       11.64ms
 ```
 
-GEMMs = 81% of time. Small ops are fully optimized. The two norm+quant points
-(4.2μs each, 2 kernels each) are the only remaining fusion opportunity.
+77% of layer time is linear algebra (GEMM/GEMV). GEMMs are at 52-72% of
+peak memory bandwidth. The remaining 23% is attention, norm, quant, RoPE.
+
+## Memory bandwidth analysis
+
+```
+Projection       Weight MB   BW floor μs   Actual μs   Efficiency
+──────────────────────────────────────────────────────────────────
+QKV GEMM             47.2          5.9          9.0         66%
+O GEMM               37.7          4.7          9.0         52%
+Gate+Up GEMM        264.2         33.0         46.0         72%
+Down GEMV           132.1         16.5         22.8         72%
+```
+
+Theoretical floor: 40.5 GB weights / 8 TB/s = 5.06 ms/token.
+Measured: 11.64 ms/token = 43% of ideal.
+
+## Roofline vs context length
+
+```
+Context   KV cache   Weight     Total      BW floor   Est. TPIT
+  128      0.02 GB   40.5 GB   40.5 GB     5.06 ms    ~11.6 ms
+   1K      0.16 GB   40.5 GB   40.7 GB     5.08 ms    ~11.7 ms
+   8K      1.25 GB   40.5 GB   41.8 GB     5.22 ms    ~12.0 ms
+  32K      5.0  GB   40.5 GB   45.5 GB     5.69 ms    ~13.0 ms
+ 128K     20.0  GB   40.5 GB   60.5 GB     7.56 ms    ~17   ms
+```
+
+KV cache = weight crossover: ~260K tokens.
 
 ## Model architecture (what transformer_layer actually calls)
 
 ```python
-def transformer_layer(positions, hidden_states, residual,
-                      input_ln_w, post_attn_ln_w, eps,
-                      qkv, o, gate_up, down,  # NvFp4Proj dataclasses
-                      rotary_emb, attn,        # callables
-                      q_size, kv_size, bufs, backend):
+def transformer_layer(positions, hidden_states, residual, ...):
 
-    # 1-2. Fused norm + FP4 quant (Triton, 2 kernels)
-    _add_variance_kernel(hidden, residual → residual_buf, variance)
-    _norm_fp4_quant_kernel(residual_buf, weight, variance → fp4, scale)
+    # 1. Fused norm + FP4 quant (single-CTA Triton, 1 kernel)
+    _single_cta_add_rms_norm_fp4_quant(hidden, residual → residual_buf, fp4, scale)
 
-    # 3. QKV GEMM (CUTLASS autotuned)
+    # 2. QKV GEMM (CUTLASS autotuned)
     qkv_out = nvfp4_gemm(fp4, scale, qkv_proj)
     q, k, v = split(qkv_out)
 
-    # 4. Fused RoPE + KV cache write (Triton, 1 kernel)
+    # 3. Fused RoPE + KV cache write (Triton, 1 kernel)
     _fused_rope_kv_kernel(q, k, v, cos_sin, positions, kv_cache, slot_mapping)
 
-    # 5. Attention (FlashInfer)
-    attn_output = attn(q, k, v)  # kv_sharing skips redundant cache write
+    # 4. Attention (FlashInfer)
+    attn_output = attn(q, k, v)
 
-    # 6. FP4 quant for O input (Triton PTX, 1 kernel)
+    # 5. FP4 quant for O input (Triton PTX, 1 kernel)
     triton_fp4_quant(attn_output → fp4, scale)
 
-    # 7. O GEMM (CUTLASS autotuned)
+    # 6. O GEMM (CUTLASS autotuned)
     hidden_states = nvfp4_gemm(fp4, scale, o_proj)
 
-    # 8-9. Fused norm + FP4 quant (Triton, 2 kernels)
-    _add_variance_kernel(hidden, residual → residual_buf, variance)
-    _norm_fp4_quant_kernel(residual_buf, weight, variance → fp4, scale)
+    # 7. Fused norm + FP4 quant (single-CTA Triton, 1 kernel)
+    _single_cta_add_rms_norm_fp4_quant(hidden, residual → residual_buf, fp4, scale)
 
-    # 10. Gate+Up GEMM (CUTLASS autotuned)
+    # 8. Gate+Up GEMM (CUTLASS autotuned)
     gate_up_out = nvfp4_gemm(fp4, scale, gate_up_proj)
 
-    # 11. Fused SiLU+mul+FP4 quant (C++, 1 kernel)
-    silu_and_mul_nvfp4_quant(gate_up_out → fp4, scale)
+    # 9. Fused SiLU+mul+FP4 quant with row-major scales (Triton, 1 kernel)
+    triton_silu_mul_fp4_quant_rowmajor(gate_up_out → fp4, scale)
 
-    # 12. Down GEMM (CUTLASS autotuned)
-    hidden_states = nvfp4_gemm(fp4, scale, down_proj)
+    # 10. GEMV down projection (raw CUDA, 1 kernel)
+    nvfp4_gemv(weight, fp4, weight_scale_rowmajor, scale, hidden_states, alpha)
 
     return hidden_states, residual
 ```
@@ -198,3 +217,13 @@ The outer `flat_forward()` function does:
 2. Set `kv_sharing_target_layer_name` on all attention layers (for fused RoPE+KV)
 3. Loop: `transformer_layer()` × 80
 4. Final RMSNorm
+
+## Optimization history
+
+| Change | TPIT impact | Commit |
+|---|---|---|
+| Flat model (no nn.Module dispatch) | 12.50 → 12.43ms | initial |
+| Single-CTA fused norm+quant (Triton) | kernel: 20.9 → 18.9μs | efb1989 |
+| NVFP4 GEMV for down projection | kernel: 48 → 22.8μs | 0986... |
+| CUDA graph stream fix for GEMV | fixed silent graph capture failure | a41d961 |
+| Fused silu+mul+FP4 quant (Triton) | 11.89 → 11.64ms | 21ffb97 |
