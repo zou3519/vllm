@@ -134,3 +134,26 @@ is the key enabler of CUTLASS performance.
 - `vllm/model_executor/models/registry.py` — FlatLlamaForCausalLM registration
 - `benchmarks/benchmark_flat_llama.sh` — benchmark script
 - `flat_llama_dev_log.md` — development history
+
+## Corrected GEMM Efficiency Analysis (with scale data)
+
+| Projection | Weight | Scale | Total | Theory | Actual | Efficiency |
+|-----------|--------|-------|-------|--------|--------|------------|
+| QKV (8192→10240) | 42MB | 5MB | 47MB | 7.1μs | 9.0μs | 79% |
+| O (8192→8192) | 34MB | 4MB | 38MB | 5.7μs | 9.0μs | 64% |
+| Gate+Up (8192→57344) | 235MB | 29MB | 264MB | 40.0μs | 46.0μs | **87%** |
+| Down (28672→8192) | 117MB | 15MB | 132MB | 20.0μs | 48.0μs | **42%** |
+
+QKV and O inefficiency is from fixed kernel launch/setup overhead (absolute
+time is already <10μs). Gate+Up is near-optimal. Down's 42% efficiency is
+structural: K=28672 requires 112 tensor core K-iterations per output tile
+(vs 32 for Gate+Up), causing excessive pipeline fill/drain overhead.
+
+### Down GEMM optimization attempts
+
+- **Split-K (2 halves)**: Made it worse (2× kernel launches + overhead)
+- **CuTe DSL cute-dsl backend**: 103μs without autotune, worse than CUTLASS 48μs
+- **Custom GEMV approaches**: Cannot beat autotuned CUTLASS tensor cores
+- **Root cause**: CUTLASS architectural limitation — large K with small N
+  causes poor pipeline utilization. Would need CUTLASS-internal changes
+  (e.g., persistent scheduling, larger K-tiles) to fix.
