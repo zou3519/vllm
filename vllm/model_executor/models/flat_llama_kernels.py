@@ -372,6 +372,8 @@ class NvFp4Proj:
     input_scale_inv: torch.Tensor  # 1 / input_global_scale
     weights_padding: int           # K-dimension padding bytes
     output_size: int               # unpadded output dim
+    weight_scale_rowmajor: torch.Tensor | None = None  # [out, in/16] FP8 row-major
+    alpha_float: float = 0.0  # cached alpha for GEMV (avoids GPU→CPU sync)
 
 
 @dataclass(slots=True)
@@ -441,6 +443,11 @@ class SharedDecodeBuffers:
     # CuTe DSL kernel param
     scale_stride_tensor: torch.Tensor  # i32[1] for swizzled scale stride
 
+    # GEMV buffers for down projection (non-swizzled FP4 + row-major scales)
+    down_fp4_gemv: torch.Tensor | None = None
+    down_scale_gemv: torch.Tensor | None = None
+    silu_out: torch.Tensor | None = None
+
     @staticmethod
     def create(
         hidden_size: int,
@@ -453,6 +460,9 @@ class SharedDecodeBuffers:
         gu_fp4, gu_sc = create_fp4_output_tensors(1, hidden_size, device, True)
         d_fp4, d_sc = create_fp4_output_tensors(1, intermediate_size, device, True)
         scale_stride_val = qkv_sc.view(torch.uint8).shape[-1]
+        # Non-swizzled FP4 buffers for GEMV down projection
+        d_fp4_gemv, d_sc_gemv = create_fp4_output_tensors(
+            1, intermediate_size, device, False)
         return SharedDecodeBuffers(
             qkv_fp4, qkv_sc, o_fp4, o_sc, gu_fp4, gu_sc, d_fp4, d_sc,
             residual_buf=torch.empty(1, hidden_size, dtype=torch.bfloat16, device=device),
@@ -461,6 +471,9 @@ class SharedDecodeBuffers:
             counter=torch.zeros(1, dtype=torch.int32, device=device),
             ready=torch.zeros(1, dtype=torch.int32, device=device),
             scale_stride_tensor=torch.tensor([scale_stride_val], dtype=torch.int32, device=device),
+            down_fp4_gemv=d_fp4_gemv,
+            down_scale_gemv=d_sc_gemv,
+            silu_out=torch.empty(1, intermediate_size, dtype=torch.bfloat16, device=device),
         )
 
 
@@ -773,13 +786,28 @@ def transformer_layer(
         bufs.gu_fp4, bufs.gu_scale.view(torch.float8_e4m3fn), gate_up, backend,
     )
 
-    # 8+9. Fused SiLU+mul+FP4 quant → down projection
-    torch.ops._C.silu_and_mul_nvfp4_quant(
-        bufs.down_fp4, bufs.down_scale, gate_up_out, down.input_scale_inv,
-    )
-    hidden_states = nvfp4_gemm(
-        bufs.down_fp4, bufs.down_scale.view(torch.float8_e4m3fn), down, backend,
-    )
+    # 8+9. SiLU+mul → FP4 quant (non-swizzled) → GEMV down projection
+    if down.weight_scale_rowmajor is not None:
+        torch.ops._C.silu_and_mul(bufs.silu_out, gate_up_out)
+        torch.ops._C.scaled_fp4_quant.out(
+            bufs.silu_out, down.input_scale_inv, False,
+            output=bufs.down_fp4_gemv,
+            output_scale=bufs.down_scale_gemv,
+        )
+        from .flat_llama_gemv import nvfp4_gemv
+        nvfp4_gemv(
+            down.weight, bufs.down_fp4_gemv,
+            down.weight_scale_rowmajor, bufs.down_scale_gemv,
+            hidden_states, down.alpha_float,
+        )
+    else:
+        torch.ops._C.silu_and_mul_nvfp4_quant(
+            bufs.down_fp4, bufs.down_scale, gate_up_out, down.input_scale_inv,
+        )
+        hidden_states = nvfp4_gemm(
+            bufs.down_fp4, bufs.down_scale.view(torch.float8_e4m3fn),
+            down, backend,
+        )
 
     return hidden_states, residual
 
@@ -891,8 +919,22 @@ def flat_forward(
 # ---------------------------------------------------------------------------
 
 
-def extract_nvfp4_proj(linear_module: torch.nn.Module) -> NvFp4Proj:
+def extract_nvfp4_proj(
+    linear_module: torch.nn.Module,
+    enable_gemv: bool = False,
+) -> NvFp4Proj:
     """Extract NVFP4 params from a vLLM ColumnParallelLinear/RowParallelLinear."""
+    weight_scale_rowmajor = None
+    alpha_float = 0.0
+    if enable_gemv:
+        from .flat_llama_gemv import unswizzle_blockscale, _ensure_compiled
+        _ensure_compiled()
+        ws = linear_module.weight_scale
+        n_groups = linear_module.weight.shape[1] // 8  # K_fp4x2 / 8
+        weight_scale_rowmajor = unswizzle_blockscale(
+            ws, linear_module.weight.shape[0], n_groups,
+        )
+        alpha_float = float(linear_module.alpha)
     return NvFp4Proj(
         weight=linear_module.weight,
         weight_scale=linear_module.weight_scale,
@@ -900,6 +942,8 @@ def extract_nvfp4_proj(linear_module: torch.nn.Module) -> NvFp4Proj:
         input_scale_inv=linear_module.input_global_scale_inv,
         weights_padding=getattr(linear_module, "weights_padding_cols", 0),
         output_size=linear_module.output_size_per_partition,
+        weight_scale_rowmajor=weight_scale_rowmajor,
+        alpha_float=alpha_float,
     )
 
 
@@ -921,7 +965,7 @@ def extract_all_layer_params(layers, start_layer, end_layer):
         qkv_projs.append(extract_nvfp4_proj(layer.self_attn.qkv_proj))
         o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj))
         gate_up_projs.append(extract_nvfp4_proj(layer.mlp.gate_up_proj))
-        down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj))
+        down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj, enable_gemv=True))
         rotary_embs.append(layer.self_attn.rotary_emb)
         attn_layer = layer.self_attn.attn
         attns.append(attn_layer)
