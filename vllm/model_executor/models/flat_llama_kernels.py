@@ -272,6 +272,79 @@ def triton_fp4_quant(x, gs_inv, fp4_out, scale_int32):
 
 
 # ---------------------------------------------------------------------------
+# Triton: fused SiLU+mul + FP4 quant with ROW-MAJOR scales (for GEMV)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _silu_mul_fp4_quant_rowmajor_kernel(
+    gate_up_ptr, sf_scale_ptr, fp4_out_ptr, scale_out_ptr,
+    HALF_N: tl.constexpr,
+):
+    """Fused SiLU(gate)*up + FP4 quant with row-major FP8 scales.
+
+    gate_up_ptr: [M, 2*HALF_N] BF16 — first half is gate, second is up.
+    One program per group of 16 output elements (after silu*mul).
+    """
+    pid = tl.program_id(0)
+    num_groups = HALF_N // 16
+    row = pid // num_groups
+    g = pid % num_groups
+
+    sf_scale = tl.load(sf_scale_ptr).to(tl.float32)
+    pair_idx = tl.arange(0, 8)
+    base = g * 16
+    even_off = row * (2 * HALF_N) + base + pair_idx * 2
+    odd_off = even_off + 1
+
+    gate_even = tl.load(gate_up_ptr + even_off).to(tl.float32)
+    gate_odd = tl.load(gate_up_ptr + odd_off).to(tl.float32)
+    up_even = tl.load(gate_up_ptr + even_off + HALF_N).to(tl.float32)
+    up_odd = tl.load(gate_up_ptr + odd_off + HALF_N).to(tl.float32)
+
+    # SiLU(gate) * up
+    silu_even = (gate_even * tl.sigmoid(gate_even)) * up_even
+    silu_odd = (gate_odd * tl.sigmoid(gate_odd)) * up_odd
+
+    # FP4 quantize with row-major scale output
+    block_max = tl.maximum(
+        tl.max(tl.abs(silu_even)), tl.max(tl.abs(silu_odd)))
+    sf_val = sf_scale * (block_max / 6.0)
+    sf_fp8 = sf_val.to(tl.float8e4nv)
+    sf_f32 = sf_fp8.to(tl.float32)
+    qs = tl.where(sf_f32 > 0.0, sf_scale / sf_f32, 0.0)
+
+    packed = tl.inline_asm_elementwise(
+        "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
+        " cvt.u16.u8 $0, tmp; }",
+        "=h, r, r", [silu_even * qs, silu_odd * qs],
+        dtype=tl.int16, is_pure=True, pack=1,
+    )
+    fp4_base = row * (HALF_N // 2) + g * 8
+    tl.store(fp4_out_ptr + fp4_base + pair_idx, packed.to(tl.uint8))
+
+    # Row-major scale: just store at group index g
+    tl.store(scale_out_ptr + row * num_groups + g,
+             sf_fp8.to(tl.uint8, bitcast=True))
+
+
+def triton_silu_mul_fp4_quant_rowmajor(
+    gate_up: torch.Tensor,
+    sf_scale_inv: torch.Tensor,
+    fp4_out: torch.Tensor,
+    scale_out: torch.Tensor,
+) -> None:
+    """Fused SiLU+mul+FP4 quant with row-major scales for GEMV."""
+    M = gate_up.shape[0]
+    half_n = gate_up.shape[1] // 2
+    num_groups = half_n // 16
+    _silu_mul_fp4_quant_rowmajor_kernel[(M * num_groups,)](
+        gate_up, sf_scale_inv, fp4_out, scale_out,
+        HALF_N=half_n,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Triton: fused RoPE + KV cache write (1 kernel instead of 2)
 # ---------------------------------------------------------------------------
 
@@ -786,13 +859,11 @@ def transformer_layer(
         bufs.gu_fp4, bufs.gu_scale.view(torch.float8_e4m3fn), gate_up, backend,
     )
 
-    # 8+9. SiLU+mul → FP4 quant (non-swizzled) → GEMV down projection
+    # 8+9. Fused SiLU+mul+FP4 quant (row-major scales) → GEMV down projection
     if down.weight_scale_rowmajor is not None:
-        torch.ops._C.silu_and_mul(bufs.silu_out, gate_up_out)
-        torch.ops._C.scaled_fp4_quant.out(
-            bufs.silu_out, down.input_scale_inv, False,
-            output=bufs.down_fp4_gemv,
-            output_scale=bufs.down_scale_gemv,
+        triton_silu_mul_fp4_quant_rowmajor(
+            gate_up_out, down.input_scale_inv,
+            bufs.down_fp4_gemv, bufs.down_scale_gemv,
         )
         from .flat_llama_gemv import nvfp4_gemv
         nvfp4_gemv(
