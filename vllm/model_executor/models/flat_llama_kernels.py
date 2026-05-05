@@ -212,6 +212,15 @@ def triton_single_cta_fused_add_rms_norm_fp4_quant(
     row_major_scales: bool = False,
 ) -> None:
     N = hidden_states.shape[-1]
+    if row_major_scales and N == 8192:
+        from .flat_llama_norm_quant import add_rms_norm_fp4_quant_8192
+        add_rms_norm_fp4_quant_8192(
+            hidden_states, residual, residual_out,
+            weight, sf_scale_inv,
+            fp4_out, scale_out,
+        )
+        return
+
     if row_major_scales:
         scale_bytes = scale_out
         scale_stride = 0
@@ -580,12 +589,15 @@ class SharedDecodeBuffers:
     gu_scale_gemv: torch.Tensor | None = None
     down_fp4_gemv: torch.Tensor | None = None
     down_scale_gemv: torch.Tensor | None = None
+    qkv_out: torch.Tensor | None = None
+    gate_up_out: torch.Tensor | None = None
     silu_out: torch.Tensor | None = None
 
     @staticmethod
     def create(
         hidden_size: int,
         q_size: int,
+        kv_size: int,
         intermediate_size: int,
         device: torch.device,
     ) -> "SharedDecodeBuffers":
@@ -619,6 +631,12 @@ class SharedDecodeBuffers:
             gu_scale_gemv=gu_sc_g,
             down_fp4_gemv=d_fp4_g,
             down_scale_gemv=d_sc_g,
+            qkv_out=torch.empty(
+                1, q_size + 2 * kv_size,
+                dtype=torch.bfloat16, device=device),
+            gate_up_out=torch.empty(
+                1, intermediate_size * 2,
+                dtype=torch.bfloat16, device=device),
             silu_out=torch.empty(1, intermediate_size, dtype=torch.bfloat16, device=device),
         )
 
@@ -870,7 +888,8 @@ def transformer_layer(
     # 2. QKV projection
     if use_gemv:
         from .flat_llama_gemv import nvfp4_gemv as _gemv
-        qkv_out = torch.empty(1, qkv.output_size, dtype=torch.bfloat16, device=hidden_states.device)
+        qkv_out = bufs.qkv_out
+        assert qkv_out is not None
         _gemv(
             qkv.weight, bufs.qkv_fp4_gemv.view(-1),
             qkv.weight_scale_rowmajor, bufs.qkv_scale_gemv.view(-1),
@@ -964,7 +983,8 @@ def transformer_layer(
             row_major_scales=True,
         )
         residual = bufs.residual_buf
-        gate_up_out = torch.empty(1, gate_up.output_size, dtype=torch.bfloat16, device=hidden_states.device)
+        gate_up_out = bufs.gate_up_out
+        assert gate_up_out is not None
         from .flat_llama_gemv import nvfp4_gemv as _gemv2
         _gemv2(
             gate_up.weight, bufs.gu_fp4_gemv.view(-1),

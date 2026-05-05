@@ -39,6 +39,7 @@ layers of interconnected nodes").
 
 ### Total latency (TTFT + decode)
 ```bash
+CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 vllm bench latency \
     --model nvidia/Llama-3.3-70B-Instruct-NVFP4 \
     --tensor-parallel-size 1 \
@@ -53,6 +54,11 @@ vllm bench latency \
 ```python
 import time, torch
 from vllm import LLM, SamplingParams
+
+# Use offline mode when the checkpoint is already cached locally; otherwise
+# Hugging Face HEAD/API calls can dominate or fail before vLLM reads the cache.
+# Run as:
+#   CUDA_VISIBLE_DEVICES=3 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python ...
 
 def measure(name, **kwargs):
     llm = LLM(model='nvidia/Llama-3.3-70B-Instruct-NVFP4',
@@ -99,11 +105,23 @@ Flat+GEMV:   78ms        9.92ms    1345ms
 Flat wins:   27%        20.6%      20.7%
 ```
 
+Latest local GPU3 run with the specialized raw CUDA `N=8192` row-major
+norm+FP4 quant path:
+
+```
+Flat+GEMV+CUDA norm/quant: TTFT=83.807ms  TPIT=9.518ms  Total=1292.627ms
+```
+
+Sanity prompts still produced sensible answers:
+- `17 * 23` → `391!`
+- capital of France → `Paris!!!`
+
 ## Files
 
 - `vllm/model_executor/models/flat_llama.py` — model class (nn.Module for weight loading)
 - `vllm/model_executor/models/flat_llama_kernels.py` — `flat_forward()`, `transformer_layer()`, Triton kernels
 - `vllm/model_executor/models/flat_llama_gemv.py` — NVFP4 GEMV kernel (raw CUDA via load_inline)
+- `vllm/model_executor/models/flat_llama_norm_quant.py` — specialized BS=1, N=8192 raw CUDA norm+FP4 quant kernel
 - `vllm/model_executor/models/flat_llama_cute_kernels.py` — CuTe DSL kernels (deprecated, not used)
 - `vllm/model_executor/models/registry.py` — `FlatLlamaForCausalLM` registration
 - `benchmarks/benchmark_flat_llama.sh` — benchmark script
@@ -114,6 +132,8 @@ Flat wins:   27%        20.6%      20.7%
 
 ### What's integrated and working
 - Fused norm+FP4 quant (single-CTA Triton kernel) — 1 kernel per norm site (was 2)
+- Specialized raw CUDA norm+FP4 quant for BS=1, N=8192, row-major scales —
+  byte-exact vs the Triton path and ~8.20μs vs ~14.37μs standalone on GPU3
 - Fused RoPE+KV cache write (Triton, 64 programs) — saves 1 kernel/layer
 - Fused silu+mul+FP4 quant with row-major scales (Triton) — for GEMV path
 - NVFP4 GEMV for down projection (raw CUDA) — 22.8μs vs 48μs CUTLASS (2.1×)
@@ -242,6 +262,7 @@ The outer `flat_forward()` function does:
 | BF16-input GEMV (added, reverted for O) | 20.7μs — too slow at K=4096 | 0510ef7 |
 | GEMV for O projection (FP4 input) | 11.54 → 11.08ms | c375faf |
 | GEMV for ALL projections (QKV+Gate+Up) | 11.08 → 9.92ms | a7d19f9 |
+| Raw CUDA norm+FP4 quant for N=8192 row-major decode | kernel: 14.37 → 8.20μs | local |
 
 ## Workflow
 
