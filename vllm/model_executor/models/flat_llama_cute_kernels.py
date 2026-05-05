@@ -16,7 +16,7 @@ import torch
 import cuda.bindings.driver as cuda_driver
 import cutlass
 from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cute.typing import (
     Float32, Uint8, Uint16, Int32, Pointer,
 )
@@ -205,24 +205,24 @@ def fused_add_rms_norm_fp4_quant_kernel(
 
 @cute.jit
 def _launch_fused_kernel(
-    hidden_t: cute.Tensor, residual_t: cute.Tensor,
-    residual_out_t: cute.Tensor, weight_t: cute.Tensor,
-    sf_scale_inv_t: cute.Tensor,
-    fp4_out_t: cute.Tensor, scale_out_t: cute.Tensor,
-    scale_stride_t: cute.Tensor,
+    hidden_p: Pointer, residual_p: Pointer,
+    residual_out_p: Pointer, weight_p: Pointer,
+    sf_scale_inv_p: Pointer,
+    fp4_out_p: Pointer, scale_out_p: Pointer,
+    scale_stride_p: Pointer,
     stream: cuda_driver.CUstream = cuda_driver.CUstream(0),
 ):
     fused_add_rms_norm_fp4_quant_kernel(
-        hidden_t.iterator, residual_t.iterator,
-        residual_out_t.iterator, weight_t.iterator,
-        sf_scale_inv_t.iterator,
-        fp4_out_t.iterator, scale_out_t.iterator,
-        scale_stride_t.iterator,
+        hidden_p, residual_p,
+        residual_out_p, weight_p,
+        sf_scale_inv_p,
+        fp4_out_p, scale_out_p,
+        scale_stride_p,
     ).launch(grid=[1], block=[NUM_THREADS], stream=stream)
 
 
 # ============================================================================
-# Python wrapper (lazy-compiled, cached)
+# Python wrapper — uses make_ptr (no from_dlpack overhead)
 # ============================================================================
 
 _compiled_fn = None
@@ -240,7 +240,7 @@ def cute_fused_add_rms_norm_fp4_quant(
 ):
     """Drop-in replacement for _add_variance_kernel + _norm_fp4_quant_kernel.
 
-    All tensors must be on the same CUDA device. Compiles on first call.
+    Uses make_ptr() instead of from_dlpack() to avoid tensor wrapping overhead.
     """
     global _compiled_fn
 
@@ -248,14 +248,14 @@ def cute_fused_add_rms_norm_fp4_quant(
     cu_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
     args = (
-        from_dlpack(hidden_states.view(-1)),
-        from_dlpack(residual.view(-1)),
-        from_dlpack(residual_out.view(-1)),
-        from_dlpack(weight),
-        from_dlpack(sf_scale_inv),
-        from_dlpack(fp4_out.view(-1)),
-        from_dlpack(scale_bytes.view(-1)),
-        from_dlpack(scale_stride_tensor),
+        make_ptr(cutlass.BFloat16, hidden_states.data_ptr()),
+        make_ptr(cutlass.BFloat16, residual.data_ptr()),
+        make_ptr(cutlass.BFloat16, residual_out.data_ptr()),
+        make_ptr(cutlass.BFloat16, weight.data_ptr()),
+        make_ptr(cutlass.Float32, sf_scale_inv.data_ptr()),
+        make_ptr(cutlass.Uint8, fp4_out.data_ptr()),
+        make_ptr(cutlass.Uint8, scale_bytes.data_ptr()),
+        make_ptr(cutlass.Int32, scale_stride_tensor.data_ptr()),
         cu_stream,
     )
 
