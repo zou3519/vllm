@@ -565,12 +565,10 @@ def _nvfp4_quant_and_gemm(
 
 # Try to import CuTe DSL kernel; fall back to Triton two-kernel approach
 _use_cute_norm_quant = False
-# TODO: CuTe DSL kernel has integration correctness issue. Disabled for now.
-# try:
-#     from .flat_llama_cute_kernels import cute_fused_add_rms_norm_fp4_quant
-#     _use_cute_norm_quant = True
-# except ImportError:
-#     pass
+# CuTe DSL kernel is correct and CUDA-graph compatible (stream fix applied),
+# but from_dlpack() costs 43μs per call (8 tensors × 5.4μs), which adds
+# 6.9ms per decode step (160 calls). This overhead negates the kernel speedup.
+# Need to either cache CuTe tensors or pass raw pointers to fix.
 
 
 def _fused_norm_quant(

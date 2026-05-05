@@ -13,6 +13,7 @@ replay overhead (~1.2μs per eliminated node × 160 nodes = ~192μs/step).
 """
 import torch
 
+import cuda.bindings.driver as cuda_driver
 import cutlass
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
@@ -209,6 +210,7 @@ def _launch_fused_kernel(
     sf_scale_inv_t: cute.Tensor,
     fp4_out_t: cute.Tensor, scale_out_t: cute.Tensor,
     scale_stride_t: cute.Tensor,
+    stream: cuda_driver.CUstream = cuda_driver.CUstream(0),
 ):
     fused_add_rms_norm_fp4_quant_kernel(
         hidden_t.iterator, residual_t.iterator,
@@ -216,7 +218,7 @@ def _launch_fused_kernel(
         sf_scale_inv_t.iterator,
         fp4_out_t.iterator, scale_out_t.iterator,
         scale_stride_t.iterator,
-    ).launch(grid=[1], block=[NUM_THREADS])
+    ).launch(grid=[1], block=[NUM_THREADS], stream=stream)
 
 
 # ============================================================================
@@ -243,18 +245,19 @@ def cute_fused_add_rms_norm_fp4_quant(
     global _compiled_fn
 
     scale_bytes = scale_int32.view(torch.uint8)
+    cu_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    ct_hidden = from_dlpack(hidden_states.view(-1))
-    ct_residual = from_dlpack(residual.view(-1))
-    ct_residual_out = from_dlpack(residual_out.view(-1))
-    ct_weight = from_dlpack(weight)
-    ct_sf = from_dlpack(sf_scale_inv)
-    ct_fp4 = from_dlpack(fp4_out.view(-1))
-    ct_scale = from_dlpack(scale_bytes.view(-1))
-    ct_stride = from_dlpack(scale_stride_tensor)
-
-    args = (ct_hidden, ct_residual, ct_residual_out, ct_weight,
-            ct_sf, ct_fp4, ct_scale, ct_stride)
+    args = (
+        from_dlpack(hidden_states.view(-1)),
+        from_dlpack(residual.view(-1)),
+        from_dlpack(residual_out.view(-1)),
+        from_dlpack(weight),
+        from_dlpack(sf_scale_inv),
+        from_dlpack(fp4_out.view(-1)),
+        from_dlpack(scale_bytes.view(-1)),
+        from_dlpack(scale_stride_tensor),
+        cu_stream,
+    )
 
     if _compiled_fn is None:
         _compiled_fn = cute.compile(_launch_fused_kernel, *args)
