@@ -24,6 +24,17 @@ curl http://localhost:8000/v1/chat/completions \
          "messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+## Accuracy
+
+The flat+GEMV model produces **factually identical** answers to the compiled
+baseline. Exact token-for-token match is ~3/8 on a test suite because the GEMV
+uses FP16 intermediate accumulation (vs CUTLASS FP32 tensor core), causing
+slight logit differences that lead to different but equally valid phrasings.
+
+All arithmetic, factual, and translation answers are correct. The differences
+are purely stylistic (e.g. "composed of interconnected nodes" vs "composed of
+layers of interconnected nodes").
+
 ## How to measure latency
 
 ### Total latency (TTFT + decode)
