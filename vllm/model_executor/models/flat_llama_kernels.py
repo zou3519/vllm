@@ -446,7 +446,8 @@ class NvFp4Proj:
     weights_padding: int           # K-dimension padding bytes
     output_size: int               # unpadded output dim
     weight_scale_rowmajor: torch.Tensor | None = None  # [out, in/16] FP8 row-major
-    alpha_float: float = 0.0  # cached alpha for GEMV (avoids GPU→CPU sync)
+    alpha_float: float = 0.0  # cached alpha for FP4-input GEMV
+    alpha_bf16_gemv: float = 0.0  # weight_global_scale for BF16-input GEMV
 
 
 @dataclass(slots=True)
@@ -997,6 +998,7 @@ def extract_nvfp4_proj(
     """Extract NVFP4 params from a vLLM ColumnParallelLinear/RowParallelLinear."""
     weight_scale_rowmajor = None
     alpha_float = 0.0
+    alpha_bf16_gemv = 0.0
     if enable_gemv:
         from .flat_llama_gemv import unswizzle_blockscale, _ensure_compiled
         _ensure_compiled()
@@ -1006,6 +1008,7 @@ def extract_nvfp4_proj(
             ws, linear_module.weight.shape[0], n_groups,
         )
         alpha_float = float(linear_module.alpha)
+        alpha_bf16_gemv = alpha_float * float(linear_module.input_global_scale_inv)
     return NvFp4Proj(
         weight=linear_module.weight,
         weight_scale=linear_module.weight_scale,
@@ -1015,6 +1018,7 @@ def extract_nvfp4_proj(
         output_size=linear_module.output_size_per_partition,
         weight_scale_rowmajor=weight_scale_rowmajor,
         alpha_float=alpha_float,
+        alpha_bf16_gemv=alpha_bf16_gemv,
     )
 
 

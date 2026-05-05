@@ -46,6 +46,20 @@ void fp4x8_to_fp16x2x4(int *out, int in) {
   );
 }
 
+__device__ half2 bf16x2_to_half2(int packed) {
+  half2 result;
+  asm("{\n\t"
+      ".reg .b16 lo_bf, hi_bf, lo_f16, hi_f16;\n\t"
+      "mov.b32 {lo_bf, hi_bf}, %1;\n\t"
+      "cvt.rn.f16.bf16 lo_f16, lo_bf;\n\t"
+      "cvt.rn.f16.bf16 hi_f16, hi_bf;\n\t"
+      "mov.b32 %0, {lo_f16, hi_f16};\n\t"
+      "}"
+      : "=r"(reinterpret_cast<int&>(result))
+      : "r"(packed));
+  return result;
+}
+
 __device__ void ldcs_i16x2(int16_t *dst, const void *src) {
   asm volatile("ld.global.L1::no_allocate.v2.b16 {%0, %1}, [%2];\n"
               : "=h"(dst[0]), "=h"(dst[1]) : "l"(src));
@@ -68,6 +82,141 @@ __device__ void ldca_i32x8(int *dst, const void *src) {
                 "=r"(dst[4]), "=r"(dst[5]), "=r"(dst[6]), "=r"(dst[7])
               : "l"(src));
 }
+
+// ---------------------------------------------------------------------------
+// BF16-input variant: weight is FP4+FP8 scales, input is BF16 (no quant).
+// Eliminates the activation FP4 quantization kernel entirely.
+// K is in fp4x2 bytes (= actual_elements / 2).
+// ---------------------------------------------------------------------------
+template <int BLOCK_M, int BLOCK_K, int K, int NUM_WARPS>
+__global__
+__launch_bounds__(NUM_WARPS * WARP_SIZE)
+void nvfp4_gemv_bf16in_kernel(
+  const char         *A_ptr,    // [M, K]   weight (FP4 packed)
+  const __nv_bfloat16 *B_ptr,   // [2*K]    input (BF16)
+  const char        *SFA_ptr,   // [M, K/8] weight scales (FP8, row-major)
+  __nv_bfloat16      *C_ptr,    // [M]      output (BF16)
+  int M, float alpha
+) {
+  constexpr int CP_SIZE = 32;
+  constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
+  constexpr int SF_BLOCK_K = BLOCK_K / 8;
+  constexpr int num_cols = BLOCK_K / CP_SIZE;
+  constexpr int num_rows = TB_SIZE / num_cols;
+  constexpr int GROUPS = CP_SIZE / 16;  // 2 scale-group pairs per thread
+
+  const int tid = threadIdx.x;
+  const int bid = blockIdx.x;
+  const int t_col = tid % num_cols;
+  const int t_row = tid / num_cols;
+
+  {
+    const int off_m = bid * BLOCK_M;
+    const int off_k = t_col * CP_SIZE;
+    A_ptr   += off_m * K + off_k;
+    B_ptr   += off_k * 2;                  // 2 BF16 elements per fp4x2 byte
+    C_ptr   += off_m;
+    SFA_ptr += off_m * (K / 8) + off_k / 8;
+  }
+
+  int A_rmem[BLOCK_M / num_rows][CP_SIZE / 4];
+  int16_t SFA_rmem[BLOCK_M / num_rows][GROUPS];
+
+  half2 A_fp16x2[BLOCK_M / num_rows][GROUPS][16];
+  half2 B_fp16x2[GROUPS][16];
+  half2 SFA_fp16x2[BLOCK_M / num_rows][GROUPS];
+  half2 acc[BLOCK_M / num_rows][GROUPS][2];
+  float master_acc[BLOCK_M / num_rows] = {};
+
+  constexpr int num_iters = K / BLOCK_K;
+  for (int iter_k = 0; iter_k < num_iters; iter_k++) {
+    // Load BF16 input (L1/L2 cached — tiny vs weight matrix)
+    {
+      const char *B_bytes = reinterpret_cast<const char*>(B_ptr);
+      for (int i = 0; i < GROUPS; i++) {
+        int B_raw_lo[8], B_raw_hi[8];
+        ldca_i32x8(B_raw_lo, B_bytes + i * 64);
+        ldca_i32x8(B_raw_hi, B_bytes + i * 64 + 32);
+        for (int j = 0; j < 8; j++)
+          B_fp16x2[i][j] = bf16x2_to_half2(B_raw_lo[j]);
+        for (int j = 0; j < 8; j++)
+          B_fp16x2[i][j + 8] = bf16x2_to_half2(B_raw_hi[j]);
+      }
+    }
+
+    // Load weight (streamed from HBM)
+    for (int m = 0; m < BLOCK_M / num_rows; m++) {
+      const int row = m * num_rows + t_row;
+      ldcs_i16x2(SFA_rmem[m], SFA_ptr + row * (K / 8));
+      ldcs_i32x8(A_rmem[m], A_ptr + row * K);
+    }
+
+    A_ptr += BLOCK_K;
+    B_ptr += BLOCK_K * 2;
+    SFA_ptr += SF_BLOCK_K;
+
+    // Unpack weight FP4→FP16, weight scale FP8→FP16 (no SFB pre-multiply)
+    for (int m = 0; m < BLOCK_M / num_rows; m++)
+      for (int i = 0; i < GROUPS; i++) {
+        SFA_fp16x2[m][i] = static_cast<half2>(reinterpret_cast<__nv_fp8x2_e4m3 *>(&SFA_rmem[m])[i]);
+        for (int j = 0; j < 4; j++)
+          fp4x8_to_fp16x2x4(reinterpret_cast<int *>(&A_fp16x2[m][i][j * 4]), A_rmem[m][i * 4 + j]);
+      }
+
+    // Dot product (same structure as FP4 path)
+    for (int m = 0; m < BLOCK_M / num_rows; m++)
+      for (int i = 0; i < GROUPS; i++) {
+        acc[m][i][0] = __hmul2(A_fp16x2[m][i][0], B_fp16x2[i][0]);
+        acc[m][i][1] = __hmul2(A_fp16x2[m][i][8], B_fp16x2[i][8]);
+        for (int j = 1; j < 8; j++) {
+          acc[m][i][0] = __hfma2(A_fp16x2[m][i][0 + j], B_fp16x2[i][0 + j], acc[m][i][0]);
+          acc[m][i][1] = __hfma2(A_fp16x2[m][i][8 + j], B_fp16x2[i][8 + j], acc[m][i][1]);
+        }
+      }
+
+    // Scale by weight scale only (no SFB) and accumulate in FP32
+    for (int m = 0; m < BLOCK_M / num_rows; m++)
+      for (int i = 0; i < GROUPS; i++) {
+        __half2_raw scales = SFA_fp16x2[m][i];
+        __half_raw group0 = __hadd(acc[m][i][0].x, acc[m][i][0].y);
+        __half_raw group1 = __hadd(acc[m][i][1].x, acc[m][i][1].y);
+        asm volatile("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(master_acc[m]) : "h"(group0.x), "h"(scales.x));
+        asm volatile("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(master_acc[m]) : "h"(group1.x), "h"(scales.y));
+      }
+  }
+
+  // Cross-thread reduction (identical to FP4 path)
+  if constexpr (num_cols > WARP_SIZE) {
+    __shared__ float smem[BLOCK_M / num_rows][TB_SIZE];
+    for (int m = 0; m < BLOCK_M / num_rows; m++)
+      smem[m][tid] = master_acc[m];
+    __syncthreads();
+    for (int stride = num_cols / 2; stride >= WARP_SIZE * 2; stride /= 2) {
+      if (t_col < stride)
+        for (int m = 0; m < BLOCK_M / num_rows; m++) {
+          master_acc[m] += smem[m][tid + stride];
+          smem[m][tid] = master_acc[m];
+        }
+      __syncthreads();
+    }
+    if (t_col < WARP_SIZE)
+      for (int m = 0; m < BLOCK_M / num_rows; m++)
+        master_acc[m] += smem[m][tid + WARP_SIZE];
+  }
+
+  constexpr int start_stride = std::min(num_cols, WARP_SIZE) / 2;
+  for (int stride = start_stride; stride > 0; stride /= 2)
+    for (int m = 0; m < BLOCK_M / num_rows; m++)
+      master_acc[m] += __shfl_down_sync(0xFFFF'FFFF, master_acc[m], stride);
+
+  if (t_col == 0)
+    for (int m = 0; m < BLOCK_M / num_rows; m++)
+      C_ptr[m * num_rows + t_row] = __float2bfloat16(master_acc[m] * alpha);
+}
+
+// ---------------------------------------------------------------------------
+// FP4-input variant (original): both weight and input are FP4 + FP8 scales.
+// ---------------------------------------------------------------------------
 
 // A[M, K] = weight (FP4 packed), B[K] = input (FP4 packed)
 // SFA[M, K/8] = weight scales, SFB[K/8] = input scales (FP8, row-major)
@@ -227,9 +376,41 @@ void nvfp4_gemv(
   }
 }
 
+// BF16-input GEMV: weight is FP4+FP8, input is BF16, no activation quant.
+void nvfp4_gemv_bf16in(
+  const at::Tensor& A,
+  const at::Tensor& B,
+  const at::Tensor& SFA,
+        at::Tensor& C,
+  double alpha
+) {
+  const int M = A.size(0);
+  const int K = A.size(1);
+  float alpha_f = static_cast<float>(alpha);
+
+  auto a = reinterpret_cast<const char *>(A.data_ptr());
+  auto b = reinterpret_cast<const __nv_bfloat16 *>(B.data_ptr());
+  auto sa = reinterpret_cast<const char *>(SFA.data_ptr());
+  auto c = reinterpret_cast<__nv_bfloat16 *>(C.data_ptr());
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (K == 14336) {
+    nvfp4_gemv_bf16in_kernel<1, 2048, 14336, 2><<<M, 64, 0, stream>>>(a,b,sa,c,M,alpha_f);
+  }
+  else if (K == 4096) {
+    nvfp4_gemv_bf16in_kernel<1, 2048, 4096, 2><<<M, 64, 0, stream>>>(a,b,sa,c,M,alpha_f);
+  }
+  else {
+    TORCH_CHECK(false, "nvfp4_gemv_bf16in: unsupported K=", K);
+  }
+}
+
 TORCH_LIBRARY(flat_llama_gemv, m) {
   m.def("nvfp4_gemv(Tensor A, Tensor B, Tensor SFA, Tensor SFB, Tensor(a!) C, float alpha) -> ()");
   m.impl("nvfp4_gemv", &nvfp4_gemv);
+  m.def("nvfp4_gemv_bf16in(Tensor A, Tensor B, Tensor SFA, Tensor(a!) C, float alpha) -> ()");
+  m.impl("nvfp4_gemv_bf16in", &nvfp4_gemv_bf16in);
 }
 """
 
@@ -292,5 +473,25 @@ def nvfp4_gemv(
     torch.ops.flat_llama_gemv.nvfp4_gemv(
         weight, input_fp4,
         weight_scale, input_scale,
+        output, alpha,
+    )
+
+
+def nvfp4_gemv_bf16in(
+    weight: torch.Tensor,
+    input_bf16: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    alpha: float,
+) -> None:
+    """NVFP4 GEMV with BF16 input: output = (weight @ input) * alpha.
+
+    Weight is FP4 packed with row-major FP8 scales. Input is BF16 (no quant).
+    alpha should be weight_global_scale (= proj.alpha * proj.input_scale_inv).
+    """
+    _ensure_compiled()
+    torch.ops.flat_llama_gemv.nvfp4_gemv_bf16in(
+        weight, input_bf16,
+        weight_scale,
         output, alpha,
     )
