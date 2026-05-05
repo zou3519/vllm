@@ -212,13 +212,15 @@ void nvfp4_gemv(
   auto sb = reinterpret_cast<const char *>(SFB.data_ptr());
   auto c = reinterpret_cast<__nv_bfloat16 *>(C.data_ptr());
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
   // 14336 = 2048 * 7  (down projection: 28672 FP4 / 2)
   if (K == 14336) {
-    nvfp4_gemv_kernel<1, 2048, 14336, 2><<<M, 64>>>(a,b,sa,sb,c,M,alpha_f);
+    nvfp4_gemv_kernel<1, 2048, 14336, 2><<<M, 64, 0, stream>>>(a,b,sa,sb,c,M,alpha_f);
   }
   // 4096 = 2048 * 2  (QKV/O/gate_up: 8192 FP4 / 2)
   else if (K == 4096) {
-    nvfp4_gemv_kernel<1, 2048, 4096, 2><<<M, 64>>>(a,b,sa,sb,c,M,alpha_f);
+    nvfp4_gemv_kernel<1, 2048, 4096, 2><<<M, 64, 0, stream>>>(a,b,sa,sb,c,M,alpha_f);
   }
   else {
     TORCH_CHECK(false, "nvfp4_gemv: unsupported K=", K);
@@ -265,7 +267,7 @@ def unswizzle_blockscale(
     swizzled: torch.Tensor, orig_M: int, orig_K: int,
 ) -> torch.Tensor:
     """Convert CUTLASS swizzled block scales to row-major [M, K] FP8."""
-    from vllm.utils import round_up
+    from vllm.utils.math_utils import round_up
     M_pad = round_up(orig_M, 128)
     K_pad = round_up(orig_K, 4)
     data = swizzled.view(torch.uint8).reshape(
