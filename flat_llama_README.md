@@ -95,8 +95,8 @@ torch.compile which we want to compare against).
 ```
              TTFT       TPIT       Total (128in+128out)
 Compiled:    107ms      12.50ms    1696ms
-Flat+GEMV:   78ms       11.08ms    1494ms
-Flat wins:   27%        11.4%      11.9%
+Flat+GEMV:   78ms        9.92ms    1345ms
+Flat wins:   27%        20.6%      20.7%
 ```
 
 ## Files
@@ -241,6 +241,7 @@ The outer `flat_forward()` function does:
 | Fused silu+mul+FP4 quant (Triton) | 11.89 → 11.64ms | 21ffb97 |
 | BF16-input GEMV (added, reverted for O) | 20.7μs — too slow at K=4096 | 0510ef7 |
 | GEMV for O projection (FP4 input) | 11.54 → 11.08ms | c375faf |
+| GEMV for ALL projections (QKV+Gate+Up) | 11.08 → 9.92ms | a7d19f9 |
 
 ## Workflow
 
