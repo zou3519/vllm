@@ -111,120 +111,93 @@ def _norm_fp4_quant_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Single fused kernel: residual-add + RMSNorm + FP4 quant in ONE launch.
-# Uses cooperative atomic reduction across programs (≤ SM count to avoid
-# deadlock on the spin-wait barrier).
+# Single-CTA fused kernel: residual-add + RMSNorm + FP4 quant in ONE launch.
+# For BS=1: one program handles the entire row — no cross-CTA sync needed.
+# Replaces both the CuTe DSL kernel and the atomic-barrier approach.
 # ---------------------------------------------------------------------------
-
-# Number of programs for the fused kernel. Must be <= number of SMs (152 on
-# GB300) to guarantee all programs can run concurrently during the spin-wait.
-_FUSED_NUM_PROGRAMS: int = 128
 
 
 @triton.jit
-def _fused_add_rms_norm_fp4_quant_kernel(
+def _single_cta_add_rms_norm_fp4_quant_kernel(
     hidden_ptr, residual_ptr, residual_out_ptr,
     weight_ptr, sf_scale_ptr,
     fp4_out_ptr, scale_out_ptr,
-    # Atomic reduction workspace
-    global_sum_ptr, counter_ptr, ready_ptr,
     N: tl.constexpr,
     SCALE_STRIDE: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
-    GROUPS_PER_PROGRAM: tl.constexpr,
+    VARIANCE_BLOCK: tl.constexpr,
+    GROUPS_PER_ITER: tl.constexpr,
 ):
-    """Fused residual-add + RMSNorm + FP4 quant for BS=1 decode.
-
-    Each of NUM_PROGRAMS programs handles GROUPS_PER_PROGRAM groups of 16
-    elements. Phase 1 does residual-add and accumulates a partial
-    sum-of-squares. Phase 2 synchronizes via an atomic barrier. Phase 3
-    applies RMSNorm + E2M1 FP4 quantization using inline PTX.
-    """
-    pid = tl.program_id(0)
-    row = 0  # BS=1
-
-    # Phase 1: residual add + partial sum-of-squares
-    base_group = pid * GROUPS_PER_PROGRAM
-    local_sum = tl.zeros([], dtype=tl.float32)
-
-    for g_off in tl.static_range(0, GROUPS_PER_PROGRAM):
-        g = base_group + g_off
-        elem_base = row * N + g * 16
-        idx = tl.arange(0, 16)
-
-        h = tl.load(hidden_ptr + elem_base + idx).to(tl.float32)
-        r = tl.load(residual_ptr + elem_base + idx).to(tl.float32)
+    # Phase 1: residual add + sum of squares
+    _sum_sq = 0.0
+    for start in tl.static_range(0, N, VARIANCE_BLOCK):
+        cols = start + tl.arange(0, VARIANCE_BLOCK)
+        h = tl.load(hidden_ptr + cols).to(tl.float32)
+        r = tl.load(residual_ptr + cols).to(tl.float32)
         s = h + r
-        tl.store(residual_out_ptr + elem_base + idx, s.to(tl.bfloat16))
-        local_sum += tl.sum(s * s)
+        tl.store(residual_out_ptr + cols, s.to(tl.bfloat16))
+        _sum_sq += tl.sum(s * s)
 
-    # Phase 2: atomic reduction + spin-wait barrier
-    tl.atomic_add(global_sum_ptr, local_sum)
-    arrived = tl.atomic_add(counter_ptr, 1)
-
-    # Last program to arrive signals completion
-    if arrived == NUM_PROGRAMS - 1:
-        tl.store(ready_ptr, 1)
-
-    # All programs spin-wait until ready
-    while tl.load(ready_ptr, volatile=True) == 0:
-        pass
-
-    # Phase 3: read final variance, apply RMSNorm + FP4 quant
-    total_sum = tl.load(global_sum_ptr)
-    rrms = tl.math.rsqrt(total_sum / N + 1e-5)
+    rrms = tl.math.rsqrt(_sum_sq / N + 1e-5)
     sf_scale = tl.load(sf_scale_ptr).to(tl.float32)
 
-    for g_off in tl.static_range(0, GROUPS_PER_PROGRAM):
-        g = base_group + g_off
-        base = row * N + g * 16
-        pair_idx = tl.arange(0, 8)
-        even_offs = base + pair_idx * 2
-        odd_offs = even_offs + 1
-        w_even_offs = g * 16 + pair_idx * 2
-        w_odd_offs = w_even_offs + 1
+    # Phase 2: norm + FP4 quant in batches of GROUPS_PER_ITER groups.
+    # Two passes per batch: (a) find per-group max, (b) quantize.
+    # Data is in L1 from Phase 1, so the second pass is cheap.
+    num_groups: tl.constexpr = N // 16
 
-        even_res = tl.load(residual_out_ptr + even_offs).to(tl.float32)
-        odd_res = tl.load(residual_out_ptr + odd_offs).to(tl.float32)
-        even_w = tl.load(weight_ptr + w_even_offs).to(tl.float32)
-        odd_w = tl.load(weight_ptr + w_odd_offs).to(tl.float32)
+    for g_start in tl.static_range(0, num_groups, GROUPS_PER_ITER):
+        g = g_start + tl.arange(0, GROUPS_PER_ITER)
 
-        even_normed = even_res * rrms * even_w
-        odd_normed = odd_res * rrms * odd_w
+        # Pass 1: per-group max over 8 pairs
+        block_max = tl.zeros([GROUPS_PER_ITER], dtype=tl.float32)
+        for p in tl.static_range(0, 8):
+            even_idx = g * 16 + p * 2
+            odd_idx = even_idx + 1
+            e_n = (tl.load(residual_out_ptr + even_idx).to(tl.float32)
+                   * rrms
+                   * tl.load(weight_ptr + even_idx).to(tl.float32))
+            o_n = (tl.load(residual_out_ptr + odd_idx).to(tl.float32)
+                   * rrms
+                   * tl.load(weight_ptr + odd_idx).to(tl.float32))
+            block_max = tl.maximum(
+                block_max, tl.maximum(tl.abs(e_n), tl.abs(o_n)))
 
-        # FP4 quantization: compute per-group FP8 scale + E2M1 via PTX
-        block_max = tl.maximum(
-            tl.max(tl.abs(even_normed)), tl.max(tl.abs(odd_normed))
-        )
+        # Compute per-group FP8 scale
         sf_val = sf_scale * (block_max / 6.0)
         sf_fp8 = sf_val.to(tl.float8e4nv)
         sf_f32 = sf_fp8.to(tl.float32)
         quant_scale = tl.where(sf_f32 > 0.0, sf_scale / sf_f32, 0.0)
 
-        packed = tl.inline_asm_elementwise(
-            "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
-            " cvt.u16.u8 $0, tmp; }",
-            "=h, r, r",
-            [even_normed * quant_scale, odd_normed * quant_scale],
-            dtype=tl.int16,
-            is_pure=True,
-            pack=1,
-        )
+        # Pass 2: quantize using computed scale
+        for p in tl.static_range(0, 8):
+            even_idx = g * 16 + p * 2
+            odd_idx = even_idx + 1
+            e_n = (tl.load(residual_out_ptr + even_idx).to(tl.float32)
+                   * rrms
+                   * tl.load(weight_ptr + even_idx).to(tl.float32))
+            o_n = (tl.load(residual_out_ptr + odd_idx).to(tl.float32)
+                   * rrms
+                   * tl.load(weight_ptr + odd_idx).to(tl.float32))
 
-        fp4_base = row * (N // 2) + g * 8
-        tl.store(fp4_out_ptr + fp4_base + pair_idx, packed.to(tl.uint8))
+            packed = tl.inline_asm_elementwise(
+                "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
+                " cvt.u16.u8 $0, tmp; }",
+                "=h, r, r",
+                [e_n * quant_scale, o_n * quant_scale],
+                dtype=tl.int16,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(fp4_out_ptr + g * 8 + p, packed.to(tl.uint8))
 
+        # Store swizzled FP8 scales
         kTileIdx = g // 4
         innerKIdx = g % 4
-        byte_offset = (
-            row * SCALE_STRIDE + kTileIdx * SCALE_STRIDE + innerKIdx
-        )
-        tl.store(
-            scale_out_ptr + byte_offset, sf_fp8.to(tl.uint8, bitcast=True)
-        )
+        tl.store(scale_out_ptr + kTileIdx * SCALE_STRIDE + innerKIdx,
+                 sf_fp8.to(tl.uint8, bitcast=True))
 
 
-def triton_fused_add_rms_norm_fp4_quant(
+def triton_single_cta_fused_add_rms_norm_fp4_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     residual_out: torch.Tensor,
@@ -232,36 +205,20 @@ def triton_fused_add_rms_norm_fp4_quant(
     sf_scale_inv: torch.Tensor,
     fp4_out: torch.Tensor,
     scale_int32: torch.Tensor,
-    global_sum: torch.Tensor,
-    counter: torch.Tensor,
-    ready: torch.Tensor,
 ) -> None:
-    """Single fused kernel: residual-add + RMSNorm + FP4 quant.
-
-    Replaces the two-kernel sequence of ``_add_variance_kernel`` +
-    ``_norm_fp4_quant_kernel``, saving one kernel launch per call site
-    (160 launches total across 80 layers × 2 norm+quant points).
-    """
     N = hidden_states.shape[-1]
     scale_bytes = scale_int32.view(torch.uint8)
     scale_stride = scale_int32.shape[1] * 4
-    num_programs = _FUSED_NUM_PROGRAMS
-    groups_per_program = (N // 16) // num_programs
 
-    # Reset atomic workspace before launch
-    global_sum.zero_()
-    counter.zero_()
-    ready.zero_()
-
-    _fused_add_rms_norm_fp4_quant_kernel[(num_programs,)](
+    _single_cta_add_rms_norm_fp4_quant_kernel[(1,)](
         hidden_states, residual, residual_out,
         weight, sf_scale_inv,
         fp4_out, scale_bytes,
-        global_sum, counter, ready,
         N=N,
         SCALE_STRIDE=scale_stride,
-        NUM_PROGRAMS=num_programs,
-        GROUPS_PER_PROGRAM=groups_per_program,
+        VARIANCE_BLOCK=min(N, 4096),
+        GROUPS_PER_ITER=min(N // 16, 256),
+        num_warps=8,
     )
 
 
@@ -563,27 +520,17 @@ def _nvfp4_quant_and_gemm(
     )
 
 
-# Try to import CuTe DSL kernel; fall back to Triton two-kernel approach
-_use_cute_norm_quant = False
-try:
-    from .flat_llama_cute_kernels import cute_fused_add_rms_norm_fp4_quant
-    _use_cute_norm_quant = True
-except ImportError:
-    pass
-
-
 def _fused_norm_quant(
     hidden_states, residual, bufs, ln_weight,
     input_scale_inv, fp4_out, scale_out,
     N, M, scale_stride,
 ):
-    """Dispatch fused add+RMSNorm+FP4 quant to CuTe DSL (1 kernel) or Triton (2 kernels)."""
-    if _use_cute_norm_quant and N == 8192 and M == 1:
-        cute_fused_add_rms_norm_fp4_quant(
+    """Dispatch fused add+RMSNorm+FP4 quant: single-CTA (BS=1) or 2-kernel."""
+    if M == 1 and N >= 256:
+        triton_single_cta_fused_add_rms_norm_fp4_quant(
             hidden_states, residual, bufs.residual_buf,
             ln_weight, input_scale_inv,
             fp4_out, scale_out,
-            bufs.scale_stride_tensor,
         )
     else:
         _add_variance_kernel[(M,)](
