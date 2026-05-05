@@ -363,13 +363,26 @@ void nvfp4_gemv(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  // Shape-tuned FlatLlama decode GEMVs.
+  // K is FP4x2 bytes. M distinguishes projections when K=4096:
+  //   QKV:     M=10240, K=4096
+  //   O:       M=8192,  K=4096
+  //   Gate+Up: M=57344, K=4096
+  //   Down:    M=8192,  K=14336
+  //
+  // GB300 CUDA-graph replay tuning, tests/bench_fp4_gemv.py --cudagraph:
+  //   K=4096 projections prefer BK=1024/W=1 over BK=2048/W=2.
+  //   QKV: ~7.70us vs ~7.90us; O: ~6.52us vs ~6.57us.
+  //   Gate+Up also prefers BK=1024/W=1 in the event-loop tuner.
+  //   Down remains fastest on the existing BK=2048/W=2 baseline.
+
   // 14336 = 2048 * 7  (down projection: 28672 FP4 / 2)
   if (K == 14336) {
     nvfp4_gemv_kernel<1, 2048, 14336, 2><<<M, 64, 0, stream>>>(a,b,sa,sb,c,M,alpha_f);
   }
   // 4096 = 2048 * 2  (QKV/O/gate_up: 8192 FP4 / 2)
   else if (K == 4096) {
-    nvfp4_gemv_kernel<1, 2048, 4096, 2><<<M, 64, 0, stream>>>(a,b,sa,sb,c,M,alpha_f);
+    nvfp4_gemv_kernel<1, 1024, 4096, 1><<<M, 32, 0, stream>>>(a,b,sa,sb,c,M,alpha_f);
   }
   else {
     TORCH_CHECK(false, "nvfp4_gemv: unsupported K=", K);
