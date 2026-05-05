@@ -271,6 +271,50 @@ def triton_fp4_quant(x, gs_inv, fp4_out, scale_int32):
     )
 
 
+@triton.jit
+def _fp4_quant_rowmajor_kernel(
+    input_ptr, sf_scale_ptr, fp4_out_ptr, scale_out_ptr,
+    N: tl.constexpr,
+):
+    """FP4 quant with row-major scale output (for GEMV, not CUTLASS)."""
+    pid = tl.program_id(0)
+    num_groups_per_row = N // 16
+    row = pid // num_groups_per_row
+    g = pid % num_groups_per_row
+    sf_scale = tl.load(sf_scale_ptr).to(tl.float32)
+
+    base = row * N + g * 16
+    pair_idx = tl.arange(0, 8)
+    even = tl.load(input_ptr + base + pair_idx * 2).to(tl.float32)
+    odd = tl.load(input_ptr + base + pair_idx * 2 + 1).to(tl.float32)
+
+    block_max = tl.maximum(tl.max(tl.abs(even)), tl.max(tl.abs(odd)))
+    sf_val = sf_scale * (block_max / 6.0)
+    sf_fp8 = sf_val.to(tl.float8e4nv)
+    sf_f32 = sf_fp8.to(tl.float32)
+    qs = tl.where(sf_f32 > 0.0, sf_scale / sf_f32, 0.0)
+
+    packed = tl.inline_asm_elementwise(
+        "{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $2, $1;"
+        " cvt.u16.u8 $0, tmp; }",
+        "=h, r, r", [even * qs, odd * qs],
+        dtype=tl.int16, is_pure=True, pack=1,
+    )
+    fp4_base = row * (N // 2) + g * 8
+    tl.store(fp4_out_ptr + fp4_base + pair_idx, packed.to(tl.uint8))
+
+    tl.store(scale_out_ptr + row * num_groups_per_row + g,
+             sf_fp8.to(tl.uint8, bitcast=True))
+
+
+def triton_fp4_quant_rowmajor(x, gs_inv, fp4_out, scale_out):
+    """Triton FP4 quant with row-major scales (for GEMV path)."""
+    M, N = x.shape
+    _fp4_quant_rowmajor_kernel[(M * (N // 16),)](
+        x, gs_inv, fp4_out, scale_out, N=N,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Triton: fused SiLU+mul + FP4 quant with ROW-MAJOR scales (for GEMV)
 # ---------------------------------------------------------------------------
@@ -517,10 +561,12 @@ class SharedDecodeBuffers:
     # CuTe DSL kernel param
     scale_stride_tensor: torch.Tensor  # i32[1] for swizzled scale stride
 
-    # GEMV buffers for down projection (non-swizzled FP4 + row-major scales)
+    # GEMV buffers (non-swizzled FP4 + row-major scales)
     down_fp4_gemv: torch.Tensor | None = None
     down_scale_gemv: torch.Tensor | None = None
     silu_out: torch.Tensor | None = None
+    o_fp4_gemv: torch.Tensor | None = None
+    o_scale_gemv: torch.Tensor | None = None
 
     @staticmethod
     def create(
@@ -534,9 +580,11 @@ class SharedDecodeBuffers:
         gu_fp4, gu_sc = create_fp4_output_tensors(1, hidden_size, device, True)
         d_fp4, d_sc = create_fp4_output_tensors(1, intermediate_size, device, True)
         scale_stride_val = qkv_sc.view(torch.uint8).shape[-1]
-        # Non-swizzled FP4 buffers for GEMV down projection
+        # Non-swizzled FP4 buffers for GEMV
         d_fp4_gemv, d_sc_gemv = create_fp4_output_tensors(
             1, intermediate_size, device, False)
+        o_fp4_gemv, o_sc_gemv = create_fp4_output_tensors(
+            1, q_size, device, False)
         return SharedDecodeBuffers(
             qkv_fp4, qkv_sc, o_fp4, o_sc, gu_fp4, gu_sc, d_fp4, d_sc,
             residual_buf=torch.empty(1, hidden_size, dtype=torch.bfloat16, device=device),
@@ -548,6 +596,8 @@ class SharedDecodeBuffers:
             down_fp4_gemv=d_fp4_gemv,
             down_scale_gemv=d_sc_gemv,
             silu_out=torch.empty(1, intermediate_size, dtype=torch.bfloat16, device=device),
+            o_fp4_gemv=o_fp4_gemv,
+            o_scale_gemv=o_sc_gemv,
         )
 
 
@@ -841,11 +891,23 @@ def transformer_layer(
         q, k = rotary_emb(positions, q, k)
         attn_output = attn(q, k, v)
 
-    # 5. O projection (Triton FP4 quant — faster than C++ at BS=1)
-    triton_fp4_quant(attn_output, o.input_scale_inv, bufs.o_fp4, bufs.o_scale)
-    hidden_states = nvfp4_gemm(
-        bufs.o_fp4, bufs.o_scale.view(torch.float8_e4m3fn), o, backend,
-    )
+    # 5. O projection: FP4 quant (row-major) + GEMV
+    if o.weight_scale_rowmajor is not None:
+        triton_fp4_quant_rowmajor(
+            attn_output, o.input_scale_inv,
+            bufs.o_fp4_gemv, bufs.o_scale_gemv,
+        )
+        from .flat_llama_gemv import nvfp4_gemv
+        nvfp4_gemv(
+            o.weight, bufs.o_fp4_gemv,
+            o.weight_scale_rowmajor, bufs.o_scale_gemv,
+            hidden_states, o.alpha_float,
+        )
+    else:
+        triton_fp4_quant(attn_output, o.input_scale_inv, bufs.o_fp4, bufs.o_scale)
+        hidden_states = nvfp4_gemm(
+            bufs.o_fp4, bufs.o_scale.view(torch.float8_e4m3fn), o, backend,
+        )
 
     # 7. Post-attention norm + FP4 quant
     _fused_norm_quant(
@@ -1038,7 +1100,7 @@ def extract_all_layer_params(layers, start_layer, end_layer):
         input_ln_weights.append(layer.input_layernorm.weight.data)
         post_attn_ln_weights.append(layer.post_attention_layernorm.weight.data)
         qkv_projs.append(extract_nvfp4_proj(layer.self_attn.qkv_proj))
-        o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj))
+        o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj, enable_gemv=True))
         gate_up_projs.append(extract_nvfp4_proj(layer.mlp.gate_up_proj))
         down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj, enable_gemv=True))
         rotary_embs.append(layer.self_attn.rotary_emb)
