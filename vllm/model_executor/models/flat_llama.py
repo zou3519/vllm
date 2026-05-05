@@ -242,7 +242,6 @@ class FlatLlamaModel(nn.Module):
             self._shared_bufs = SharedDecodeBuffers.create(
                 self.config.hidden_size,
                 self._q_size,
-                self._kv_size,
                 self._intermediate_size,
                 hidden_states.device,
             )

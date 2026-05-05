@@ -212,15 +212,6 @@ def triton_single_cta_fused_add_rms_norm_fp4_quant(
     row_major_scales: bool = False,
 ) -> None:
     N = hidden_states.shape[-1]
-    if row_major_scales and N == 8192:
-        from .flat_llama_norm_quant import add_rms_norm_fp4_quant_8192
-        add_rms_norm_fp4_quant_8192(
-            hidden_states, residual, residual_out,
-            weight, sf_scale_inv,
-            fp4_out, scale_out,
-        )
-        return
-
     if row_major_scales:
         scale_bytes = scale_out
         scale_stride = 0
@@ -483,10 +474,10 @@ def _fused_rope_kv_kernel(
             vs = tl.load(v_scale_ptr).to(tl.float32)
             k_full = tl.load(k_ptr + hd + dd).to(tl.float32)
             tl.store(kv_cache_ptr + k_base + dd,
-                     (k_full / ks).to(tl.float8e4nv))
+                     (k_full / ks).to(tl.float8e4nv).to(tl.uint8, bitcast=True))
             v_vals = tl.load(v_ptr + hd + dd).to(tl.float32)
             tl.store(kv_cache_ptr + v_base + dd,
-                     (v_vals / vs).to(tl.float8e4nv))
+                     (v_vals / vs).to(tl.float8e4nv).to(tl.uint8, bitcast=True))
         else:
             tl.store(kv_cache_ptr + k_base + d, k_rot1)
             tl.store(kv_cache_ptr + k_base + HALF_ROT + d, k_rot2)
@@ -589,15 +580,12 @@ class SharedDecodeBuffers:
     gu_scale_gemv: torch.Tensor | None = None
     down_fp4_gemv: torch.Tensor | None = None
     down_scale_gemv: torch.Tensor | None = None
-    qkv_out: torch.Tensor | None = None
-    gate_up_out: torch.Tensor | None = None
     silu_out: torch.Tensor | None = None
 
     @staticmethod
     def create(
         hidden_size: int,
         q_size: int,
-        kv_size: int,
         intermediate_size: int,
         device: torch.device,
     ) -> "SharedDecodeBuffers":
@@ -631,12 +619,6 @@ class SharedDecodeBuffers:
             gu_scale_gemv=gu_sc_g,
             down_fp4_gemv=d_fp4_g,
             down_scale_gemv=d_sc_g,
-            qkv_out=torch.empty(
-                1, q_size + 2 * kv_size,
-                dtype=torch.bfloat16, device=device),
-            gate_up_out=torch.empty(
-                1, intermediate_size * 2,
-                dtype=torch.bfloat16, device=device),
             silu_out=torch.empty(1, intermediate_size, dtype=torch.bfloat16, device=device),
         )
 
@@ -703,11 +685,19 @@ def _fused_norm_quant(
     N, M, scale_stride,
 ):
     """Dispatch fused add+RMSNorm+FP4 quant: single-CTA (BS=1) or 2-kernel."""
-    if M == 1 and N >= 256:
+    if M == 1 and N >= 256 and False:  # DISABLED: use C++ path for debugging
         triton_single_cta_fused_add_rms_norm_fp4_quant(
             hidden_states, residual, bufs.residual_buf,
             ln_weight, input_scale_inv,
             fp4_out, scale_out,
+        )
+    elif M == 1:
+        # Use C++ ops for debugging (matches general path)
+        ops.fused_add_rms_norm(hidden_states, residual, ln_weight, 1e-5)
+        bufs.residual_buf.copy_(residual)
+        torch.ops._C.scaled_fp4_quant.out(
+            hidden_states, input_scale_inv, True,
+            output=fp4_out, output_scale=scale_out,
         )
     else:
         _add_variance_kernel[(M,)](
@@ -888,8 +878,7 @@ def transformer_layer(
     # 2. QKV projection
     if use_gemv:
         from .flat_llama_gemv import nvfp4_gemv as _gemv
-        qkv_out = bufs.qkv_out
-        assert qkv_out is not None
+        qkv_out = torch.empty(1, qkv.output_size, dtype=torch.bfloat16, device=hidden_states.device)
         _gemv(
             qkv.weight, bufs.qkv_fp4_gemv.view(-1),
             qkv.weight_scale_rowmajor, bufs.qkv_scale_gemv.view(-1),
@@ -918,7 +907,7 @@ def transformer_layer(
         slot_mapping = fwd_ctx.slot_mapping[attn.layer_name]
         cos_sin_cache = rotary_emb.cos_sin_cache
         head_dim = attn.head_size
-        is_fp8 = kv_cache.dtype == torch.float8_e4m3fn
+        is_fp8 = kv_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
         gqa = attn.num_heads // attn.num_kv_heads
 
         # Map strides for NHD [B,2,BS,H,D] vs HND [B,2,H,BS,D]
@@ -949,8 +938,6 @@ def transformer_layer(
             KV_CACHE_IS_FP8=is_fp8,
             GQA_RATIO=gqa,
         )
-        # Attention reads from cache (KV write already done by fused kernel;
-        # kv_sharing_target_layer_name was set permanently in extract_all_layer_params)
         attn_output = attn(q, k, v)
     else:
         q, k = rotary_emb(positions, q, k)
@@ -983,8 +970,7 @@ def transformer_layer(
             row_major_scales=True,
         )
         residual = bufs.residual_buf
-        gate_up_out = bufs.gate_up_out
-        assert gate_up_out is not None
+        gate_up_out = torch.empty(1, gate_up.output_size, dtype=torch.bfloat16, device=hidden_states.device)
         from .flat_llama_gemv import nvfp4_gemv as _gemv2
         _gemv2(
             gate_up.weight, bufs.gu_fp4_gemv.view(-1),
@@ -1077,8 +1063,6 @@ def flat_forward(
 
     if num_tokens == 1 and bufs is not None:
         # BS=1 decode: use fused Triton kernels + pre-allocated buffers.
-        # Mark attention layers to skip KV cache write (fused kernel handles it).
-        # Must be set BEFORE graph capture and stay set during replay.
         for i in range(start_layer, end_layer):
             attns[i].kv_sharing_target_layer_name = attns[i].layer_name
         for i in range(start_layer, end_layer):
@@ -1179,10 +1163,10 @@ def extract_all_layer_params(layers, start_layer, end_layer):
         layer = layers[i]
         input_ln_weights.append(layer.input_layernorm.weight.data)
         post_attn_ln_weights.append(layer.post_attention_layernorm.weight.data)
-        qkv_projs.append(extract_nvfp4_proj(layer.self_attn.qkv_proj, enable_gemv=True))
-        o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj, enable_gemv=True))
-        gate_up_projs.append(extract_nvfp4_proj(layer.mlp.gate_up_proj, enable_gemv=True))
-        down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj, enable_gemv=True))
+        qkv_projs.append(extract_nvfp4_proj(layer.self_attn.qkv_proj, enable_gemv=False))
+        o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj, enable_gemv=False))
+        gate_up_projs.append(extract_nvfp4_proj(layer.mlp.gate_up_proj, enable_gemv=False))
+        down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj, enable_gemv=False))
         rotary_embs.append(layer.self_attn.rotary_emb)
         attn_layer = layer.self_attn.attn
         attns.append(attn_layer)
