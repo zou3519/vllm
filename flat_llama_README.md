@@ -92,6 +92,34 @@ Measured via standalone kernel benchmarks, then validated against e2e TPIT.
     ≈ TPIT                          9.5ms  (measured: 9.52ms)
 ```
 
+## Roofline analysis
+
+BS=1 decode is entirely memory-bound. The roofline is determined by
+weight reads (FP4 packed data + FP8 block scales) at peak HBM bandwidth.
+
+```
+Projection    Weight (FP4+scales)   Roofline @8TB/s   Measured    BW eff
+──────────────────────────────────────────────────────────────────────────
+QKV            45 MB                  5.6 μs           9.0 μs      62%  (CUTLASS)
+O              36 MB                  4.5 μs           ~5  μs      90%  (BF16-GEMV)
+Gate+Up       252 MB                 31.5 μs          46.0 μs      68%  (CUTLASS)
+Down          126 MB                 15.8 μs          22.8 μs      69%  (FP4-GEMV)
+──────────────────────────────────────────────────────────────────────────
+Total         459 MB                 57.4 μs          82.8 μs      69%  avg
+× 80 layers                          4.6 ms           6.6 ms
++ non-GEMM ops                                       ~0.4 ms
++ overhead (CUDA graph, framework)                    ~2.5 ms
+──────────────────────────────────────────────────────────────────────────
+TPIT roofline (100% BW)               ~7.5 ms
+TPIT roofline (70% BW)                ~9.1 ms
+TPIT measured                          9.52 ms
+```
+
+Current TPIT is within ~5% of the 70%-efficiency roofline. The main
+opportunity is Gate+Up (52% of per-layer time) — a faster GEMM kernel
+or weight layout optimization could save ~15μs/layer = 1.2ms total.
+QKV and O are already close to roofline.
+
 ## Known issues and investigations
 
 ### FP8 KV cache dtype mismatch (FIXED)
