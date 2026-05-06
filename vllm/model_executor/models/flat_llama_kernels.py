@@ -835,27 +835,47 @@ def transformer_layer(
     M = hidden_states.shape[0]
     scale_stride = bufs.qkv_scale.view(torch.uint8).shape[-1]
 
-    # 1. Pre-attention: residual-add + RMSNorm + FP4 quant
+    # 1. Pre-attention: residual-add + RMSNorm (+ FP4 quant if CUTLASS)
+    use_qkv_gemv = qkv.weight_scale_rowmajor is not None
     if residual is None:
         residual = hidden_states
         from vllm.model_executor.layers.layernorm import ir
         hidden_states = ir.ops.rms_norm(hidden_states, input_ln_w, eps)
-        torch.ops._C.scaled_fp4_quant.out(
-            hidden_states, qkv.input_scale_inv, True,
-            output=bufs.qkv_fp4, output_scale=bufs.qkv_scale,
-        )
+        if not use_qkv_gemv:
+            torch.ops._C.scaled_fp4_quant.out(
+                hidden_states, qkv.input_scale_inv, True,
+                output=bufs.qkv_fp4, output_scale=bufs.qkv_scale,
+            )
     else:
-        _fused_norm_quant(
-            hidden_states, residual, bufs, input_ln_w,
-            qkv.input_scale_inv, bufs.qkv_fp4, bufs.qkv_scale,
-            N, M, scale_stride,
-        )
+        if use_qkv_gemv:
+            # BF16-GEMV: just norm, skip FP4 quant. fused_add_rms_norm
+            # modifies hidden_states (normalized) and residual (sum) in-place.
+            # When residual IS bufs.residual_buf (layers 2+), no copy needed.
+            ops.fused_add_rms_norm(hidden_states, residual, input_ln_w, eps)
+            if residual is not bufs.residual_buf:
+                bufs.residual_buf.copy_(residual)
+        else:
+            _fused_norm_quant(
+                hidden_states, residual, bufs, input_ln_w,
+                qkv.input_scale_inv, bufs.qkv_fp4, bufs.qkv_scale,
+                N, M, scale_stride,
+            )
         residual = bufs.residual_buf
 
-    # 2. QKV projection (CUTLASS)
-    qkv_out = nvfp4_gemm(
-        bufs.qkv_fp4, bufs.qkv_scale.view(torch.float8_e4m3fn), qkv, backend,
-    )
+    # 2. QKV projection: BF16-input GEMV or CUTLASS
+    if use_qkv_gemv:
+        from .flat_llama_gemv import nvfp4_gemv_bf16in as _gemv_bf16_qkv
+        qkv_out = torch.empty(1, qkv.output_size, dtype=torch.bfloat16,
+                               device=hidden_states.device)
+        _gemv_bf16_qkv(
+            qkv.weight, hidden_states.view(-1),
+            qkv.weight_scale_rowmajor,
+            qkv_out.view(-1), qkv.alpha_bf16_gemv,
+        )
+    else:
+        qkv_out = nvfp4_gemm(
+            bufs.qkv_fp4, bufs.qkv_scale.view(torch.float8_e4m3fn), qkv, backend,
+        )
 
     # 3. Split Q/K/V
     q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
