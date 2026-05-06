@@ -10,7 +10,7 @@ pass is a single function with all parameters as plain tensors.
 ```
              TPIT       Speedup
 Compiled:    12.50ms    baseline
-Flat+GEMV:   12.07ms    1.04×
+Flat+GEMV:    9.52ms    1.31×
 ```
 
 ## Maintenance
@@ -62,10 +62,11 @@ That's 18 ops and ~13 kernel launches per layer.
 |---|---|---|---|
 | Residual+RMSNorm+FP4 quant | 1+2+3, 11+12+13 | 2→1 (×2 sites) | Single-CTA Triton kernel |
 | RoPE+KV cache write | 5+6 | 2→1 | Triton kernel (64 programs) |
+| O GEMM → BF16-GEMV | 9+10 | 2→1 | Raw CUDA BF16-input GEMV (no FP4 quant) |
 | SiLU+mul+FP4 quant | 15+16+17 | 3→1 | Triton kernel (row-major scales) |
 | Down GEMM → GEMV | 18 | same count | Raw CUDA (22.8μs vs 48μs CUTLASS) |
 
-Result: **11 kernels per layer** (down from ~13).
+Result: **10 kernels per layer** (down from ~13).
 
 ## Per-layer decode breakdown
 
@@ -74,22 +75,21 @@ Measured via standalone kernel benchmarks, then validated against e2e TPIT.
 ```
  #  Op                               μs     Pct
 ────────────────────────────────────────────────────
- 1  Norm+FP4 quant (pre-attn)        4.2    3.5%   fused (Triton single-CTA)
- 2  QKV GEMM (CUTLASS)               9.0    7.5%
- 3  RoPE+KV write (fused)            2.5    2.1%   fused (Triton)
- 4  Attention decode (FlashInfer)     9.3    7.8%
- 5  Merge states (FlashInfer)         2.3    1.9%
- 6  FP4 quant O (Triton)             1.9    1.6%
- 7  O GEMM (CUTLASS)                 9.0    7.5%
- 8  Norm+FP4 quant (post-attn)       4.2    3.5%   fused (Triton single-CTA)
- 9  Gate+Up GEMM (CUTLASS)          46.0   38.5%
-10  Fused silu+mul+FP4 quant         1.8    1.5%   fused (Triton, row-major)
-11  Down GEMV (CUDA)                22.8   19.1%   was 48μs CUTLASS
+ 1  Norm+FP4 quant (pre-attn)        4.2    4.8%   fused (Triton single-CTA)
+ 2  QKV GEMM (CUTLASS)               9.0   10.3%
+ 3  RoPE+KV write (fused)            2.5    2.9%   fused (Triton)
+ 4  Attention decode (FlashInfer)     9.3   10.6%
+ 5  Merge states (FlashInfer)         2.3    2.6%
+ 6  O BF16-GEMV (CUDA)               ~5    5.7%   was FP4 quant+CUTLASS (10.9μs)
+ 7  Norm+FP4 quant (post-attn)       4.2    4.8%   fused (Triton single-CTA)
+ 8  Gate+Up GEMM (CUTLASS)          46.0   52.5%
+ 9  Fused silu+mul+FP4 quant         1.8    2.1%   fused (Triton, row-major)
+10  Down GEMV (CUDA)                22.8   26.0%   was 48μs CUTLASS
 ────────────────────────────────────────────────────
-    TOTAL per layer                119.5
-    80 layers                        9.6ms
+    TOTAL per layer                ~87.6
+    80 layers                        7.0ms
     + overhead                      ~2.5ms
-    ≈ TPIT                         12.1ms  (measured: 12.07ms)
+    ≈ TPIT                          9.5ms  (measured: 9.52ms)
 ```
 
 ## Known issues and investigations
@@ -100,22 +100,30 @@ but vLLM/FlashInfer allocates FP8 cache as `torch.uint8`. Fixed by checking
 for both types. Without this fix, the kernel wrote BF16 (2 bytes) into the
 uint8 cache (1 byte per element), corrupting all subsequent attention.
 
-### GEMV for QKV/O/Gate+Up (NOT VIABLE — numerical fragility)
-Extensive testing (CUDA GEMV, Triton GEMV, FP32-acc GEMV) shows that ANY
-custom matmul kernel for QKV, O, or Gate+Up breaks the model — even when
-it produces output within 1 BF16 ULP (0.015625) of CUTLASS. The max diff
-across 80 layers is ~0.015, but this tiny error compounds through the
-attention pipeline to produce wrong tokens. The down projection is immune
-because its output enters the residual stream (noise-tolerant), not the
-attention pathway (noise-amplifying).
+### FP4-input GEMV for QKV/Gate+Up (NOT VIABLE — numerical fragility)
+FP4-input GEMV (where activations are quantized to FP4 then decompressed
+in the GEMV kernel) breaks model quality for QKV and Gate+Up projections,
+even when the GEMV kernel produces output within 0.008 of CUTLASS on
+identical FP4 data.
 
-Root cause: different instruction pipelines (scalar FMA vs tcgen05 MMA)
-produce different BF16 rounding on the same mathematical operation. This
-model is sensitive to bit-exact CUTLASS output at QKV/O/Gate+Up.
+**Root cause 1 — Triton compiler FP4 data divergence**: The Triton fused
+norm+quant kernel compiled with `ROW_MAJOR_SCALES=True` produces subtly
+different FP4 quantization than with `ROW_MAJOR_SCALES=False`, due to
+different compiler optimization choices affecting FP32 intermediate rounding.
+Fix: always quantize with the CUTLASS-compatible kernel and unswizzle
+activation scales for GEMV.
 
-To use custom GEMV for these projections, it would need to produce
-bit-identical results to CUTLASS's tcgen05 MMA instructions — which is
-fundamentally impossible with a different compute path.
+**Root cause 2 — MMA vs FMA rounding**: Even with identical FP4 data,
+the GEMV (scalar FMA in FP16/FP32) produces ~0.008 max diff vs CUTLASS
+(tensor core MMA). This error compounds across 80 layers through attention.
+The model was calibrated for CUTLASS MMA rounding behavior.
+
+### BF16-input GEMV for O projection (WORKS)
+The BF16-input GEMV bypasses FP4 activation quantization entirely, feeding
+BF16 attention output directly to the GEMV with FP4 weights. This avoids
+both root causes above: no FP4 quant means no Triton compiler divergence,
+and the higher-precision input compensates for MMA/FMA differences. Saves
+~6μs per layer (eliminates FP4 quant kernel + faster than CUTLASS GEMM).
 
 ### Prefill kv_sharing bug (FIXED)
 The `else` branch in `flat_forward` (general/prefill path) incorrectly set
@@ -141,4 +149,5 @@ attention to skip KV cache writes during prefill.
 | GEMV for O projection | 11.08ms | c375faf |
 | All-GEMV decode (**BROKEN** — was 9.92ms) | — | a7d19f9 |
 | FP8 KV cache dtype fix | fixed correctness | 712759a |
-| Revert QKV/O/Gate+Up GEMV (precision) | 12.07ms | current |
+| Revert QKV/O/Gate+Up GEMV (precision) | 12.07ms | fa7e236 |
+| O BF16-input GEMV (no FP4 quant) | 9.52ms | current |

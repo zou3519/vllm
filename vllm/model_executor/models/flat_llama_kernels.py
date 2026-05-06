@@ -685,19 +685,11 @@ def _fused_norm_quant(
     N, M, scale_stride,
 ):
     """Dispatch fused add+RMSNorm+FP4 quant: single-CTA (BS=1) or 2-kernel."""
-    if M == 1 and N >= 256 and False:  # DISABLED: use C++ path for debugging
+    if M == 1 and N >= 256:
         triton_single_cta_fused_add_rms_norm_fp4_quant(
             hidden_states, residual, bufs.residual_buf,
             ln_weight, input_scale_inv,
             fp4_out, scale_out,
-        )
-    elif M == 1:
-        # Use C++ ops for debugging (matches general path)
-        ops.fused_add_rms_norm(hidden_states, residual, ln_weight, 1e-5)
-        bufs.residual_buf.copy_(residual)
-        torch.ops._C.scaled_fp4_quant.out(
-            hidden_states, input_scale_inv, True,
-            output=fp4_out, output_scale=scale_out,
         )
     else:
         _add_variance_kernel[(M,)](
@@ -843,51 +835,27 @@ def transformer_layer(
     M = hidden_states.shape[0]
     scale_stride = bufs.qkv_scale.view(torch.uint8).shape[-1]
 
-    # 1. Fused pre-attention: residual-add + RMSNorm + FP4 quant
-    use_gemv = qkv.weight_scale_rowmajor is not None
+    # 1. Pre-attention: residual-add + RMSNorm + FP4 quant
     if residual is None:
         residual = hidden_states
         from vllm.model_executor.layers.layernorm import ir
         hidden_states = ir.ops.rms_norm(hidden_states, input_ln_w, eps)
-        if use_gemv:
-            torch.ops._C.scaled_fp4_quant.out(
-                hidden_states, qkv.input_scale_inv, False,
-                output=bufs.qkv_fp4_gemv, output_scale=bufs.qkv_scale_gemv,
-            )
-        else:
-            torch.ops._C.scaled_fp4_quant.out(
-                hidden_states, qkv.input_scale_inv, True,
-                output=bufs.qkv_fp4, output_scale=bufs.qkv_scale,
-            )
+        torch.ops._C.scaled_fp4_quant.out(
+            hidden_states, qkv.input_scale_inv, True,
+            output=bufs.qkv_fp4, output_scale=bufs.qkv_scale,
+        )
     else:
-        if use_gemv:
-            triton_single_cta_fused_add_rms_norm_fp4_quant(
-                hidden_states, residual, bufs.residual_buf,
-                input_ln_w, qkv.input_scale_inv,
-                bufs.qkv_fp4_gemv, bufs.qkv_scale_gemv,
-                row_major_scales=True,
-            )
-        else:
-            _fused_norm_quant(
-                hidden_states, residual, bufs, input_ln_w,
-                qkv.input_scale_inv, bufs.qkv_fp4, bufs.qkv_scale,
-                N, M, scale_stride,
-            )
+        _fused_norm_quant(
+            hidden_states, residual, bufs, input_ln_w,
+            qkv.input_scale_inv, bufs.qkv_fp4, bufs.qkv_scale,
+            N, M, scale_stride,
+        )
         residual = bufs.residual_buf
 
-    # 2. QKV projection
-    if use_gemv:
-        from .flat_llama_gemv import nvfp4_gemv as _gemv
-        qkv_out = torch.empty(1, qkv.output_size, dtype=torch.bfloat16, device=hidden_states.device)
-        _gemv(
-            qkv.weight, bufs.qkv_fp4_gemv.view(-1),
-            qkv.weight_scale_rowmajor, bufs.qkv_scale_gemv.view(-1),
-            qkv_out.view(-1), qkv.alpha_float,
-        )
-    else:
-        qkv_out = nvfp4_gemm(
-            bufs.qkv_fp4, bufs.qkv_scale.view(torch.float8_e4m3fn), qkv, backend,
-        )
+    # 2. QKV projection (CUTLASS)
+    qkv_out = nvfp4_gemm(
+        bufs.qkv_fp4, bufs.qkv_scale.view(torch.float8_e4m3fn), qkv, backend,
+    )
 
     # 3. Split Q/K/V
     q, k, v = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
@@ -943,17 +911,13 @@ def transformer_layer(
         q, k = rotary_emb(positions, q, k)
         attn_output = attn(q, k, v)
 
-    # 5. O projection: FP4 quant (row-major) + GEMV
+    # 5. O projection: BF16-input GEMV (no activation quant) or CUTLASS
     if o.weight_scale_rowmajor is not None:
-        triton_fp4_quant_rowmajor(
-            attn_output, o.input_scale_inv,
-            bufs.o_fp4_gemv, bufs.o_scale_gemv,
-        )
-        from .flat_llama_gemv import nvfp4_gemv
-        nvfp4_gemv(
-            o.weight, bufs.o_fp4_gemv,
-            o.weight_scale_rowmajor, bufs.o_scale_gemv,
-            hidden_states, o.alpha_float,
+        from .flat_llama_gemv import nvfp4_gemv_bf16in as _gemv_bf16_o
+        _gemv_bf16_o(
+            o.weight, attn_output.view(-1),
+            o.weight_scale_rowmajor,
+            hidden_states.view(-1), o.alpha_bf16_gemv,
         )
     else:
         triton_fp4_quant(attn_output, o.input_scale_inv, bufs.o_fp4, bufs.o_scale)
@@ -962,31 +926,16 @@ def transformer_layer(
         )
 
     # 7. Post-attention norm + FP4 quant → Gate+Up projection
-    if gate_up.weight_scale_rowmajor is not None:
-        triton_single_cta_fused_add_rms_norm_fp4_quant(
-            hidden_states, residual, bufs.residual_buf,
-            post_attn_ln_w, gate_up.input_scale_inv,
-            bufs.gu_fp4_gemv, bufs.gu_scale_gemv,
-            row_major_scales=True,
-        )
-        residual = bufs.residual_buf
-        gate_up_out = torch.empty(1, gate_up.output_size, dtype=torch.bfloat16, device=hidden_states.device)
-        from .flat_llama_gemv import nvfp4_gemv as _gemv2
-        _gemv2(
-            gate_up.weight, bufs.gu_fp4_gemv.view(-1),
-            gate_up.weight_scale_rowmajor, bufs.gu_scale_gemv.view(-1),
-            gate_up_out.view(-1), gate_up.alpha_float,
-        )
-    else:
-        _fused_norm_quant(
-            hidden_states, residual, bufs, post_attn_ln_w,
-            gate_up.input_scale_inv, bufs.gu_fp4, bufs.gu_scale,
-            N, M, scale_stride,
-        )
-        residual = bufs.residual_buf
-        gate_up_out = nvfp4_gemm(
-            bufs.gu_fp4, bufs.gu_scale.view(torch.float8_e4m3fn), gate_up, backend,
-        )
+    # Always quantize with CUTLASS format, unswizzle for GEMV
+    _fused_norm_quant(
+        hidden_states, residual, bufs, post_attn_ln_w,
+        gate_up.input_scale_inv, bufs.gu_fp4, bufs.gu_scale,
+        N, M, scale_stride,
+    )
+    residual = bufs.residual_buf
+    gate_up_out = nvfp4_gemm(
+        bufs.gu_fp4, bufs.gu_scale.view(torch.float8_e4m3fn), gate_up, backend,
+    )
 
     # 8+9. Fused SiLU+mul+FP4 quant (row-major scales) → GEMV down projection
     if down.weight_scale_rowmajor is not None:
@@ -1164,9 +1113,9 @@ def extract_all_layer_params(layers, start_layer, end_layer):
         input_ln_weights.append(layer.input_layernorm.weight.data)
         post_attn_ln_weights.append(layer.post_attention_layernorm.weight.data)
         qkv_projs.append(extract_nvfp4_proj(layer.self_attn.qkv_proj, enable_gemv=False))
-        o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj, enable_gemv=False))
+        o_projs.append(extract_nvfp4_proj(layer.self_attn.o_proj, enable_gemv=True))
         gate_up_projs.append(extract_nvfp4_proj(layer.mlp.gate_up_proj, enable_gemv=False))
-        down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj, enable_gemv=False))
+        down_projs.append(extract_nvfp4_proj(layer.mlp.down_proj, enable_gemv=True))
         rotary_embs.append(layer.self_attn.rotary_emb)
         attn_layer = layer.self_attn.attn
         attns.append(attn_layer)
