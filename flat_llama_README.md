@@ -95,8 +95,10 @@ Measured via standalone kernel benchmarks, then validated against e2e TPIT.
 ## Roofline analysis
 
 BS=1 decode is entirely memory-bound. The roofline is determined by
-weight reads (FP4 packed data + FP8 block scales) at peak HBM bandwidth.
+weight reads (FP4 packed data + FP8 block scales) at peak HBM bandwidth
+(~8 TB/s on GB300).
 
+**Per-projection roofline:**
 ```
 Projection    Weight (FP4+scales)   Roofline @8TB/s   Measured    BW eff
 ──────────────────────────────────────────────────────────────────────────
@@ -106,19 +108,25 @@ Gate+Up       252 MB                 31.5 μs          46.0 μs      68%  (CUTLA
 Down          126 MB                 15.8 μs          22.8 μs      69%  (FP4-GEMV)
 ──────────────────────────────────────────────────────────────────────────
 Total         459 MB                 57.4 μs          82.8 μs      69%  avg
-× 80 layers                          4.6 ms           6.6 ms
-+ non-GEMM ops                                       ~0.4 ms
-+ overhead (CUDA graph, framework)                    ~2.5 ms
-──────────────────────────────────────────────────────────────────────────
-TPIT roofline (100% BW)               ~7.5 ms
-TPIT roofline (70% BW)                ~9.1 ms
-TPIT measured                          9.52 ms
 ```
 
-Current TPIT is within ~5% of the 70%-efficiency roofline. The main
-opportunity is Gate+Up (52% of per-layer time) — a faster GEMM kernel
-or weight layout optimization could save ~15μs/layer = 1.2ms total.
-QKV and O are already close to roofline.
+**End-to-end TPIT breakdown:**
+```
+Component                      Time
+─────────────────────────────────────
+GEMM/GEMV (× 80 layers)       6.6 ms   (roofline: 4.6ms at 100% BW)
+Non-GEMM ops (× 80 layers)   ~0.4 ms   (norm, RoPE, attention, quant)
+Fixed overhead                ~2.5 ms   (CUDA graph replay, framework)
+─────────────────────────────────────
+Measured TPIT                  9.52 ms
+Compute roofline (100% BW)     5.0 ms   (GEMM/GEMV + non-GEMM only)
+Compute roofline (70% BW)      7.0 ms
+```
+
+The compute portion (7.0ms at 70% BW) is close to measured (7.0ms =
+9.52ms − 2.5ms overhead). The main opportunity is Gate+Up CUTLASS
+(52% of per-layer time, 68% BW efficiency) — a faster kernel or weight
+layout could save ~15μs/layer = 1.2ms.
 
 ## Known issues and investigations
 
