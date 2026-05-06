@@ -100,13 +100,22 @@ but vLLM/FlashInfer allocates FP8 cache as `torch.uint8`. Fixed by checking
 for both types. Without this fix, the kernel wrote BF16 (2 bytes) into the
 uint8 cache (1 byte per element), corrupting all subsequent attention.
 
-### GEMV for QKV/O/Gate+Up (NOT VIABLE)
-The CUDA GEMV uses FP16 intermediate accumulation which compounds across
-80 layers for attention-critical projections (QKV, O). Standalone comparison
-shows near-zero error vs CUTLASS, but the model degenerates after 1 token.
-The down projection works because the larger K=28672 averages out errors.
-Both CUDA and Triton GEMV variants have the same issue — it's a precision
-problem, not a kernel bug. Gate+Up also shows quality degradation.
+### GEMV for QKV/O/Gate+Up (NOT VIABLE — numerical fragility)
+Extensive testing (CUDA GEMV, Triton GEMV, FP32-acc GEMV) shows that ANY
+custom matmul kernel for QKV, O, or Gate+Up breaks the model — even when
+it produces output within 1 BF16 ULP (0.015625) of CUTLASS. The max diff
+across 80 layers is ~0.015, but this tiny error compounds through the
+attention pipeline to produce wrong tokens. The down projection is immune
+because its output enters the residual stream (noise-tolerant), not the
+attention pathway (noise-amplifying).
+
+Root cause: different instruction pipelines (scalar FMA vs tcgen05 MMA)
+produce different BF16 rounding on the same mathematical operation. This
+model is sensitive to bit-exact CUTLASS output at QKV/O/Gate+Up.
+
+To use custom GEMV for these projections, it would need to produce
+bit-identical results to CUTLASS's tcgen05 MMA instructions — which is
+fundamentally impossible with a different compute path.
 
 ### Prefill kv_sharing bug (FIXED)
 The `else` branch in `flat_forward` (general/prefill path) incorrectly set
