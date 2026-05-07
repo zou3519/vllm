@@ -42,19 +42,13 @@ To set up:
 
 ## Profiling
 
-To find bottlenecks, use kernel-level profiling:
+vLLM runs the model in a subprocess, so you can't wrap the forward pass
+with a profiler from the outside. Two approaches:
 
-**torch.profiler** (timeline — which kernels take the most time):
-```python
-with torch.profiler.profile(
-    activities=[torch.profiler.ProfilerActivity.CUDA],
-    on_trace_ready=torch.profiler.tensorboard_trace_handler("./profile_out"),
-) as prof:
-    <run_one_forward>
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-```
-The trace file can be viewed in Chrome at `chrome://tracing` or in
-TensorBoard. This gives the human a visual timeline of all GPU kernels.
+**Standalone profiling script**: write a script that loads the model
+directly (bypassing the server), runs one forward pass under
+`torch.profiler.profile()`, and exports a trace. The trace can be viewed
+in Chrome at `chrome://tracing` or in TensorBoard.
 
 **ncu** (single kernel deep-dive — memory bandwidth, occupancy):
 ```bash
