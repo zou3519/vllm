@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from flashinfer import trtllm_fp4_block_scale_moe
 from flashinfer.tllm_enums import SfLayout
 
+from vllm import _custom_ops as ops
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
@@ -202,18 +203,22 @@ def transformer_layer(
     ) = layer_params
 
     # TransformerBlock.input_layernorm
-    original_dtype = hidden_states.dtype
     if residual is None:
         residual = hidden_states
-        hidden_states = hidden_states.to(torch.float32)
+        hidden_states = torch.empty_like(hidden_states)
+        ops.rms_norm(
+            hidden_states,
+            residual,
+            input_norm_weight,
+            input_norm_eps,
+        )
     else:
-        hidden_states = torch.add(hidden_states.to(torch.float32), residual)
-        residual = hidden_states.to(original_dtype)
-    variance = torch.mean(torch.pow(hidden_states, 2), dim=-1, keepdim=True)
-    hidden_states = torch.mul(
-        hidden_states, torch.rsqrt(torch.add(variance, input_norm_eps))
-    )
-    hidden_states = torch.mul(hidden_states.to(original_dtype), input_norm_weight)
+        ops.fused_add_rms_norm(
+            hidden_states,
+            residual,
+            input_norm_weight,
+            input_norm_eps,
+        )
 
     # TransformerBlock.attn.qkv_proj
     qkv = F.linear(hidden_states, qkv_weight, qkv_bias)
@@ -295,16 +300,11 @@ def transformer_layer(
     hidden_states = F.linear(attn_output, o_proj_weight, o_proj_bias)
 
     # TransformerBlock.post_attention_layernorm
-    original_dtype = hidden_states.dtype
-    hidden_states = torch.add(hidden_states.to(torch.float32), residual)
-    residual = hidden_states.to(original_dtype)
-    variance = torch.mean(torch.pow(hidden_states, 2), dim=-1, keepdim=True)
-    hidden_states = torch.mul(
-        hidden_states, torch.rsqrt(torch.add(variance, post_attention_norm_eps))
-    )
-    hidden_states = torch.mul(
-        hidden_states.to(original_dtype),
+    ops.fused_add_rms_norm(
+        hidden_states,
+        residual,
         post_attention_norm_weight,
+        post_attention_norm_eps,
     )
 
     # TransformerBlock.mlp.router
@@ -460,9 +460,14 @@ def flat_forward(
                     layer.mlp.hidden_size,
                 )
             )
-        cached_params = (model.embedding, layer_params, model.norm)
+        cached_params = (
+            model.embedding,
+            layer_params,
+            model.norm.weight.data,
+            model.norm.variance_epsilon,
+        )
         model._flat_gpt_oss_params = cached_params
-    embedding, layer_params, norm = cached_params
+    embedding, layer_params, norm_weight, norm_eps = cached_params
 
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
@@ -503,7 +508,7 @@ def flat_forward(
 
     assert residual is not None
     # GptOssModel.norm
-    x, _ = norm.forward_native(x, residual)
+    ops.fused_add_rms_norm(x, residual, norm_weight, norm_eps)
 
     if len(aux_hidden_states) > 0:
         return x, aux_hidden_states
