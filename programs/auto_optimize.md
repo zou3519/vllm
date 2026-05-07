@@ -42,18 +42,9 @@ To set up:
 
 ## Profiling
 
-vLLM runs the model in a subprocess, so you can't wrap the forward pass
-with a profiler from the outside. Two approaches:
-
-**Standalone profiling script**: write a script that loads the model
-directly (bypassing the server), runs one forward pass under
-`torch.profiler.profile()`, and exports a trace. The trace can be viewed
-in Chrome at `chrome://tracing` or in TensorBoard.
-
-**ncu** (single kernel deep-dive — memory bandwidth, occupancy):
-```bash
-ncu --target-processes all --set full -k <kernel_name> -o ncu_out <command>
-```
+Use vLLM's built-in torch profiler integration to get kernel-level
+traces. See https://docs.vllm.ai/en/stable/contributing/profiling/#openai-server
+for how to profile the server.
 
 For the iterative loop, TPIT measurement (below) is usually sufficient.
 Use profiling when you need to understand WHERE time is spent within a
