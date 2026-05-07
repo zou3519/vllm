@@ -11,6 +11,7 @@ from vllm import _custom_ops as ops
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
+from vllm.model_executor.models.flat_gpt_oss_kernels import rope_and_cache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -169,11 +170,11 @@ def transformer_layer(
         attn_num_kv_heads,
         attn_head_size,
         attn_head_size_v,
-        _attn_k_scale,
-        _attn_v_scale,
+        attn_k_scale,
+        attn_v_scale,
         attn_q_scale,
         attn_query_uses_fp8,
-        _attn_kv_cache_uses_fp8,
+        attn_kv_cache_dtype,
         _fp8_dtype,
         _fp8_min,
         _fp8_max,
@@ -230,14 +231,37 @@ def transformer_layer(
     cos_sin_cache = rotary_cos_sin_cache.to(dtype=q.dtype, device=q.device)
     q = q.contiguous()
     k = k.contiguous()
-    ops.rotary_embedding(
-        positions,
-        q,
-        k,
-        rotary_head_size,
-        cos_sin_cache,
-        True,
-    )
+    if _layer_slot_mapping is None:
+        ops.rotary_embedding(
+            positions,
+            q,
+            k,
+            rotary_head_size,
+            cos_sin_cache,
+            True,
+        )
+        kv_cache_dummy_dep = torch.empty(
+            0,
+            dtype=_attn_kv_cache.dtype,
+            device=_attn_kv_cache.device,
+        )
+    else:
+        kv_cache_dummy_dep = rope_and_cache(
+            q,
+            k,
+            v,
+            _attn_kv_cache,
+            _layer_slot_mapping,
+            positions,
+            cos_sin_cache,
+            attn_kv_cache_dtype,
+            attn_k_scale,
+            attn_v_scale,
+            attn_num_heads,
+            attn_num_kv_heads,
+            attn_head_size,
+            _rotary_dim,
+        )
 
     # TransformerBlock.attn.attn KV-cache write and attention
     attn_output_dtype = q.dtype
@@ -247,12 +271,6 @@ def transformer_layer(
     q = torch.reshape(q, (num_tokens, attn_num_heads, attn_head_size))
     k = torch.reshape(k, (num_tokens, attn_num_kv_heads, attn_head_size))
     v = torch.reshape(v, (num_tokens, attn_num_kv_heads, attn_head_size_v))
-
-    kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-        k,
-        v,
-        attn_layer_name,
-    )
 
     attn_output = torch.empty(
         (num_tokens, attn_num_heads, attn_head_size_v),
@@ -404,7 +422,7 @@ def flat_forward(
                     attn._v_scale,
                     attn._q_scale,
                     attn.query_quant is not None,
-                    attn.kv_cache_dtype.startswith("fp8"),
+                    attn.kv_cache_dtype,
                     attn.impl.fp8_dtype,
                     fp8_min,
                     fp8_max,
