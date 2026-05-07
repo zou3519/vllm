@@ -203,7 +203,7 @@ def transformer_layer(
         moe_local_num_experts,
         moe_routing_method_type,
         moe_tune_max_num_tokens,
-        hidden_size,
+        _hidden_size,
     ) = layer_params
 
     # TransformerBlock.input_layernorm
@@ -347,7 +347,6 @@ def transformer_layer(
         moe_routing_method_type,
         moe_tune_max_num_tokens,
     )
-    output = output[:, :hidden_size]
 
     return output, residual
 
