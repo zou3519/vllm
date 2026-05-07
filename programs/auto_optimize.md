@@ -11,6 +11,17 @@ BS=1 decode latency (TPIT) for a flat vLLM model.
 Read `flat_config.txt` in the repo root for the serve command, file
 paths, and baseline TPITs (written by `flat_model.md`).
 
+Assume the current shell is already inside the correct conda environment.
+That environment should already have `torch` and `vllm` installed. Do not
+create a virtualenv and do not install packages. Confirm the environment
+before doing any work:
+```bash
+python -c "import torch, vllm; print(torch.__version__); print(vllm.__file__)"
+command -v vllm
+```
+If either `torch` or `vllm` is missing, stop immediately and shout to the
+human that the conda environment is broken and needs to be fixed.
+
 To set up:
 
 1. **Read `flat_config.txt`** and the flat model forward file. Understand
@@ -28,6 +39,33 @@ To set up:
 5. **Confirm and go**: tell the user the flat baseline TPIT, the original
    model TPIT (from `flat_config.txt`), the roofline, and the gap.
    Then start optimizing.
+
+## Profiling
+
+To find bottlenecks, use kernel-level profiling:
+
+**nsys** (timeline — which kernels take the most time):
+```bash
+nsys profile -o profile_out --capture-range=cudaProfilerApi \
+  python -c "import torch; torch.cuda.cudart().cudaProfilerStart(); <run_one_forward>; torch.cuda.cudart().cudaProfilerStop()"
+nsys stats profile_out.nsys-rep --report cuda_gpu_kern_sum
+```
+
+**ncu** (single kernel deep-dive — memory bandwidth, occupancy):
+```bash
+ncu --target-processes all --set full -k <kernel_name> -o ncu_out <command>
+```
+
+**torch.profiler** (quick and easy, no special tools):
+```python
+with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+    <run_one_forward>
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+```
+
+For the iterative loop, TPIT measurement (below) is usually sufficient.
+Use profiling when you need to understand WHERE time is spent within a
+layer.
 
 ## Benchmarking
 
