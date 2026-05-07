@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
+import os
 from typing import Union
 
 import torch
@@ -456,6 +457,16 @@ def convert_to_mxfp4_moe_kernel_format(
         assert w13_bias is not None and w2_bias is not None
         w13_bias = w13_bias.data.to(torch.float32)
         w2_bias = w2_bias.data.to(torch.float32)
+
+        if os.environ.get("VLLM_FLAT_GPT_OSS_CUSTOM_MOE") == "1":
+            layer._flat_gpt_oss_gemv_moe = (
+                w13_weight.contiguous(),
+                w13_weight_scale.contiguous(),
+                w13_bias.contiguous(),
+                w2_weight.contiguous(),
+                w2_weight_scale.contiguous(),
+                w2_bias.contiguous(),
+            )
 
         # Swap w1 and w3 as the definition of swiglu is different in trtllm-gen
         def swap_every_two_rows(x, axis=-1):

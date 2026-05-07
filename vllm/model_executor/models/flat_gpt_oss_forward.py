@@ -193,6 +193,7 @@ def transformer_layer(
         moe_w2_scale,
         moe_w1_bias,
         moe_w2_bias,
+        custom_moe_weights,
         moe_gemm1_alpha,
         moe_gemm1_beta,
         moe_gemm1_clamp_limit,
@@ -305,19 +306,52 @@ def transformer_layer(
     # TransformerBlock.attn.o_proj
     hidden_states = F.linear(attn_output, o_proj_weight, o_proj_bias)
 
-    # TransformerBlock.post_attention_layernorm + MoE MXFP8 activation quant.
-    moe_x_quant, moe_x_scale = fused_add_rms_norm_mxfp8_quant(
-        hidden_states,
-        residual,
-        post_attention_norm_weight,
-        post_attention_norm_eps,
-        256,
-    )
+    use_custom_moe = custom_moe_weights is not None and hidden_states.shape[0] == 1
+    if use_custom_moe:
+        ops.fused_add_rms_norm(
+            hidden_states,
+            residual,
+            post_attention_norm_weight,
+            post_attention_norm_eps,
+        )
+    else:
+        # TransformerBlock.post_attention_layernorm + MoE MXFP8 activation quant.
+        moe_x_quant, moe_x_scale = fused_add_rms_norm_mxfp8_quant(
+            hidden_states,
+            residual,
+            post_attention_norm_weight,
+            post_attention_norm_eps,
+            256,
+        )
 
     # TransformerBlock.mlp.router
     router_logits = F.linear(hidden_states, router_weight, router_bias)
 
     # TransformerBlock.mlp.experts.forward_cuda
+    if use_custom_moe:
+        from vllm.model_executor.models.flat_gpt_oss_moe_cuda import flat_bs1_moe
+
+        (
+            custom_w13,
+            custom_w13_scale,
+            custom_w13_bias,
+            custom_w2,
+            custom_w2_scale,
+            custom_w2_bias,
+        ) = custom_moe_weights
+        output = flat_bs1_moe(
+            hidden_states,
+            router_logits.to(torch.bfloat16),
+            custom_w13,
+            custom_w13_scale,
+            custom_w13_bias,
+            custom_w2,
+            custom_w2_scale,
+            custom_w2_bias,
+            hidden_size,
+        )
+        return output, residual
+
     # FusedMoE.runner.forward -> MoEPrepareAndFinalizeNoDPEPMonolithic.prepare
     moe_x_scale = moe_x_scale.view(torch.float8_e4m3fn).reshape(
         *hidden_states.shape[:-1],
@@ -450,6 +484,7 @@ def flat_forward(
                     fused_experts.w2_scale,
                     fused_experts.w1_bias,
                     fused_experts.w2_bias,
+                    getattr(experts, "_flat_gpt_oss_gemv_moe", None),
                     fused_experts.gemm1_alpha,
                     fused_experts.gemm1_beta,
                     fused_experts.gemm1_clamp_limit,
