@@ -2,10 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import datetime
+import os
 from collections.abc import Iterable, Sequence
 from typing import Literal
 
 from openai.types.responses.tool import Tool
+
+os.environ.setdefault(
+    "TIKTOKEN_RS_CACHE_DIR",
+    os.path.join(
+        os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+        "tiktoken-rs-cache",
+    ),
+)
+
 from openai_harmony import (
     Author,
     Conversation,
