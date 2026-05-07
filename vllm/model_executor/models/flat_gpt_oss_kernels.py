@@ -97,7 +97,7 @@ def fused_add_rms_norm_mxfp8_quant(
         device=input.device,
     )
     scale_output = torch.empty(
-        (num_rows * padded_hidden_size // 32,),
+        (*input.shape[:-1], padded_hidden_size // 32),
         dtype=torch.uint8,
         device=input.device,
     )
