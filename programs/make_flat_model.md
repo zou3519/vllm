@@ -43,12 +43,42 @@ The backbone `forward()` calls `flat_forward()` from the forward file.
 
 ### `flat_<model>_forward.py` — Flat forward pass
 
-- `extract_all_layer_params()` — pull weights out of nn.Modules into flat lists
 - `transformer_layer()` — one decoder block, all params explicit, no `self`
 - `flat_forward()` — embedding → loop of transformer_layer → final norm
 
-Use standard torch ops. For attention and MoE, vLLM's existing operators
-are fine. No custom kernels. The goal is correctness first.
+Only define those two functions. Pull weights/constants out of nn.Modules inside
+`flat_forward()` and cache them on the model.
+
+Inline the whole hidden layer body in `transformer_layer()`. Do not add helper
+functions for RMSNorm, rotary embedding, activation, residual handling, or
+linear wrappers. The only non-Python call sites inside `transformer_layer()`
+should be:
+- native PyTorch operators (`torch.*`, Tensor methods such as `.to()`/`.view()`,
+  indexing, and assignment)
+- `torch.nn.functional.*` ops
+- vLLM's attention op
+- vLLM's MoE op
+
+Add short comments at the original module boundaries in the flat forward, e.g.
+embedding, each decoder layer, attention qkv/rotary/KV-cache/attention/o_proj,
+MLP router/experts, and final norm.
+
+Specialize on the current target hardware and serve command when that removes
+branches from `transformer_layer()`. Prefer the original model's native PyTorch
+path for ordinary math, but keep attention and MoE on the vLLM CUDA path. If a
+linear layer's quant method is known for the target, inline that specialized
+linear path instead of preserving generic dispatch. The goal is correctness
+first.
+
+Make the KV-cache write explicit in the flat definition. Prefer a torch-native
+cache update specialized to the active attention backend/cache layout/hardware,
+then call vLLM's attention op directly, ideally
+`torch.ops.vllm.unified_attention_with_output(...)`, instead of calling the
+`Attention` module wrapper.
+
+Do not torch.compile the flat model when testing or benchmarking. Turn it off
+via the serve command, e.g. add `-cc.mode=none` (CompilationMode.NONE) to the
+flat-model `vllm serve` command.
 
 ## The Test Loop
 
@@ -56,8 +86,9 @@ LOOP FOREVER until the flat model produces correct output:
 
 1. **Start the server** using the user's `vllm serve` command, but add
    `--hf-overrides '{"architectures": ["Flat<Model>ForCausalLM"]}'` to
-   use your flat model. Redirect output to a log file and run in background.
-   Wait for "Application startup complete" in the log.
+   use your flat model, and add `-cc.mode=none` so the flat model is not
+   torch-compiled. Redirect output to a log file and run in background. Wait
+   for "Application startup complete" in the log.
 
 2. **Test correctness** — send these prompts and check the answers:
    - "What is 2+2?" → should answer 4

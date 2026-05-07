@@ -5,7 +5,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -17,7 +16,6 @@ from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import maybe_prefix
 
 
-@support_torch_compile
 class FlatGptOssModel(GptOssModel):
     def forward(
         self,
