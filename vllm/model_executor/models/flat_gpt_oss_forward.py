@@ -229,7 +229,6 @@ def transformer_layer(
     q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
 
     # TransformerBlock.attn.rotary_emb
-    positions = torch.flatten(positions)
     num_tokens = positions.shape[0]
     cos_sin_cache = rotary_cos_sin_cache
     attn_output_dtype = q.dtype
