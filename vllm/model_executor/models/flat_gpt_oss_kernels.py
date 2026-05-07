@@ -11,6 +11,7 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 @triton.jit
 def _rope_and_cache_kernel(
     query_ptr,
+    query_out_ptr,
     key_ptr,
     value_ptr,
     key_cache_ptr,
@@ -18,6 +19,7 @@ def _rope_and_cache_kernel(
     slot_mapping_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
+    q_scale_ptr,
     k_scale_ptr,
     v_scale_ptr,
     query_stride: tl.int64,
@@ -36,6 +38,7 @@ def _rope_and_cache_kernel(
     head_size: tl.constexpr,
     block_size: tl.constexpr,
     rotary_dim: tl.constexpr,
+    QUERY_FP8: tl.constexpr,
     FP8_KV_CACHE: tl.constexpr,
     TILE_SIZE: tl.constexpr,
 ):
@@ -64,7 +67,11 @@ def _rope_and_cache_kernel(
     )
     q_out = tl.where(q_dim < embed_dim, q_x * q_cos - q_y * q_sin,
                      q_y * q_cos + q_x * q_sin)
-    tl.store(query_ptr + q_base + q_dim, q_out, mask=q_mask)
+    if QUERY_FP8:
+        tl.store(query_out_ptr + q_base + q_dim, q_out / tl.load(q_scale_ptr),
+                 mask=q_mask)
+    else:
+        tl.store(query_ptr + q_base + q_dim, q_out, mask=q_mask)
 
     kv_mask = offs < kv_elems
     kv_head = offs // head_size
@@ -145,6 +152,8 @@ def rope_and_cache(
     num_kv_heads: int,
     head_size: int,
     rotary_dim: int,
+    query_output: torch.Tensor | None = None,
+    query_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     key_cache, value_cache = kv_cache.unbind(1)
 
@@ -175,9 +184,15 @@ def rope_and_cache(
     n = max(num_q_heads * rotary_dim, num_kv_heads * head_size)
     tile_size = min(2048, triton.next_power_of_2(n))
     grid = (slot_mapping.shape[0], triton.cdiv(n, tile_size))
+    query_fp8 = query_output is not None
+    if query_output is None:
+        query_output = query
+    if query_scale is None:
+        query_scale = k_scale
 
     _rope_and_cache_kernel[grid](
         query,
+        query_output,
         key,
         value,
         key_cache,
@@ -185,6 +200,7 @@ def rope_and_cache(
         slot_mapping,
         positions,
         cos_sin_cache,
+        query_scale,
         k_scale,
         v_scale,
         query.stride(0),
@@ -203,6 +219,7 @@ def rope_and_cache(
         head_size,
         block_size,
         rotary_dim,
+        query_fp8,
         fp8_kv_cache,
         tile_size,
         num_warps=8,

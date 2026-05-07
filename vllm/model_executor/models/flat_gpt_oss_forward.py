@@ -231,6 +231,8 @@ def transformer_layer(
     cos_sin_cache = rotary_cos_sin_cache.to(dtype=q.dtype, device=q.device)
     q = q.contiguous()
     k = k.contiguous()
+    attn_output_dtype = q.dtype
+    q_already_quantized = False
     if _layer_slot_mapping is None:
         ops.rotary_embedding(
             positions,
@@ -246,6 +248,10 @@ def transformer_layer(
             device=_attn_kv_cache.device,
         )
     else:
+        q_fp8 = None
+        if attn_query_uses_fp8:
+            q_fp8 = torch.empty(q.shape, dtype=_fp8_dtype, device=q.device)
+            q_already_quantized = True
         kv_cache_dummy_dep = rope_and_cache(
             q,
             k,
@@ -261,11 +267,14 @@ def transformer_layer(
             attn_num_kv_heads,
             attn_head_size,
             _rotary_dim,
+            q_fp8,
+            attn_q_scale,
         )
+        if q_fp8 is not None:
+            q = q_fp8
 
     # TransformerBlock.attn.attn KV-cache write and attention
-    attn_output_dtype = q.dtype
-    if attn_query_uses_fp8:
+    if attn_query_uses_fp8 and not q_already_quantized:
         q, _ = ops.scaled_fp8_quant(q, attn_q_scale)
 
     q = torch.reshape(q, (num_tokens, attn_num_heads, attn_head_size))
