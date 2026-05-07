@@ -459,7 +459,7 @@ def flat_forward(
                     fused_experts.ep_rank * fused_experts.local_num_experts,
                     fused_experts.local_num_experts,
                     fused_experts.routing_method_type,
-                    1,
+                    2,
                     layer.mlp.hidden_size,
                 )
             )
