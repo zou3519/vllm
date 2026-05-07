@@ -117,7 +117,7 @@ def fused_add_rms_norm_mxfp8_quant(
         padded_hidden_size,
         block_size,
         scale_blocks,
-        num_warps=8,
+        num_warps=2,
     )
     return quant_output, scale_output
 
