@@ -9,6 +9,85 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 
 
 @triton.jit
+def _top4_softmax_kernel(
+    logits_ptr,
+    weights_ptr,
+    ids_ptr,
+    logits_stride: tl.int64,
+    weights_stride: tl.int64,
+    ids_stride: tl.int64,
+    num_experts: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_experts
+    logits = tl.load(logits_ptr + row * logits_stride + offs, mask=mask,
+                     other=-float("inf")).to(tl.float32)
+
+    top0 = tl.max(logits, axis=0)
+    id0 = tl.argmax(logits, axis=0)
+    logits = tl.where(offs == id0, -float("inf"), logits)
+    top1 = tl.max(logits, axis=0)
+    id1 = tl.argmax(logits, axis=0)
+    logits = tl.where(offs == id1, -float("inf"), logits)
+    top2 = tl.max(logits, axis=0)
+    id2 = tl.argmax(logits, axis=0)
+    logits = tl.where(offs == id2, -float("inf"), logits)
+    top3 = tl.max(logits, axis=0)
+    id3 = tl.argmax(logits, axis=0)
+
+    max_top = tl.maximum(tl.maximum(top0, top1), tl.maximum(top2, top3))
+    exp0 = tl.exp(top0 - max_top)
+    exp1 = tl.exp(top1 - max_top)
+    exp2 = tl.exp(top2 - max_top)
+    exp3 = tl.exp(top3 - max_top)
+    inv_sum = 1.0 / (exp0 + exp1 + exp2 + exp3)
+
+    weights_base = row * weights_stride
+    ids_base = row * ids_stride
+    tl.store(weights_ptr + weights_base + 0, exp0 * inv_sum)
+    tl.store(weights_ptr + weights_base + 1, exp1 * inv_sum)
+    tl.store(weights_ptr + weights_base + 2, exp2 * inv_sum)
+    tl.store(weights_ptr + weights_base + 3, exp3 * inv_sum)
+    tl.store(ids_ptr + ids_base + 0, id0)
+    tl.store(ids_ptr + ids_base + 1, id1)
+    tl.store(ids_ptr + ids_base + 2, id2)
+    tl.store(ids_ptr + ids_base + 3, id3)
+
+
+def top4_softmax(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = logits.shape[0]
+    num_experts = logits.shape[-1]
+    if num_experts != 128:
+        raise ValueError("Flat GPT-OSS top-k kernel is specialized for 128 experts")
+    weights = torch.empty(
+        (num_tokens, 4),
+        dtype=torch.bfloat16,
+        device=logits.device,
+    )
+    ids = torch.empty(
+        (num_tokens, 4),
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    _top4_softmax_kernel[(num_tokens,)](
+        logits,
+        weights,
+        ids,
+        logits.stride(0),
+        weights.stride(0),
+        ids.stride(0),
+        num_experts,
+        triton.next_power_of_2(num_experts),
+        num_warps=4,
+    )
+    return weights, ids
+
+
+@triton.jit
 def _fused_add_rms_norm_mxfp8_quant_kernel(
     input_ptr,
     residual_ptr,
