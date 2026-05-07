@@ -174,9 +174,9 @@ def transformer_layer(
         attn_q_scale,
         attn_query_uses_fp8,
         _attn_kv_cache_uses_fp8,
-        fp8_dtype,
-        fp8_min,
-        fp8_max,
+        _fp8_dtype,
+        _fp8_min,
+        _fp8_max,
         o_proj_weight,
         o_proj_bias,
         post_attention_norm_weight,
@@ -241,6 +241,9 @@ def transformer_layer(
 
     # TransformerBlock.attn.attn KV-cache write and attention
     attn_output_dtype = q.dtype
+    if attn_query_uses_fp8:
+        q, _ = ops.scaled_fp8_quant(q, attn_q_scale)
+
     q = torch.reshape(q, (num_tokens, attn_num_heads, attn_head_size))
     k = torch.reshape(k, (num_tokens, attn_num_kv_heads, attn_head_size))
     v = torch.reshape(v, (num_tokens, attn_num_kv_heads, attn_head_size_v))
@@ -250,14 +253,6 @@ def transformer_layer(
         v,
         attn_layer_name,
     )
-
-    if attn_query_uses_fp8:
-        q = torch.clamp(
-            torch.div(q.to(torch.float32), attn_q_scale),
-            fp8_min,
-            fp8_max,
-        )
-        q = q.to(fp8_dtype)
 
     attn_output = torch.empty(
         (num_tokens, attn_num_heads, attn_head_size_v),
