@@ -10,12 +10,14 @@ from flashinfer.tllm_enums import SfLayout
 from vllm import _custom_ops as ops
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.model_executor.models.flat_gpt_oss_kernels import (
     fused_add_rms_norm_mxfp8_quant,
     rope_and_cache,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -84,7 +86,12 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     routing_method_type: int,
     tune_max_num_tokens: int,
 ) -> torch.Tensor:
-    output = torch.empty_like(output_like)
+    output_cols = (output_like.shape[-1] + 127) // 128 * 128
+    output = torch.empty(
+        (*output_like.shape[:-1], output_cols),
+        dtype=output_like.dtype,
+        device=output_like.device,
+    )
     return trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=None,
@@ -150,6 +157,63 @@ direct_register_custom_op(
 )
 
 
+def _flashinfer_cutlass_mxfp4_mxfp8_moe(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    output_like: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: torch.Tensor,
+    gemm1_alpha: torch.Tensor,
+    gemm1_beta: torch.Tensor,
+    gemm1_clamp_limit: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: torch.Tensor,
+    fake_input_scale: torch.Tensor,
+    tune_max_num_tokens: int,
+) -> torch.Tensor:
+    from flashinfer.fused_moe.core import ActivationType
+
+    output_cols = (output_like.shape[-1] + 127) // 128 * 128
+    output = torch.empty(
+        (*output_like.shape[:-1], output_cols),
+        dtype=output_like.dtype,
+        device=output_like.device,
+    )
+    _ = flashinfer_cutlass_fused_moe(
+        input=hidden_states,
+        token_selected_experts=topk_ids.to(torch.int).contiguous(),
+        token_final_scales=topk_weights,
+        fc1_expert_weights=gemm1_weights.contiguous().view(torch.long),
+        fc2_expert_weights=gemm2_weights.contiguous().view(torch.long),
+        fc1_expert_biases=gemm1_bias,
+        fc2_expert_biases=gemm2_bias,
+        swiglu_alpha=gemm1_alpha,
+        swiglu_beta=gemm1_beta,
+        swiglu_limit=gemm1_clamp_limit,
+        output=output,
+        output_dtype=output_like.dtype,
+        quant_scales=[
+            gemm1_weights_scale.view(torch.int32),
+            fake_input_scale,
+            gemm2_weights_scale.view(torch.int32),
+            fake_input_scale,
+        ],
+        input_sf=hidden_states_scale,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        activation_type=ActivationType.Swiglu,
+        use_mxfp8_act_scaling=True,
+        tune_max_num_tokens=tune_max_num_tokens,
+    )
+    return output
+
+
 def transformer_layer(
     layer_params: tuple[Any, ...],
     hidden_states: torch.Tensor,
@@ -203,6 +267,9 @@ def transformer_layer(
         moe_local_num_experts,
         moe_routing_method_type,
         moe_tune_max_num_tokens,
+        moe_backend_kind,
+        moe_fake_input_scale,
+        moe_activation_alignment,
         hidden_size,
     ) = layer_params
 
@@ -310,7 +377,7 @@ def transformer_layer(
         residual,
         post_attention_norm_weight,
         post_attention_norm_eps,
-        256,
+        moe_activation_alignment,
     )
 
     # TransformerBlock.mlp.router
@@ -323,29 +390,56 @@ def transformer_layer(
         -1,
     )
 
-    # TrtLlmMxfp4ExpertsMonolithic.apply
-    output = torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe(
-        router_logits.to(torch.bfloat16),
-        hidden_states,
-        moe_x_quant,
-        moe_x_scale,
-        moe_w1,
-        moe_w1_scale,
-        moe_w1_bias,
-        moe_gemm1_alpha,
-        moe_gemm1_beta,
-        moe_gemm1_clamp_limit,
-        moe_w2,
-        moe_w2_scale,
-        moe_w2_bias,
-        moe_global_num_experts,
-        moe_topk,
-        moe_intermediate_size,
-        moe_local_expert_offset,
-        moe_local_num_experts,
-        moe_routing_method_type,
-        moe_tune_max_num_tokens,
-    )
+    if moe_backend_kind == "cutlass":
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states,
+            router_logits,
+            moe_topk,
+            True,
+        )
+        assert moe_fake_input_scale is not None
+        output = _flashinfer_cutlass_mxfp4_mxfp8_moe(
+            moe_x_quant,
+            moe_x_scale,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            moe_w1,
+            moe_w1_scale,
+            moe_w1_bias,
+            moe_gemm1_alpha,
+            moe_gemm1_beta,
+            moe_gemm1_clamp_limit,
+            moe_w2,
+            moe_w2_scale,
+            moe_w2_bias,
+            moe_fake_input_scale,
+            moe_tune_max_num_tokens,
+        )
+    else:
+        # TrtLlmMxfp4ExpertsMonolithic.apply
+        output = torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe(
+            router_logits.to(torch.bfloat16),
+            hidden_states,
+            moe_x_quant,
+            moe_x_scale,
+            moe_w1,
+            moe_w1_scale,
+            moe_w1_bias,
+            moe_gemm1_alpha,
+            moe_gemm1_beta,
+            moe_gemm1_clamp_limit,
+            moe_w2,
+            moe_w2_scale,
+            moe_w2_bias,
+            moe_global_num_experts,
+            moe_topk,
+            moe_intermediate_size,
+            moe_local_expert_offset,
+            moe_local_num_experts,
+            moe_routing_method_type,
+            moe_tune_max_num_tokens,
+        )
     output = output[:, :hidden_size]
 
     return output, residual
@@ -389,19 +483,51 @@ def flat_forward(
             experts = layer.mlp.experts
             expert_method = experts.quant_method
             moe_kernel = expert_method.moe_kernel
-            if moe_kernel is None or not expert_method.is_monolithic:
+            if moe_kernel is None:
                 raise ValueError(
-                    "Flat GPT-OSS is specialized for monolithic MXFP4 MoE"
+                    "Flat GPT-OSS is specialized for FlashInfer MXFP4 MoE"
                 )
             fused_experts = moe_kernel.fused_experts
-            if fused_experts.__class__.__name__ != "TrtLlmMxfp4ExpertsMonolithic":
+            fused_experts_cls = fused_experts.__class__.__name__
+            if fused_experts_cls not in (
+                "TrtLlmMxfp4ExpertsMonolithic",
+                "FlashInferExperts",
+            ):
                 raise ValueError(
-                    "Flat GPT-OSS is specialized for FlashInfer TRTLLM MXFP4 MoE"
+                    "Flat GPT-OSS is specialized for FlashInfer MXFP4 MoE"
                 )
-            if not fused_experts.use_mxfp8_input:
+            if fused_experts_cls == "TrtLlmMxfp4ExpertsMonolithic":
+                moe_backend_kind = "trtllm"
+                moe_fake_input_scale = None
+                moe_activation_alignment = 256
+                if not expert_method.is_monolithic:
+                    raise ValueError(
+                        "Flat GPT-OSS expects monolithic TRTLLM MXFP4 MoE"
+                    )
+                if not fused_experts.use_mxfp8_input:
+                    raise ValueError(
+                        "Flat GPT-OSS is specialized for MXFP8 MoE activations"
+                    )
+                moe_topk = fused_experts.topk
+                moe_intermediate_size = fused_experts.intermediate_size_per_partition
+                moe_local_expert_offset = (
+                    fused_experts.ep_rank * fused_experts.local_num_experts
+                )
+                moe_local_num_experts = fused_experts.local_num_experts
+                moe_routing_method_type = fused_experts.routing_method_type
+            elif fused_experts.quant_dtype != "mxfp8":
                 raise ValueError(
                     "Flat GPT-OSS is specialized for MXFP8 MoE activations"
                 )
+            else:
+                moe_backend_kind = "cutlass"
+                moe_fake_input_scale = fused_experts.fake_input_scale
+                moe_activation_alignment = 128
+                moe_topk = experts.top_k
+                moe_intermediate_size = 0
+                moe_local_expert_offset = 0
+                moe_local_num_experts = experts.local_num_experts
+                moe_routing_method_type = 0
             if moe_kernel.output_is_reduced():
                 raise ValueError("Flat GPT-OSS is specialized for no MoE all-reduce")
             moe_parallel_config = experts.moe_config.moe_parallel_config
@@ -453,12 +579,15 @@ def flat_forward(
                     fused_experts.gemm1_beta,
                     fused_experts.gemm1_clamp_limit,
                     experts.global_num_experts,
-                    fused_experts.topk,
-                    fused_experts.intermediate_size_per_partition,
-                    fused_experts.ep_rank * fused_experts.local_num_experts,
-                    fused_experts.local_num_experts,
-                    fused_experts.routing_method_type,
+                    moe_topk,
+                    moe_intermediate_size,
+                    moe_local_expert_offset,
+                    moe_local_num_experts,
+                    moe_routing_method_type,
                     1,
+                    moe_backend_kind,
+                    moe_fake_input_scale,
+                    moe_activation_alignment,
                     layer.mlp.hidden_size,
                 )
             )
