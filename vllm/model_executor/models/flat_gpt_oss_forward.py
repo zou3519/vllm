@@ -149,8 +149,8 @@ def transformer_layer(
     layer_params: tuple[Any, ...],
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
-    layer_slot_mapping: torch.Tensor | None,
-    attn_kv_cache: torch.Tensor,
+    _layer_slot_mapping: torch.Tensor | None,
+    _attn_kv_cache: torch.Tensor,
     residual: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     (
@@ -168,11 +168,11 @@ def transformer_layer(
         attn_num_kv_heads,
         attn_head_size,
         attn_head_size_v,
-        attn_k_scale,
-        attn_v_scale,
+        _attn_k_scale,
+        _attn_v_scale,
         attn_q_scale,
         attn_query_uses_fp8,
-        attn_kv_cache_uses_fp8,
+        _attn_kv_cache_uses_fp8,
         fp8_dtype,
         fp8_min,
         fp8_max,
@@ -260,37 +260,11 @@ def transformer_layer(
     k = torch.reshape(k, (num_tokens, attn_num_kv_heads, attn_head_size))
     v = torch.reshape(v, (num_tokens, attn_num_kv_heads, attn_head_size_v))
 
-    if layer_slot_mapping is not None and torch.numel(attn_kv_cache) != 0:
-        valid_slots = torch.ge(layer_slot_mapping, 0)
-        token_indices = torch.squeeze(torch.nonzero(valid_slots), -1)
-        slots = torch.index_select(layer_slot_mapping, 0, token_indices)
-        key_cache, value_cache = torch.unbind(attn_kv_cache, 1)
-        if attn_kv_cache_uses_fp8:
-            key_cache = torch.ops.aten.view.dtype(key_cache, fp8_dtype)
-            value_cache = torch.ops.aten.view.dtype(value_cache, fp8_dtype)
-        block_size = key_cache.shape[1]
-        block_indices = torch.div(slots, block_size, rounding_mode="floor")
-        block_offsets = torch.remainder(slots, block_size)
-        cache_k = torch.index_select(k, 0, token_indices)
-        cache_v = torch.index_select(v, 0, token_indices)
-        if attn_kv_cache_uses_fp8:
-            cache_k = torch.clamp(
-                torch.div(cache_k.to(torch.float32), attn_k_scale),
-                fp8_min,
-                fp8_max,
-            )
-            cache_v = torch.clamp(
-                torch.div(cache_v.to(torch.float32), attn_v_scale),
-                fp8_min,
-                fp8_max,
-            )
-            cache_k = cache_k.to(fp8_dtype)
-            cache_v = cache_v.to(fp8_dtype)
-        else:
-            cache_k = cache_k.to(key_cache.dtype)
-            cache_v = cache_v.to(value_cache.dtype)
-        key_cache[block_indices, block_offsets] = cache_k
-        value_cache[block_indices, block_offsets] = cache_v
+    kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+        k,
+        v,
+        attn_layer_name,
+    )
 
     if attn_query_uses_fp8:
         q = torch.clamp(
@@ -313,7 +287,7 @@ def transformer_layer(
         attn_layer_name,
         None,
         None,
-        None,
+        kv_cache_dummy_dep,
     )
     attn_output = torch.reshape(attn_output, (num_tokens, q_size))
 
