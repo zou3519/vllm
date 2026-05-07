@@ -256,7 +256,7 @@ def transformer_layer(
         if attn_query_uses_fp8:
             q_fp8 = torch.empty(q.shape, dtype=_fp8_dtype, device=q.device)
             q_already_quantized = True
-        kv_cache_dummy_dep = rope_and_cache(
+        rope_and_cache(
             q,
             k,
             v,
@@ -274,6 +274,7 @@ def transformer_layer(
             q_fp8,
             attn_q_scale,
         )
+        kv_cache_dummy_dep = None
         if q_fp8 is not None:
             q = q_fp8
 
