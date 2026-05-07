@@ -14,6 +14,17 @@ The user will give you a `vllm serve` command, e.g.:
 vllm serve <model_name> --arg1 ... --arg2 ...
 ```
 
+Assume the current shell is already inside the correct conda environment.
+That environment should already have `torch` and `vllm` installed. Do not
+create a virtualenv and do not install packages. Confirm the environment
+before doing any work:
+```bash
+python -c "import torch, vllm; print(torch.__version__); print(vllm.__file__)"
+command -v vllm
+```
+If either `torch` or `vllm` is missing, stop immediately and shout to the
+human that the conda environment is broken and needs to be fixed.
+
 1. **Read the original model** in `vllm/model_executor/models/`. Understand
    the layer structure, parameter names, and forward pass.
 2. **Ensure weights are downloaded.** If not, ask the user to run:
@@ -71,4 +82,3 @@ LOOP FOREVER until the flat model produces correct output:
    flat_baseline_tpit_ms: <measured>
    ```
    Commit everything (including `flat_config.txt`), done.
-
