@@ -346,4 +346,4 @@ def rope_and_cache(
         num_warps=8,
         num_stages=4,
     )
-    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+    return kv_cache
