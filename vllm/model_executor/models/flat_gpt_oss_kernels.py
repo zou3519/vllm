@@ -223,8 +223,6 @@ def _rope_and_cache_kernel(
     k_rot = tl.where(kv_dim < embed_dim, k_x * k_cos - k_y * k_sin,
                      k_y * k_cos + k_x * k_sin)
     k_out = tl.where(kv_dim < rotary_dim, k_rot, k_raw)
-    tl.store(key_ptr + k_base + kv_dim, k_out, mask=kv_mask)
-
     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
     if slot_idx < 0:
         return
