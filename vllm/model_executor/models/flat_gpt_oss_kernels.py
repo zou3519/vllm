@@ -123,6 +123,88 @@ def fused_add_rms_norm_mxfp8_quant(
 
 
 @triton.jit
+def _flat_router_linear_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    input_stride: tl.int64,
+    weight_out_stride: tl.int64,
+    weight_in_stride: tl.int64,
+    output_stride: tl.int64,
+    in_features: tl.constexpr,
+    out_features: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    n_block = tl.program_id(axis=1)
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((1, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, in_features, BLOCK_K):
+        k_idxs = k_start + offs_k
+        x = tl.load(
+            input_ptr + row * input_stride + k_idxs,
+            mask=k_idxs < in_features,
+            other=0.0,
+        )
+        w = tl.load(
+            weight_ptr
+            + offs_n[None, :] * weight_out_stride
+            + k_idxs[:, None] * weight_in_stride,
+            mask=(offs_n[None, :] < out_features) & (k_idxs[:, None] < in_features),
+            other=0.0,
+        )
+        acc += tl.dot(tl.expand_dims(x, 0), w)
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < out_features, other=0.0)
+        acc += bias[None, :]
+
+    tl.store(
+        output_ptr + row * output_stride + offs_n,
+        tl.reshape(acc, [BLOCK_N]),
+        mask=offs_n < out_features,
+    )
+
+
+def flat_router_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    in_features = input.shape[-1]
+    out_features = weight.shape[0]
+    num_rows = input.numel() // in_features
+    output = torch.empty(
+        (*input.shape[:-1], out_features),
+        dtype=input.dtype,
+        device=input.device,
+    )
+    _flat_router_linear_kernel[(num_rows, triton.cdiv(out_features, 16))](
+        input,
+        weight,
+        weight if bias is None else bias,
+        output,
+        input.stride(-2),
+        weight.stride(0),
+        weight.stride(1),
+        output.stride(-2),
+        in_features,
+        out_features,
+        bias is not None,
+        BLOCK_N=16,
+        BLOCK_K=64,
+        num_warps=4,
+        num_stages=3,
+    )
+    return output
+
+
+@triton.jit
 def _rope_and_cache_kernel(
     query_ptr,
     query_out_ptr,

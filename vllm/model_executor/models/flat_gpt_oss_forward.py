@@ -12,6 +12,7 @@ from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.model_executor.models.flat_gpt_oss_kernels import (
+    flat_router_linear,
     fused_add_rms_norm_mxfp8_quant,
     rope_and_cache,
 )
@@ -315,7 +316,7 @@ def transformer_layer(
     )
 
     # TransformerBlock.mlp.router
-    router_logits = F.linear(hidden_states, router_weight, router_bias)
+    router_logits = flat_router_linear(hidden_states, router_weight, router_bias)
 
     # TransformerBlock.mlp.experts.forward_cuda
     # FusedMoE.runner.forward -> MoEPrepareAndFinalizeNoDPEPMonolithic.prepare
