@@ -285,18 +285,11 @@ def transformer_layer(
     k = torch.reshape(k, (num_tokens, attn_num_kv_heads, attn_head_size))
     v = torch.reshape(v, (num_tokens, attn_num_kv_heads, attn_head_size_v))
 
-    if _layer_slot_mapping is not None and q_already_quantized:
-        attn_output = torch.reshape(qkv[:, :q_size], (
-            num_tokens,
-            attn_num_heads,
-            attn_head_size_v,
-        ))
-    else:
-        attn_output = torch.empty(
-            (num_tokens, attn_num_heads, attn_head_size_v),
-            dtype=attn_output_dtype,
-            device=q.device,
-        )
+    attn_output = torch.empty(
+        (num_tokens, attn_num_heads, attn_head_size_v),
+        dtype=attn_output_dtype,
+        device=q.device,
+    )
     torch.ops.vllm.unified_attention_with_output(
         q,
         k,
