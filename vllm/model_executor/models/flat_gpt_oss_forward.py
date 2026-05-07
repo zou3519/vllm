@@ -64,7 +64,7 @@ direct_register_custom_op(
 
 def _flashinfer_trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
-    output_like: torch.Tensor,
+    output: torch.Tensor,
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -83,9 +83,8 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     local_num_experts: int,
     routing_method_type: int,
     tune_max_num_tokens: int,
-) -> torch.Tensor:
-    output = torch.empty_like(output_like)
-    return trtllm_fp4_block_scale_moe(
+) -> None:
+    trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=None,
         hidden_states=hidden_states,
@@ -115,12 +114,12 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
         enable_pdl=True,
         tune_max_num_tokens=tune_max_num_tokens,
         output=output,
-    )[0]
+    )
 
 
 def _flashinfer_trtllm_fp4_block_scale_moe_fake(
     routing_logits: torch.Tensor,
-    output_like: torch.Tensor,
+    output: torch.Tensor,
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -139,14 +138,15 @@ def _flashinfer_trtllm_fp4_block_scale_moe_fake(
     local_num_experts: int,
     routing_method_type: int,
     tune_max_num_tokens: int,
-) -> torch.Tensor:
-    return torch.empty_like(output_like)
+) -> None:
+    return None
 
 
 direct_register_custom_op(
     op_name="flashinfer_trtllm_fp4_block_scale_moe",
     op_func=_flashinfer_trtllm_fp4_block_scale_moe,
     fake_impl=_flashinfer_trtllm_fp4_block_scale_moe_fake,
+    mutates_args=["output"],
 )
 
 
@@ -325,9 +325,10 @@ def transformer_layer(
     )
 
     # TrtLlmMxfp4ExpertsMonolithic.apply
-    output = torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe(
+    output = hidden_states
+    torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe(
         router_logits.to(torch.bfloat16),
-        hidden_states,
+        output,
         moe_x_quant,
         moe_x_scale,
         moe_w1,
