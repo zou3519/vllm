@@ -192,6 +192,9 @@ def _rope_and_cache_kernel(
     else:
         tl.store(query_ptr + q_base + q_dim, q_out, mask=q_mask)
 
+    if tile_idx != 0:
+        return
+
     kv_mask = offs < kv_elems
     kv_head = offs // head_size
     kv_dim = offs % head_size
