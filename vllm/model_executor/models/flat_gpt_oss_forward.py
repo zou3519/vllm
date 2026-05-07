@@ -326,7 +326,7 @@ def transformer_layer(
 
     # TrtLlmMxfp4ExpertsMonolithic.apply
     output = torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe(
-        router_logits,
+        router_logits.to(torch.bfloat16),
         hidden_states,
         moe_x_quant,
         moe_x_scale,
