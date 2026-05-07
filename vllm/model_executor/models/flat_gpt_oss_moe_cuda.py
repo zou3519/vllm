@@ -147,8 +147,8 @@ __global__ void swiglu_kernel(
   int slot = idx / intermediate_size;
   int col = idx - slot * intermediate_size;
   const float* base = gemm1_out + slot * rows13;
-  float gate = fminf(base[col], 7.0f);
-  float up = fminf(fmaxf(base[intermediate_size + col], -7.0f), 7.0f);
+  float gate = fminf(base[2 * col], 7.0f);
+  float up = fminf(fmaxf(base[2 * col + 1], -7.0f), 7.0f);
   float sigmoid = 1.0f / (1.0f + __expf(-1.702f * gate));
   act_out[idx] = gate * sigmoid * (up + 1.0f);
 }
