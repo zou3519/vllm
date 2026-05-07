@@ -319,7 +319,10 @@ def transformer_layer(
 
     # TransformerBlock.mlp.experts.forward_cuda
     # FusedMoE.runner.forward -> MoEPrepareAndFinalizeNoDPEPMonolithic.prepare
-    moe_x_scale = moe_x_scale.view(torch.float8_e4m3fn)
+    moe_x_scale = moe_x_scale.view(torch.float8_e4m3fn).reshape(
+        *hidden_states.shape[:-1],
+        -1,
+    )
 
     # TrtLlmMxfp4ExpertsMonolithic.apply
     output = torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe(
