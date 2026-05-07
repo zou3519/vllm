@@ -1,11 +1,14 @@
 # flat_model
 
-**FULL_DECODE_ONLY** — this program only targets the BS=1 decode path.
-Prefill is out of scope.
-
 Create a "flat" model definition for a vLLM-supported model. The forward
 pass becomes a single function with all parameters as plain tensors — no
 nn.Module dispatch. The result must produce identical output to the original.
+
+The flat model definition should preserve the original model's forward behavior
+for both prefill and decode, and it should not assume batch size 1 unless the
+target serve command or user explicitly narrows the scope. Some downstream
+auto-optimize workflows may benchmark or specialize for BS=1 decode, but that
+is an optimization target, not the default scope of this program.
 
 ## Setup
 
