@@ -80,7 +80,7 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     tune_max_num_tokens: int,
 ) -> torch.Tensor:
     output = torch.empty_like(output_like)
-    trtllm_fp4_block_scale_moe(
+    return trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=None,
         hidden_states=hidden_states,
@@ -110,8 +110,7 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
         enable_pdl=True,
         tune_max_num_tokens=tune_max_num_tokens,
         output=output,
-    )
-    return output
+    )[0]
 
 
 def _flashinfer_trtllm_fp4_block_scale_moe_fake(
