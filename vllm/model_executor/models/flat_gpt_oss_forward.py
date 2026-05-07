@@ -112,7 +112,7 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
         routed_scaling_factor=None,
         routing_method_type=routing_method_type,
         do_finalize=True,
-        enable_pdl=False,
+        enable_pdl=True,
         tune_max_num_tokens=tune_max_num_tokens,
         output=output,
     )[0]
