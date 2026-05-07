@@ -1,7 +1,9 @@
 # auto_optimize
 
-**FULL_DECODE_ONLY** — this program only targets the BS=1 decode path.
-Prefill is out of scope.
+**FULL_DECODE_ONLY auto-optimize target** — this program only targets the
+BS=1 decode path, especially the full-cudagraph decode path. Prefill is out
+of scope for optimization, though the flat model definition itself may still
+support prefill.
 
 You are a GPU inference optimization engineer. Your job is to minimize
 BS=1 decode latency (TPIT) for a flat vLLM model.
@@ -34,7 +36,8 @@ To set up:
    ```
    Sum across projections × num_layers for the total model roofline.
 3. **Verify the baseline TPIT** from `flat_config.txt` by re-measuring
-   (see Benchmarking below).
+   (see Benchmarking below). Distinguish the no-compile flat baseline from
+   the cudagraph optimization target; record which mode each number used.
 4. **Initialize results.tsv** with just the header row.
 5. **Confirm and go**: tell the user the flat baseline TPIT, the original
    model TPIT (from `flat_config.txt`), the roofline, and the gap.
@@ -52,17 +55,49 @@ layer.
 
 ## Benchmarking
 
-Start the server using the user's `vllm serve` command. Redirect output
-to a log file and run in background. Wait for "Application startup
-complete" in the log.
+Start the server using the flat serve command from `flat_config.txt`, or the
+user's original `vllm serve` command plus the flat `--hf-overrides`. Redirect
+output to a log file and run in background. Wait for "Application startup
+complete" in the log. Before each start, check for and stop stale vLLM
+server/EngineCore processes from previous runs; after each run, stop the
+server and verify none remain.
 
-**Measure TPIT** by sending a streaming request:
+For the auto-optimize target, set `-cc.cudagraph_mode=full_decode_only`.
+Do not silently reuse a no-compile baseline command if it disables cudagraphs
+for the experiment you are measuring. `-cc.mode=none` is useful for measuring
+the no-compile flat baseline, but vLLM can override cudagraph mode to `NONE`
+when compilation mode is `NONE`; always check the startup log for the
+effective `CompilationMode` and `CUDAGraphMode` and record surprises.
+
+**Measure engine-side TPIT** with vLLM's Prometheus metrics, but validate the
+metric count:
+
+1. Send one warmup streaming request.
+2. Read `/metrics` and save
+   `vllm:inter_token_latency_seconds_sum/count` and
+   `vllm:time_to_first_token_seconds_sum/count`.
+3. Send 3-5 identical streaming requests with fixed prompt, `max_tokens`,
+   temperature, and seed settings.
+4. Read `/metrics` again and compute delta means:
+   `mean_itl_ms = 1000 * delta_sum / delta_count`.
+5. Check that `delta_count == num_requests * (generated_tokens_per_request - 1)`.
+   If it does not, an engine output event may contain multiple token IDs; do
+   not report the histogram mean as TPIT without explaining the mismatch.
+
+This measures engine-core inter-token latency. It is the right signal for
+kernel/runtime optimization when the count validation passes, but it is not
+necessarily client-visible TTIT. Measure client-visible TTIT from streaming
+responses only when each chunk corresponds to one generated token; if
+`--stream-interval > 1`, either rerun with `--stream-interval 1` for client
+timing or clearly label the result as chunk timing.
+
+You can still send a streaming request with curl for sanity:
 ```bash
 curl -s localhost:<port>/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model": "<model>", "messages": [{"role": "user", "content": "Write a paragraph about AI."}], "max_tokens": 150, "stream": true}'
 ```
-Parse the SSE stream: `TPIT = (total_time - first_token_time) / (tokens - 1)`.
-Run 3-5 times — TPIT should be consistent (±0.1ms) with CUDA graphs.
+Do not report SSE chunk spacing as TPIT when `--stream-interval > 1`. Run
+3-5 times — TPIT should be consistent (±0.1ms) with CUDA graphs.
 
 **Test quality** after every change with these prompts:
 - "What is 2+2?" → should answer 4
@@ -81,6 +116,10 @@ broke precision — revert.
 - Write benchmarking scripts
 - Search the internet for state-of-the-art kernel implementations,
   optimization techniques, and relevant papers
+- Inline backend wrappers further when they hide concrete pointwise,
+  reduction, routing, quantization, or allocation work. For example, a method
+  named `forward_cuda` may still be Python orchestration; inspect until you
+  see the real CUDA/custom ops.
 
 ## What you CANNOT do
 
@@ -183,6 +222,20 @@ These bugs wasted hours. Watch for them:
   subprocess. Crashes and prints go to the log file, not your terminal.
   Always check the log.
 
+- **Stale servers poison measurements**: always verify which process owns the
+  port and which code revision it loaded. Kill old `vllm serve`, `APIServer`,
+  and `EngineCore` processes before starting a new measurement.
+
+- **SSE chunking is not token timing**: with `--stream-interval 20`, one chunk
+  can represent many generated tokens. Use `/metrics`
+  `vllm:inter_token_latency_seconds` delta means for engine-side TPIT only
+  when the histogram count matches expected token intervals; use streaming
+  timing with `--stream-interval 1` for client-visible TTIT.
+
+- **CompilationMode.NONE disables cudagraphs**: if the log says cudagraph mode
+  was overridden to `NONE`, that run is a no-cudagraph baseline, not the
+  `FULL_DECODE_ONLY` target.
+
 - **FP8 KV cache stored as uint8**: vLLM stores FP8 KV cache as
   `torch.uint8`, not `torch.float8_e4m3fn`. If writing custom KV cache
   kernels, check for both dtypes.
@@ -191,6 +244,11 @@ These bugs wasted hours. Watch for them:
   Python-side tensor value checks in the forward path. These break graph
   capture. Guard diagnostic code with
   `if not torch.cuda.is_current_stream_capturing()`.
+
+- **Backend selection is part of the benchmark**: environment variables such
+  as MoE backend selectors can materially change the op sequence. Assert or
+  log the selected attention/MoE backend and specialize only for the backend
+  used by the target serve command.
 
 - **CUDA device mismatch**: when running standalone kernel benchmarks,
   use `CUDA_VISIBLE_DEVICES=<gpu>` to match the server's device. Using

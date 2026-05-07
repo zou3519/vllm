@@ -2,5 +2,8 @@ serve_cmd: VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 vllm serve openai/gpt-oss-120b 
 flat_serve_cmd: VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 vllm serve openai/gpt-oss-120b --tensor-parallel-size 1 --kv-cache-dtype fp8 --no-enable-prefix-caching --max-cudagraph-capture-size 2048 --max-num-batched-tokens 8192 --stream-interval 20 --tool-call-parser openai --enable-auto-tool-choice --hf-overrides '{"architectures": ["FlatGptOssForCausalLM"]}' -cc.mode=none
 forward_file: vllm/model_executor/models/flat_gpt_oss_forward.py
 model_file: vllm/model_executor/models/flat_gpt_oss.py
-original_tpit_ms: 2.547813
-flat_baseline_tpit_ms: pending_no_compile_remeasure
+original_tpit_ms: 2.528427
+flat_baseline_tpit_ms: 67.099660
+flat_baseline_vs_original: 26.54x slower
+tpit_benchmark: engine-side Prometheus vllm:inter_token_latency_seconds mean, 3x512-token streaming completions after 64-token warmup
+tpit_sample_count: 1533 inter-token samples, matching 3 * (512 - 1)

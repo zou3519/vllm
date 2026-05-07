@@ -10,6 +10,11 @@ target serve command or user explicitly narrows the scope. Some downstream
 auto-optimize workflows may benchmark or specialize for BS=1 decode, but that
 is an optimization target, not the default scope of this program.
 
+The target cudagraph configuration for this workflow is
+`cudagraph_mode=FULL_DECODE_ONLY`. Treat that as the CUDA graph capture policy:
+full cudagraphs are intended for decode batches, while prefill and mixed
+prefill/decode behavior still need to be preserved by the flat model.
+
 ## Setup
 
 The user will give you a `vllm serve` command, e.g.:
@@ -60,7 +65,7 @@ should be:
   indexing, and assignment)
 - `torch.nn.functional.*` ops
 - vLLM's attention op
-- vLLM's MoE op
+- the concrete CUDA ops used by vLLM's selected MoE backend
 
 Add short comments at the original module boundaries in the flat forward, e.g.
 embedding, each decoder layer, attention qkv/rotary/KV-cache/attention/o_proj,
@@ -73,6 +78,24 @@ linear layer's quant method is known for the target, inline that specialized
 linear path instead of preserving generic dispatch. The goal is correctness
 first.
 
+Inline the selected MoE `forward_cuda` path too. Do not call
+`FusedMoE.forward_cuda()` or runner/custom-op wrappers when they only dispatch
+through Python to a concrete backend. Pull the backend's tensor weights,
+scales, biases, routing constants, and workspace/output allocation into
+`flat_forward()`'s cached params, then call the concrete CUDA ops directly in
+`transformer_layer()`. For example, for GPT-OSS on FlashInfer TRTLLM
+MXFP4/MXFP8, inline the NoDPEP monolithic prepare, FlashInfer MXFP8 activation
+quantization, and `trtllm_fp4_block_scale_moe(...)` call. This exposes
+pointwise/reduction-shaped work such as activation quantization, scale
+reshaping, routing casts, top-k packing, weighting, and final combine instead
+of hiding it behind `forward_cuda`.
+
+Do the same inspection for any method named `forward_cuda`: the name does not
+mean it is a single CUDA op. If it only validates, reshapes, allocates, selects
+backends, or calls another wrapper before reaching the real kernel, inline that
+body until `transformer_layer()` shows the concrete PyTorch ops and concrete
+CUDA/custom ops that actually run for the target serve command.
+
 Make the KV-cache write explicit in the flat definition. Prefer a torch-native
 cache update specialized to the active attention backend/cache layout/hardware,
 then call vLLM's attention op directly, ideally
@@ -81,7 +104,9 @@ then call vLLM's attention op directly, ideally
 
 Do not torch.compile the flat model when testing or benchmarking. Turn it off
 via the serve command, e.g. add `-cc.mode=none` (CompilationMode.NONE) to the
-flat-model `vllm serve` command.
+flat-model `vllm serve` command. When running cudagraph-enabled comparisons or
+auto-optimize work rather than the no-compile flat baseline, set
+`-cc.cudagraph_mode=full_decode_only`.
 
 ## The Test Loop
 
@@ -91,7 +116,9 @@ LOOP FOREVER until the flat model produces correct output:
    `--hf-overrides '{"architectures": ["Flat<Model>ForCausalLM"]}'` to
    use your flat model, and add `-cc.mode=none` so the flat model is not
    torch-compiled. Redirect output to a log file and run in background. Wait
-   for "Application startup complete" in the log.
+   for "Application startup complete" in the log. Before starting, check for
+   and stop stale vLLM server/EngineCore processes from previous runs; after
+   finishing, stop the server and verify none remain.
 
 2. **Test correctness** — send these prompts and check the answers:
    - "What is 2+2?" → should answer 4
@@ -109,16 +136,28 @@ LOOP FOREVER until the flat model produces correct output:
    the original (non-flat) model using the user's `vllm serve` command
    without `--hf-overrides`. TPIT/TTIT means streaming inter-token latency:
    time each generated token arrives after the previous generated token.
-   Do not use TPOT ("time per output token") from serving benchmarks as the
-   primary number; TPOT is an aggregate derived from request latency and can
-   hide chunking behavior. If using `vllm bench serve`, report the `ITL`
-   metric (`mean_itl_ms`/`median_itl_ms`), not `TPOT`. Write
+   Measure engine-side TPIT by reading `/metrics` before and after a fixed
+   workload and using `vllm:inter_token_latency_seconds` only after validating
+   the delta count. For N requests that each generate T tokens, the expected
+   inter-token count is `N * (T - 1)`. If the metric count differs, an engine
+   output event may contain multiple token IDs, so do not report the histogram
+   mean as TPIT without explaining the mismatch. Measure client-visible TTIT
+   from streaming responses only when each chunk corresponds to one generated
+   token; if the serve command uses `--stream-interval > 1`, either rerun with
+   `--stream-interval 1` for client timing or clearly label the result as
+   chunk timing. Do not use TPOT ("time per output token") from serving
+   benchmarks as the primary number; TPOT is an aggregate derived from request
+   latency and can hide chunking behavior. If using `vllm bench serve`, report
+   the `ITL` metric (`mean_itl_ms`/`median_itl_ms`), not `TPOT`, and verify it
+   is token-level rather than chunk-level for the selected stream interval. Write
    `flat_config.txt` in the repo root:
    ```
    serve_cmd: <the user's original vllm serve command>
+   flat_serve_cmd: <serve_cmd plus --hf-overrides and flat baseline flags>
    forward_file: vllm/model_executor/models/flat_<model>_forward.py
    model_file: vllm/model_executor/models/flat_<model>.py
    original_tpit_ms: <measured>
    flat_baseline_tpit_ms: <measured>
+   tpit_benchmark: <exact metric/workload used>
    ```
    Commit everything (including `flat_config.txt`), done.
