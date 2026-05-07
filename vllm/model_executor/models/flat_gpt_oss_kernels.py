@@ -344,6 +344,6 @@ def rope_and_cache(
         fp8_kv_cache,
         tile_size,
         num_warps=8,
-        num_stages=1,
+        num_stages=4,
     )
     return kv_cache
