@@ -8,6 +8,8 @@ happen during model execution.
 
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -90,7 +92,12 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     import vllm.utils.flashinfer as fi_utils
 
-    with torch.inference_mode(), fi_utils.autotune():
+    cache_path = os.path.join(
+        envs.VLLM_CACHE_ROOT,
+        "flashinfer_autotune",
+        "configs.json",
+    )
+    with torch.inference_mode(), fi_utils.autotune(cache=cache_path):
         # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
         # incompatible with autotuning. This state is used to skip
         # those kernels during the autotuning process.
