@@ -57,6 +57,94 @@ direct_register_custom_op(
 )
 
 
+def _flashinfer_trtllm_fp4_block_scale_moe_out(
+    routing_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: torch.Tensor,
+    gemm1_alpha: torch.Tensor,
+    gemm1_beta: torch.Tensor,
+    gemm1_clamp_limit: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: torch.Tensor,
+    output: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int,
+    tune_max_num_tokens: int,
+) -> None:
+    trtllm_fp4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=gemm1_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=gemm2_bias,
+        output1_scale_scalar=None,
+        output1_scale_gate_scalar=None,
+        output2_scale_scalar=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type,
+        do_finalize=True,
+        enable_pdl=True,
+        tune_max_num_tokens=tune_max_num_tokens,
+        output=output,
+    )
+
+
+def _flashinfer_trtllm_fp4_block_scale_moe_out_fake(
+    routing_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: torch.Tensor,
+    gemm1_alpha: torch.Tensor,
+    gemm1_beta: torch.Tensor,
+    gemm1_clamp_limit: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: torch.Tensor,
+    output: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int,
+    tune_max_num_tokens: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="flashinfer_trtllm_fp4_block_scale_moe_out",
+    op_func=_flashinfer_trtllm_fp4_block_scale_moe_out,
+    mutates_args=["output"],
+    fake_impl=_flashinfer_trtllm_fp4_block_scale_moe_out_fake,
+)
+
+
 def transformer_layer(
     layer_params: tuple[Any, ...],
     hidden_states: torch.Tensor,
@@ -261,36 +349,29 @@ def transformer_layer(
 
     # TrtLlmMxfp4ExpertsMonolithic.apply
     output = torch.empty_like(hidden_states)
-    output = trtllm_fp4_block_scale_moe(
-        routing_logits=router_logits.to(torch.bfloat16),
-        routing_bias=None,
-        hidden_states=moe_x_quant,
-        hidden_states_scale=moe_x_scale,
-        gemm1_weights=moe_w1,
-        gemm1_weights_scale=moe_w1_scale,
-        gemm1_bias=moe_w1_bias,
-        gemm1_alpha=moe_gemm1_alpha,
-        gemm1_beta=moe_gemm1_beta,
-        gemm1_clamp_limit=moe_gemm1_clamp_limit,
-        gemm2_weights=moe_w2,
-        gemm2_weights_scale=moe_w2_scale,
-        gemm2_bias=moe_w2_bias,
-        output1_scale_scalar=None,
-        output1_scale_gate_scalar=None,
-        output2_scale_scalar=None,
-        num_experts=moe_global_num_experts,
-        top_k=moe_topk,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=moe_intermediate_size,
-        local_expert_offset=moe_local_expert_offset,
-        local_num_experts=moe_local_num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=moe_routing_method_type,
-        do_finalize=True,
-        tune_max_num_tokens=moe_tune_max_num_tokens,
-        output=output,
-    )[0][:, :hidden_size]
+    torch.ops.vllm.flashinfer_trtllm_fp4_block_scale_moe_out(
+        router_logits.to(torch.bfloat16),
+        moe_x_quant,
+        moe_x_scale,
+        moe_w1,
+        moe_w1_scale,
+        moe_w1_bias,
+        moe_gemm1_alpha,
+        moe_gemm1_beta,
+        moe_gemm1_clamp_limit,
+        moe_w2,
+        moe_w2_scale,
+        moe_w2_bias,
+        output,
+        moe_global_num_experts,
+        moe_topk,
+        moe_intermediate_size,
+        moe_local_expert_offset,
+        moe_local_num_experts,
+        moe_routing_method_type,
+        moe_tune_max_num_tokens,
+    )
+    output = output[:, :hidden_size]
 
     return output, residual
 
