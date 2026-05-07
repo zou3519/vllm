@@ -137,6 +137,7 @@ def _rope_and_cache_kernel(
     k_scale_ptr,
     v_scale_ptr,
     query_stride: tl.int64,
+    query_out_stride: tl.int64,
     key_stride: tl.int64,
     value_stride: tl.int64,
     key_cache_block_stride: tl.int64,
@@ -182,8 +183,12 @@ def _rope_and_cache_kernel(
     q_out = tl.where(q_dim < embed_dim, q_x * q_cos - q_y * q_sin,
                      q_y * q_cos + q_x * q_sin)
     if QUERY_FP8:
-        tl.store(query_out_ptr + q_base + q_dim, q_out / tl.load(q_scale_ptr),
-                 mask=q_mask)
+        q_out_base = token_idx * query_out_stride + q_head * head_size
+        tl.store(
+            query_out_ptr + q_out_base + q_dim,
+            q_out / tl.load(q_scale_ptr),
+            mask=q_mask,
+        )
     else:
         tl.store(query_ptr + q_base + q_dim, q_out, mask=q_mask)
 
@@ -318,6 +323,7 @@ def rope_and_cache(
         k_scale,
         v_scale,
         query.stride(0),
+        query_output.stride(0),
         key.stride(0),
         value.stride(0),
         key_cache.stride(0),
