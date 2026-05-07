@@ -231,7 +231,7 @@ def transformer_layer(
     # TransformerBlock.attn.rotary_emb
     positions = torch.flatten(positions)
     num_tokens = positions.shape[0]
-    cos_sin_cache = rotary_cos_sin_cache.to(dtype=q.dtype, device=q.device)
+    cos_sin_cache = rotary_cos_sin_cache
     q = q.contiguous()
     k = k.contiguous()
     attn_output_dtype = q.dtype
