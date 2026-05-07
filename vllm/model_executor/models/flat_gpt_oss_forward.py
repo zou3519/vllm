@@ -11,7 +11,10 @@ from vllm import _custom_ops as ops
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
-from vllm.model_executor.models.flat_gpt_oss_kernels import rope_and_cache
+from vllm.model_executor.models.flat_gpt_oss_kernels import (
+    fused_add_rms_norm_mxfp8_quant,
+    rope_and_cache,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -301,12 +304,13 @@ def transformer_layer(
     # TransformerBlock.attn.o_proj
     hidden_states = F.linear(attn_output, o_proj_weight, o_proj_bias)
 
-    # TransformerBlock.post_attention_layernorm
-    ops.fused_add_rms_norm(
+    # TransformerBlock.post_attention_layernorm + MoE MXFP8 activation quant.
+    moe_x_quant, moe_x_scale = fused_add_rms_norm_mxfp8_quant(
         hidden_states,
         residual,
         post_attention_norm_weight,
         post_attention_norm_eps,
+        256,
     )
 
     # TransformerBlock.mlp.router
@@ -314,10 +318,6 @@ def transformer_layer(
 
     # TransformerBlock.mlp.experts.forward_cuda
     # FusedMoE.runner.forward -> MoEPrepareAndFinalizeNoDPEPMonolithic.prepare
-    moe_x_quant, moe_x_scale = torch.ops.vllm.flashinfer_mxfp8_quantize_linear(
-        hidden_states,
-        256,
-    )
     moe_x_scale = moe_x_scale.view(torch.float8_e4m3fn).reshape(
         *hidden_states.shape[:-1],
         -1,

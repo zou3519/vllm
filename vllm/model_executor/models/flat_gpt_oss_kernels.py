@@ -9,6 +9,120 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 
 
 @triton.jit
+def _fused_add_rms_norm_mxfp8_quant_kernel(
+    input_ptr,
+    residual_ptr,
+    weight_ptr,
+    quant_output_ptr,
+    scale_output_ptr,
+    input_stride: tl.int64,
+    residual_stride: tl.int64,
+    eps: tl.float32,
+    hidden_size: tl.constexpr,
+    padded_hidden_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SCALE_BLOCKS: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    hidden_mask = offs < hidden_size
+
+    input_base = row * input_stride
+    residual_base = row * residual_stride
+    x = tl.load(input_ptr + input_base + offs, mask=hidden_mask,
+                other=0.0).to(tl.float32)
+    residual = tl.load(
+        residual_ptr + residual_base + offs,
+        mask=hidden_mask,
+        other=0.0,
+    ).to(tl.float32)
+    added = x + residual
+    variance = tl.sum(added * added, axis=0) / hidden_size
+    norm_scale = tl.rsqrt(variance + eps)
+    weight = tl.load(weight_ptr + offs, mask=hidden_mask,
+                     other=0.0).to(tl.float32)
+    normed = added * norm_scale * weight
+
+    tl.store(input_ptr + input_base + offs, normed, mask=hidden_mask)
+    tl.store(residual_ptr + residual_base + offs, added, mask=hidden_mask)
+
+    quant_mask = offs < padded_hidden_size
+    quant_normed = tl.where(hidden_mask, normed, 0.0)
+    quant_blocks = tl.reshape(quant_normed, [SCALE_BLOCKS, 32])
+    quant_valid = tl.reshape(hidden_mask, [SCALE_BLOCKS, 32])
+    block_amax = tl.max(tl.where(quant_valid, tl.abs(quant_blocks), 0.0),
+                        axis=1)
+
+    dequant_scale = block_amax / 448.0
+    dequant_scale_exponent = (
+        dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
+    ) & 0x7F800000
+    dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_scale_rounded == 0.0, 0.0,
+                           1.0 / dequant_scale_rounded)
+    quantized = quant_blocks * tl.expand_dims(quant_scale, axis=1)
+    quantized = tl.reshape(quantized, [BLOCK_SIZE])
+    quantized = tl.where(quant_mask, quantized, 0.0)
+    tl.store(
+        quant_output_ptr + row * padded_hidden_size + offs,
+        quantized,
+        mask=quant_mask,
+    )
+
+    scale_idx = tl.arange(0, SCALE_BLOCKS)
+    scale_mask = scale_idx < padded_hidden_size // 32
+    scale_bytes = (dequant_scale_exponent >> 23).to(tl.uint8)
+    tl.store(
+        scale_output_ptr + row * (padded_hidden_size // 32) + scale_idx,
+        scale_bytes,
+        mask=scale_mask,
+    )
+
+
+def fused_add_rms_norm_mxfp8_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    alignment: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden_size = input.shape[-1]
+    if hidden_size % 32 != 0:
+        raise ValueError("Flat GPT-OSS MXFP8 quantization requires 32-wide blocks")
+    padded_hidden_size = (hidden_size + alignment - 1) // alignment * alignment
+    num_rows = input.numel() // hidden_size
+    quant_output = torch.empty(
+        (*input.shape[:-1], padded_hidden_size),
+        dtype=torch.float8_e4m3fn,
+        device=input.device,
+    )
+    scale_output = torch.empty(
+        (num_rows * padded_hidden_size // 32,),
+        dtype=torch.uint8,
+        device=input.device,
+    )
+
+    block_size = triton.next_power_of_2(padded_hidden_size)
+    scale_blocks = block_size // 32
+    _fused_add_rms_norm_mxfp8_quant_kernel[(num_rows,)](
+        input,
+        residual,
+        weight,
+        quant_output,
+        scale_output,
+        input.stride(-2),
+        residual.stride(-2),
+        eps,
+        hidden_size,
+        padded_hidden_size,
+        block_size,
+        scale_blocks,
+        num_warps=8,
+    )
+    return quant_output, scale_output
+
+
+@triton.jit
 def _rope_and_cache_kernel(
     query_ptr,
     query_out_ptr,
