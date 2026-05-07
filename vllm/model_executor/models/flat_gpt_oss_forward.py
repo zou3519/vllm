@@ -282,9 +282,8 @@ def transformer_layer(
         q, _ = ops.scaled_fp8_quant(q, attn_q_scale)
 
     q = torch.reshape(q, (num_tokens, attn_num_heads, attn_head_size))
-    if _layer_slot_mapping is None:
-        k = torch.reshape(k, (num_tokens, attn_num_kv_heads, attn_head_size))
-        v = torch.reshape(v, (num_tokens, attn_num_kv_heads, attn_head_size_v))
+    k = torch.reshape(k, (num_tokens, attn_num_kv_heads, attn_head_size))
+    v = torch.reshape(v, (num_tokens, attn_num_kv_heads, attn_head_size_v))
 
     attn_output = torch.empty(
         (num_tokens, attn_num_heads, attn_head_size_v),
