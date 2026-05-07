@@ -154,7 +154,6 @@ def _rope_and_cache_kernel(
     rotary_dim: tl.constexpr,
     QUERY_FP8: tl.constexpr,
     FP8_KV_CACHE: tl.constexpr,
-    STORE_KEY_GLOBAL: tl.constexpr,
     TILE_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(axis=0)
@@ -219,8 +218,7 @@ def _rope_and_cache_kernel(
     k_rot = tl.where(kv_dim < embed_dim, k_x * k_cos - k_y * k_sin,
                      k_y * k_cos + k_x * k_sin)
     k_out = tl.where(kv_dim < rotary_dim, k_rot, k_raw)
-    if STORE_KEY_GLOBAL:
-        tl.store(key_ptr + k_base + kv_dim, k_out, mask=kv_mask)
+    tl.store(key_ptr + k_base + kv_dim, k_out, mask=kv_mask)
 
     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
     if slot_idx < 0:
@@ -337,7 +335,6 @@ def rope_and_cache(
         rotary_dim,
         query_fp8,
         fp8_kv_cache,
-        key.shape[0] != 1,
         tile_size,
         num_warps=8,
         num_stages=4,
