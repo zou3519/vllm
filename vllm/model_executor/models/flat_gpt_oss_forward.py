@@ -163,7 +163,7 @@ def transformer_layer(
         kv_size,
         rotary_cos_sin_cache,
         rotary_head_size,
-        rotary_dim,
+        _rotary_dim,
         attn_layer_name,
         attn_num_heads,
         attn_num_kv_heads,
@@ -228,36 +228,16 @@ def transformer_layer(
     positions = torch.flatten(positions)
     num_tokens = positions.shape[0]
     cos_sin_cache = rotary_cos_sin_cache.to(dtype=q.dtype, device=q.device)
-    cos_sin = torch.index_select(cos_sin_cache, 0, positions)
-    cos, sin = torch.chunk(cos_sin, 2, dim=-1)
-    cos = torch.unsqueeze(cos, -2)
-    sin = torch.unsqueeze(sin, -2)
-
-    q = torch.reshape(q, (num_tokens, -1, rotary_head_size))
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-    q1, q2 = torch.chunk(q_rot, 2, dim=-1)
-    q_rot = torch.cat(
-        (
-            torch.sub(torch.mul(q1, cos), torch.mul(q2, sin)),
-            torch.add(torch.mul(q2, cos), torch.mul(q1, sin)),
-        ),
-        dim=-1,
+    q = q.contiguous()
+    k = k.contiguous()
+    ops.rotary_embedding(
+        positions,
+        q,
+        k,
+        rotary_head_size,
+        cos_sin_cache,
+        True,
     )
-    q = torch.reshape(torch.cat((q_rot, q_pass), dim=-1), (num_tokens, q_size))
-
-    k = torch.reshape(k, (num_tokens, -1, rotary_head_size))
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-    k1, k2 = torch.chunk(k_rot, 2, dim=-1)
-    k_rot = torch.cat(
-        (
-            torch.sub(torch.mul(k1, cos), torch.mul(k2, sin)),
-            torch.add(torch.mul(k2, cos), torch.mul(k1, sin)),
-        ),
-        dim=-1,
-    )
-    k = torch.reshape(torch.cat((k_rot, k_pass), dim=-1), (num_tokens, kv_size))
 
     # TransformerBlock.attn.attn KV-cache write and attention
     attn_output_dtype = q.dtype
