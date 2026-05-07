@@ -71,9 +71,15 @@ LOOP FOREVER until the flat model produces correct output:
 4. **If output is wrong**: compare against original model's forward pass.
    Check parameter extraction, op ordering, KV cache handling.
 
-5. **If output is correct**: measure TPIT for both the flat model and
+5. **If output is correct**: measure TPIT/TTIT for both the flat model and
    the original (non-flat) model using the user's `vllm serve` command
-   without `--hf-overrides`. Write `flat_config.txt` in the repo root:
+   without `--hf-overrides`. TPIT/TTIT means streaming inter-token latency:
+   time each generated token arrives after the previous generated token.
+   Do not use TPOT ("time per output token") from serving benchmarks as the
+   primary number; TPOT is an aggregate derived from request latency and can
+   hide chunking behavior. If using `vllm bench serve`, report the `ITL`
+   metric (`mean_itl_ms`/`median_itl_ms`), not `TPOT`. Write
+   `flat_config.txt` in the repo root:
    ```
    serve_cmd: <the user's original vllm serve command>
    forward_file: vllm/model_executor/models/flat_<model>_forward.py
