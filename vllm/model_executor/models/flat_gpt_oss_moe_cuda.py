@@ -18,6 +18,7 @@ namespace {
 constexpr int kTopK = 4;
 constexpr int kThreads = 256;
 constexpr int kBlockRows = 8;
+constexpr int kWarpSize = 32;
 
 __device__ __forceinline__ float fp4_to_float(unsigned int x) {
   switch (x & 0xF) {
@@ -109,48 +110,28 @@ __global__ void gemm1_kernel(
     int rows13,
     int packed_k,
     int scale_k) {
-  __shared__ float smem[kBlockRows][kThreads];
   int row_blocks = (rows13 + kBlockRows - 1) / kBlockRows;
   int slot = blockIdx.x / row_blocks;
-  int row_start = (blockIdx.x - slot * row_blocks) * kBlockRows;
+  int row = (blockIdx.x - slot * row_blocks) * kBlockRows
+      + threadIdx.x / kWarpSize;
+  int lane = threadIdx.x & (kWarpSize - 1);
   int expert = topk_ids[slot];
 
-  float acc[kBlockRows] = {};
-  for (int k = threadIdx.x; k < padded_hidden_size; k += blockDim.x) {
+  float acc = 0.0f;
+  if (row < rows13) {
+    int expert_row = expert * rows13 + row;
+    for (int k = lane; k < padded_hidden_size; k += kWarpSize) {
     float xv = k < hidden_size ? __bfloat162float(x[k]) : 0.0f;
-    #pragma unroll
-    for (int m = 0; m < kBlockRows; ++m) {
-      int row = row_start + m;
-      if (row < rows13) {
-        int expert_row = expert * rows13 + row;
-        float wv = load_mxfp4(w13, w13_scale, expert_row, k, packed_k, scale_k);
-        acc[m] += xv * wv;
-      }
+      float wv = load_mxfp4(w13, w13_scale, expert_row, k, packed_k, scale_k);
+      acc += xv * wv;
     }
   }
-  #pragma unroll
-  for (int m = 0; m < kBlockRows; ++m) {
-    smem[m][threadIdx.x] = acc[m];
+  for (int offset = kWarpSize >> 1; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffff, acc, offset);
   }
-  __syncthreads();
-  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      #pragma unroll
-      for (int m = 0; m < kBlockRows; ++m) {
-        smem[m][threadIdx.x] += smem[m][threadIdx.x + stride];
-      }
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) {
-    #pragma unroll
-    for (int m = 0; m < kBlockRows; ++m) {
-      int row = row_start + m;
-      if (row < rows13) {
-        int expert_row = expert * rows13 + row;
-        gemm1_out[slot * rows13 + row] = smem[m][0] + w13_bias[expert_row];
-      }
-    }
+  if (lane == 0 && row < rows13) {
+    int expert_row = expert * rows13 + row;
+    gemm1_out[slot * rows13 + row] = acc + w13_bias[expert_row];
   }
 }
 
@@ -186,60 +167,32 @@ __global__ void gemm2_kernel(
     int intermediate_size,
     int packed_k,
     int scale_k) {
-  __shared__ float smem[kBlockRows][kThreads];
-  int row_start = blockIdx.x * kBlockRows;
-  float total[kBlockRows] = {};
+  int row = blockIdx.x * kBlockRows + threadIdx.x / kWarpSize;
+  int lane = threadIdx.x & (kWarpSize - 1);
+  float total = 0.0f;
 
   for (int slot = 0; slot < kTopK; ++slot) {
     int expert = topk_ids[slot];
-    float acc[kBlockRows] = {};
-    for (int k = threadIdx.x; k < intermediate_size; k += blockDim.x) {
-      float av = act[slot * intermediate_size + k];
-      #pragma unroll
-      for (int m = 0; m < kBlockRows; ++m) {
-        int row = row_start + m;
-        if (row < hidden_size) {
-          int expert_row = expert * padded_hidden_size + row;
-          float wv = load_mxfp4(w2, w2_scale, expert_row, k, packed_k, scale_k);
-          acc[m] += av * wv;
-        }
+    float acc = 0.0f;
+    if (row < hidden_size) {
+      int expert_row = expert * padded_hidden_size + row;
+      for (int k = lane; k < intermediate_size; k += kWarpSize) {
+        float av = act[slot * intermediate_size + k];
+        float wv = load_mxfp4(w2, w2_scale, expert_row, k, packed_k, scale_k);
+        acc += av * wv;
       }
     }
-    #pragma unroll
-    for (int m = 0; m < kBlockRows; ++m) {
-      smem[m][threadIdx.x] = acc[m];
+    for (int offset = kWarpSize >> 1; offset > 0; offset >>= 1) {
+      acc += __shfl_down_sync(0xffffffff, acc, offset);
     }
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) {
-        #pragma unroll
-        for (int m = 0; m < kBlockRows; ++m) {
-          smem[m][threadIdx.x] += smem[m][threadIdx.x + stride];
-        }
-      }
-      __syncthreads();
+    if (lane == 0 && row < hidden_size) {
+      int expert_row = expert * padded_hidden_size + row;
+      total += (acc + w2_bias[expert_row]) * topk_weights[slot];
     }
-    if (threadIdx.x == 0) {
-      #pragma unroll
-      for (int m = 0; m < kBlockRows; ++m) {
-        int row = row_start + m;
-        if (row < hidden_size) {
-          int expert_row = expert * padded_hidden_size + row;
-          total[m] += (smem[m][0] + w2_bias[expert_row]) * topk_weights[slot];
-        }
-      }
-    }
-    __syncthreads();
   }
 
-  if (threadIdx.x == 0) {
-    #pragma unroll
-    for (int m = 0; m < kBlockRows; ++m) {
-      int row = row_start + m;
-      if (row < hidden_size) {
-        out[row] = __float2bfloat16(total[m]);
-      }
-    }
+  if (lane == 0 && row < hidden_size) {
+    out[row] = __float2bfloat16(total);
   }
 }
 
