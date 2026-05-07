@@ -4,12 +4,57 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from flashinfer import mxfp8_quantize, trtllm_fp4_block_scale_moe
+from flashinfer import trtllm_fp4_block_scale_moe
+from flashinfer.tllm_enums import SfLayout
 
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _flashinfer_mxfp8_quantize_linear(
+    x: torch.Tensor,
+    alignment: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from flashinfer.quantization.fp8_quantization import (
+        get_mxfp8_quantization_sm100_module,
+    )
+
+    return get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
+        x,
+        SfLayout.layout_linear,
+        alignment,
+        True,
+    )
+
+
+def _flashinfer_mxfp8_quantize_linear_fake(
+    x: torch.Tensor,
+    alignment: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    padded_k = (x.shape[-1] + alignment - 1) // alignment * alignment
+    num_rows = x.numel() // x.shape[-1]
+    return (
+        torch.empty(
+            (*x.shape[:-1], padded_k),
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        ),
+        torch.empty(
+            (num_rows * padded_k // 32,),
+            dtype=torch.uint8,
+            device=x.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="flashinfer_mxfp8_quantize_linear",
+    op_func=_flashinfer_mxfp8_quantize_linear,
+    fake_impl=_flashinfer_mxfp8_quantize_linear_fake,
+)
 
 
 def transformer_layer(
@@ -205,10 +250,9 @@ def transformer_layer(
 
     # TransformerBlock.mlp.experts.forward_cuda
     # FusedMoE.runner.forward -> MoEPrepareAndFinalizeNoDPEPMonolithic.prepare
-    moe_x_quant, moe_x_scale = mxfp8_quantize(
+    moe_x_quant, moe_x_scale = torch.ops.vllm.flashinfer_mxfp8_quantize_linear(
         hidden_states,
-        is_sf_swizzled_layout=False,
-        alignment=256,
+        256,
     )
     moe_x_scale = moe_x_scale.view(torch.float8_e4m3fn).reshape(
         *hidden_states.shape[:-1],
