@@ -123,6 +123,88 @@ def fused_add_rms_norm_mxfp8_quant(
 
 
 @triton.jit
+def _moe_top4_softmax_pack_kernel(
+    logits_ptr,
+    packed_ptr,
+    logits_stride: tl.int64,
+    num_experts: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_experts
+    logits = tl.load(
+        logits_ptr + row * logits_stride + offs,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    idxs = offs.to(tl.int32)
+    invalid_idx: tl.constexpr = 1 << 20
+
+    v0 = tl.max(logits, axis=0)
+    i0 = tl.min(tl.where(logits == v0, idxs, invalid_idx), axis=0)
+    logits = tl.where(idxs == i0, -float("inf"), logits)
+
+    v1 = tl.max(logits, axis=0)
+    i1 = tl.min(tl.where(logits == v1, idxs, invalid_idx), axis=0)
+    logits = tl.where(idxs == i1, -float("inf"), logits)
+
+    v2 = tl.max(logits, axis=0)
+    i2 = tl.min(tl.where(logits == v2, idxs, invalid_idx), axis=0)
+    logits = tl.where(idxs == i2, -float("inf"), logits)
+
+    v3 = tl.max(logits, axis=0)
+    i3 = tl.min(tl.where(logits == v3, idxs, invalid_idx), axis=0)
+
+    norm = tl.maximum(tl.maximum(v0, v1), tl.maximum(v2, v3))
+    e0 = tl.exp(v0 - norm)
+    e1 = tl.exp(v1 - norm)
+    e2 = tl.exp(v2 - norm)
+    e3 = tl.exp(v3 - norm)
+    denom = e0 + e1 + e2 + e3
+
+    w0 = e0 / denom
+    w1 = e1 / denom
+    w2 = e2 / denom
+    w3 = e3 / denom
+
+    # Pack as (expert_id << 16) | bf16(weight) bits for FlashInfer routed MoE.
+    bias = 0x7FFF
+    b0 = ((w0.to(tl.uint32, bitcast=True) + bias) >> 16) & 0xFFFF
+    b1 = ((w1.to(tl.uint32, bitcast=True) + bias) >> 16) & 0xFFFF
+    b2 = ((w2.to(tl.uint32, bitcast=True) + bias) >> 16) & 0xFFFF
+    b3 = ((w3.to(tl.uint32, bitcast=True) + bias) >> 16) & 0xFFFF
+
+    out_base = row * 4
+    tl.store(packed_ptr + out_base + 0, ((i0.to(tl.uint32) << 16) | b0).to(tl.int32))
+    tl.store(packed_ptr + out_base + 1, ((i1.to(tl.uint32) << 16) | b1).to(tl.int32))
+    tl.store(packed_ptr + out_base + 2, ((i2.to(tl.uint32) << 16) | b2).to(tl.int32))
+    tl.store(packed_ptr + out_base + 3, ((i3.to(tl.uint32) << 16) | b3).to(tl.int32))
+
+
+def moe_top4_softmax_pack(logits: torch.Tensor) -> torch.Tensor:
+    num_experts = logits.shape[-1]
+    if num_experts != 128:
+        raise ValueError("Flat GPT-OSS top4 pack is specialized for 128 experts")
+    num_rows = logits.numel() // num_experts
+    packed = torch.empty(
+        (num_rows, 4),
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    _moe_top4_softmax_pack_kernel[(num_rows,)](
+        logits,
+        packed,
+        logits.stride(-2),
+        num_experts,
+        triton.next_power_of_2(num_experts),
+        num_warps=4,
+    )
+    return packed
+
+
+@triton.jit
 def _rope_and_cache_kernel(
     query_ptr,
     query_out_ptr,
