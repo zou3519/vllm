@@ -44,23 +44,21 @@ To set up:
 
 To find bottlenecks, use kernel-level profiling:
 
-**nsys** (timeline — which kernels take the most time):
-```bash
-nsys profile -o profile_out --capture-range=cudaProfilerApi \
-  python -c "import torch; torch.cuda.cudart().cudaProfilerStart(); <run_one_forward>; torch.cuda.cudart().cudaProfilerStop()"
-nsys stats profile_out.nsys-rep --report cuda_gpu_kern_sum
+**torch.profiler** (timeline — which kernels take the most time):
+```python
+with torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CUDA],
+    on_trace_ready=torch.profiler.tensorboard_trace_handler("./profile_out"),
+) as prof:
+    <run_one_forward>
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 ```
+The trace file can be viewed in Chrome at `chrome://tracing` or in
+TensorBoard. This gives the human a visual timeline of all GPU kernels.
 
 **ncu** (single kernel deep-dive — memory bandwidth, occupancy):
 ```bash
 ncu --target-processes all --set full -k <kernel_name> -o ncu_out <command>
-```
-
-**torch.profiler** (quick and easy, no special tools):
-```python
-with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-    <run_one_forward>
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 ```
 
 For the iterative loop, TPIT measurement (below) is usually sufficient.
