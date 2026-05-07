@@ -13,7 +13,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.model_executor.models.flat_gpt_oss_kernels import (
     fused_add_rms_norm_mxfp8_quant,
-    linear_gemv,
     rope_and_cache,
 )
 from vllm.sequence import IntermediateTensors
@@ -303,10 +302,7 @@ def transformer_layer(
     attn_output = torch.reshape(attn_output, (num_tokens, q_size))
 
     # TransformerBlock.attn.o_proj
-    if num_tokens == 1:
-        hidden_states = linear_gemv(attn_output, o_proj_weight, o_proj_bias)
-    else:
-        hidden_states = F.linear(attn_output, o_proj_weight, o_proj_bias)
+    hidden_states = F.linear(attn_output, o_proj_weight, o_proj_bias)
 
     # TransformerBlock.post_attention_layernorm + MoE MXFP8 activation quant.
     moe_x_quant, moe_x_scale = fused_add_rms_norm_mxfp8_quant(
