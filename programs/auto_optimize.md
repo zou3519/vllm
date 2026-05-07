@@ -1,9 +1,9 @@
 # auto_optimize
 
-**FULL_DECODE_ONLY auto-optimize target** — this program only targets the
-BS=1 decode path, especially the full-cudagraph decode path. Prefill is out
-of scope for optimization, though the flat model definition itself may still
-support prefill.
+**Flat no-compile FULL_DECODE_ONLY auto-optimize target** — this program only
+targets the BS=1 decode path for the flat model with torch.compile disabled
+and full decode CUDA graphs enabled. Prefill is out of scope for optimization,
+though the flat model definition itself may still support prefill.
 
 You are a GPU inference optimization engineer. Your job is to minimize
 BS=1 decode latency (TPIT) for a flat vLLM model.
@@ -35,9 +35,9 @@ To set up:
    roofline_μs  = weight_bytes / peak_HBM_bandwidth
    ```
    Sum across projections × num_layers for the total model roofline.
-3. **Verify the baseline TPIT** from `flat_config.txt` by re-measuring
-   (see Benchmarking below). Distinguish the no-compile flat baseline from
-   the cudagraph optimization target; record which mode each number used.
+3. **Verify the flat no-compile FULL_DECODE_ONLY baseline TPIT** from
+   `flat_config.txt` by re-measuring (see Benchmarking below). This loop
+   optimizes that flat path, not a torch.compile variant.
 4. **Initialize results.tsv** with just the header row.
 5. **Confirm and go**: tell the user the flat baseline TPIT, the original
    model TPIT (from `flat_config.txt`), the roofline, and the gap.
@@ -56,18 +56,18 @@ layer.
 ## Benchmarking
 
 Start the server using the flat serve command from `flat_config.txt`, or the
-user's original `vllm serve` command plus the flat `--hf-overrides`. Redirect
-output to a log file and run in background. Wait for "Application startup
-complete" in the log. Before each start, check for and stop stale vLLM
-server/EngineCore processes from previous runs; after each run, stop the
-server and verify none remain.
+user's original `vllm serve` command plus the flat `--hf-overrides`. Always add
+both `-cc.mode=none` and `-cc.cudagraph_mode=full_decode_only` for this
+auto-optimize loop. Redirect output to a log file and run in background. Wait
+for "Application startup complete" in the log. Before each start, check for and
+stop stale vLLM server/EngineCore processes from previous runs; after each run,
+stop the server and verify none remain.
 
-For the auto-optimize target, set `-cc.cudagraph_mode=full_decode_only`.
-Do not silently reuse a no-compile baseline command if it disables cudagraphs
-for the experiment you are measuring. `-cc.mode=none` is useful for measuring
-the no-compile flat baseline, but vLLM can override cudagraph mode to `NONE`
-when compilation mode is `NONE`; always check the startup log for the
-effective `CompilationMode` and `CUDAGraphMode` and record surprises.
+For the auto-optimize target, torch.compile must be disabled while full decode
+CUDA graphs remain enabled. The startup log must show
+`CompilationMode.NONE` and `CUDAGraphMode.FULL_DECODE_ONLY` (or equivalent
+effective config). If vLLM overrides cudagraph mode to `NONE`, treat that as a
+target setup failure, not as a valid benchmark.
 
 **Measure engine-side TPIT** with vLLM's Prometheus metrics, but validate the
 metric count:
@@ -97,7 +97,8 @@ curl -s localhost:<port>/v1/chat/completions -H 'Content-Type: application/json'
   -d '{"model": "<model>", "messages": [{"role": "user", "content": "Write a paragraph about AI."}], "max_tokens": 150, "stream": true}'
 ```
 Do not report SSE chunk spacing as TPIT when `--stream-interval > 1`. Run
-3-5 times — TPIT should be consistent (±0.1ms) with CUDA graphs.
+3-5 times; TPIT should be consistent enough to distinguish real regressions
+from runtime noise.
 
 **Test quality** after every change with these prompts:
 - "What is 2+2?" → should answer 4
@@ -193,8 +194,9 @@ activation quantization error. The BF16 input is tiny (one vector) so
 the 4× larger read is negligible vs weight reads.
 
 ### Pre-allocated buffers
-Allocate intermediate tensors once and reuse across layers. Eliminates
-per-layer `torch.empty` overhead inside CUDA graphs.
+Allocate intermediate tensors once and reuse across layers. This reduces
+allocation and Python/runtime overhead in the no-compile flat path, and can
+reduce capture-time allocations for full decode CUDA graphs.
 
 ## Gotchas from prior work
 
@@ -232,18 +234,19 @@ These bugs wasted hours. Watch for them:
   when the histogram count matches expected token intervals; use streaming
   timing with `--stream-interval 1` for client-visible TTIT.
 
-- **CompilationMode.NONE disables cudagraphs**: if the log says cudagraph mode
-  was overridden to `NONE`, that run is a no-cudagraph baseline, not the
-  `FULL_DECODE_ONLY` target.
+- **This loop uses CompilationMode.NONE plus FULL_DECODE_ONLY**: if the log
+  does not show `CompilationMode.NONE`, you are benchmarking the wrong target.
+  If the log says cudagraph mode was overridden to `NONE`, you are also
+  benchmarking the wrong target; fix the serve command/config before measuring.
 
 - **FP8 KV cache stored as uint8**: vLLM stores FP8 KV cache as
   `torch.uint8`, not `torch.float8_e4m3fn`. If writing custom KV cache
   kernels, check for both dtypes.
 
-- **CUDA graph capture**: no `torch.cuda.synchronize()`, `.item()`, or
-  Python-side tensor value checks in the forward path. These break graph
-  capture. Guard diagnostic code with
-  `if not torch.cuda.is_current_stream_capturing()`.
+- **CUDA graph capture**: torch.compile is disabled, but full decode CUDA
+  graphs are enabled. Do not add `torch.cuda.synchronize()`, `.item()`, or
+  Python-side tensor value checks to the forward path unless the diagnostic is
+  temporary and removed before committing.
 
 - **Backend selection is part of the benchmark**: environment variables such
   as MoE backend selectors can materially change the op sequence. Assert or

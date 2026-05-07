@@ -10,9 +10,10 @@ target serve command or user explicitly narrows the scope. Some downstream
 auto-optimize workflows may benchmark or specialize for BS=1 decode, but that
 is an optimization target, not the default scope of this program.
 
-The target cudagraph configuration for this workflow is
-`cudagraph_mode=FULL_DECODE_ONLY`. Treat that as the CUDA graph capture policy:
-full cudagraphs are intended for decode batches, while prefill and mixed
+The flat-model test and optimization workflows run with torch.compile disabled
+and full decode CUDA graphs enabled. Use `-cc.mode=none` together with
+`-cc.cudagraph_mode=full_decode_only` for flat-model serve commands unless the
+user explicitly asks for a different experiment. Prefill and mixed
 prefill/decode behavior still need to be preserved by the flat model.
 
 ## Setup
@@ -104,9 +105,10 @@ then call vLLM's attention op directly, ideally
 
 Do not torch.compile the flat model when testing or benchmarking. Turn it off
 via the serve command, e.g. add `-cc.mode=none` (CompilationMode.NONE) to the
-flat-model `vllm serve` command. When running cudagraph-enabled comparisons or
-auto-optimize work rather than the no-compile flat baseline, set
-`-cc.cudagraph_mode=full_decode_only`.
+flat-model `vllm serve` command, and also add
+`-cc.cudagraph_mode=full_decode_only` so BS=1 decode still uses full CUDA
+graphs. If the log says cudagraph mode was overridden to `NONE`, treat that as
+a setup failure and fix the serve command/config before benchmarking.
 
 ## The Test Loop
 
@@ -115,10 +117,11 @@ LOOP FOREVER until the flat model produces correct output:
 1. **Start the server** using the user's `vllm serve` command, but add
    `--hf-overrides '{"architectures": ["Flat<Model>ForCausalLM"]}'` to
    use your flat model, and add `-cc.mode=none` so the flat model is not
-   torch-compiled. Redirect output to a log file and run in background. Wait
-   for "Application startup complete" in the log. Before starting, check for
-   and stop stale vLLM server/EngineCore processes from previous runs; after
-   finishing, stop the server and verify none remain.
+   torch-compiled. Also add `-cc.cudagraph_mode=full_decode_only` so decode
+   still uses full CUDA graphs. Redirect output to a log file and run in
+   background. Wait for "Application startup complete" in the log. Before
+   starting, check for and stop stale vLLM server/EngineCore processes from
+   previous runs; after finishing, stop the server and verify none remain.
 
 2. **Test correctness** — send these prompts and check the answers:
    - "What is 2+2?" → should answer 4
