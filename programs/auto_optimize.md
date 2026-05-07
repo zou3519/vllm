@@ -57,11 +57,13 @@ layer.
 
 Start the server using the flat serve command from `flat_config.txt`, or the
 user's original `vllm serve` command plus the flat `--hf-overrides`. Always add
-both `-cc.mode=none` and `-cc.cudagraph_mode=full_decode_only` for this
-auto-optimize loop. Redirect output to a log file and run in background. Wait
-for "Application startup complete" in the log. Before each start, check for and
-stop stale vLLM server/EngineCore processes from previous runs; after each run,
-stop the server and verify none remain.
+`--max-cudagraph-capture-size 1`, `-cc.mode=none`, and
+`-cc.cudagraph_mode=full_decode_only` for this auto-optimize loop. The target is
+BS=1 decode, so larger capture sizes only add irrelevant startup and capture
+work. Redirect output to a log file and run in background. Wait for
+"Application startup complete" in the log. Before each start, check for and stop
+stale vLLM server/EngineCore processes from previous runs; after each run, stop
+the server and verify none remain.
 
 For the auto-optimize target, torch.compile must be disabled while full decode
 CUDA graphs remain enabled. The startup log must show
@@ -244,9 +246,10 @@ These bugs wasted hours. Watch for them:
   kernels, check for both dtypes.
 
 - **CUDA graph capture**: torch.compile is disabled, but full decode CUDA
-  graphs are enabled. Do not add `torch.cuda.synchronize()`, `.item()`, or
-  Python-side tensor value checks to the forward path unless the diagnostic is
-  temporary and removed before committing.
+  graphs are enabled. Use `--max-cudagraph-capture-size 1` because this program
+  only measures BS=1 decode. Do not add `torch.cuda.synchronize()`, `.item()`,
+  or Python-side tensor value checks to the forward path unless the diagnostic
+  is temporary and removed before committing.
 
 - **Backend selection is part of the benchmark**: environment variables such
   as MoE backend selectors can materially change the op sequence. Assert or

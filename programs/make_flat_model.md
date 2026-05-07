@@ -13,8 +13,10 @@ is an optimization target, not the default scope of this program.
 The flat-model test and optimization workflows run with torch.compile disabled
 and full decode CUDA graphs enabled. Use `-cc.mode=none` together with
 `-cc.cudagraph_mode=full_decode_only` for flat-model serve commands unless the
-user explicitly asks for a different experiment. Prefill and mixed
-prefill/decode behavior still need to be preserved by the flat model.
+user explicitly asks for a different experiment. For BS=1 decode-only
+optimization runs, also use `--max-cudagraph-capture-size 1`; larger capture
+sizes only slow down setup for that target. Prefill and mixed prefill/decode
+behavior still need to be preserved by the flat model.
 
 ## Setup
 
@@ -107,8 +109,10 @@ Do not torch.compile the flat model when testing or benchmarking. Turn it off
 via the serve command, e.g. add `-cc.mode=none` (CompilationMode.NONE) to the
 flat-model `vllm serve` command, and also add
 `-cc.cudagraph_mode=full_decode_only` so BS=1 decode still uses full CUDA
-graphs. If the log says cudagraph mode was overridden to `NONE`, treat that as
-a setup failure and fix the serve command/config before benchmarking.
+graphs. For BS=1 decode-only optimization, set
+`--max-cudagraph-capture-size 1`. If the log says cudagraph mode was overridden
+to `NONE`, treat that as a setup failure and fix the serve command/config before
+benchmarking.
 
 ## The Test Loop
 
@@ -118,7 +122,8 @@ LOOP FOREVER until the flat model produces correct output:
    `--hf-overrides '{"architectures": ["Flat<Model>ForCausalLM"]}'` to
    use your flat model, and add `-cc.mode=none` so the flat model is not
    torch-compiled. Also add `-cc.cudagraph_mode=full_decode_only` so decode
-   still uses full CUDA graphs. Redirect output to a log file and run in
+   still uses full CUDA graphs. For BS=1 decode-only optimization, add
+   `--max-cudagraph-capture-size 1`. Redirect output to a log file and run in
    background. Wait for "Application startup complete" in the log. Before
    starting, check for and stop stale vLLM server/EngineCore processes from
    previous runs; after finishing, stop the server and verify none remain.

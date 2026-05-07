@@ -1,5 +1,5 @@
-serve_cmd: VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 vllm serve openai/gpt-oss-120b --tensor-parallel-size 1 --kv-cache-dtype fp8 --no-enable-prefix-caching --max-cudagraph-capture-size 2048 --max-num-batched-tokens 8192 --stream-interval 20 --tool-call-parser openai --enable-auto-tool-choice
-flat_serve_cmd: VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 vllm serve openai/gpt-oss-120b --tensor-parallel-size 1 --kv-cache-dtype fp8 --no-enable-prefix-caching --max-cudagraph-capture-size 2048 --max-num-batched-tokens 8192 --stream-interval 20 --tool-call-parser openai --enable-auto-tool-choice --hf-overrides '{"architectures": ["FlatGptOssForCausalLM"]}' -cc.mode=none
+serve_cmd: VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 vllm serve openai/gpt-oss-120b --tensor-parallel-size 1 --kv-cache-dtype fp8 --no-enable-prefix-caching --max-cudagraph-capture-size 1 --max-num-batched-tokens 8192 --stream-interval 20 --tool-call-parser openai --enable-auto-tool-choice
+flat_serve_cmd: VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 vllm serve openai/gpt-oss-120b --tensor-parallel-size 1 --kv-cache-dtype fp8 --no-enable-prefix-caching --max-cudagraph-capture-size 1 --max-num-batched-tokens 8192 --stream-interval 20 --tool-call-parser openai --enable-auto-tool-choice --hf-overrides '{"architectures": ["FlatGptOssForCausalLM"]}' -cc.mode=none -cc.cudagraph_mode=full_decode_only
 forward_file: vllm/model_executor/models/flat_gpt_oss_forward.py
 model_file: vllm/model_executor/models/flat_gpt_oss.py
 original_tpit_ms: 2.528427
