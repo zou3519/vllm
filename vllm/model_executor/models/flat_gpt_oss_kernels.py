@@ -302,7 +302,7 @@ def rope_and_cache(
         value_dim_stride = value_cache.stride(3)
 
     n = max(num_q_heads * rotary_dim, num_kv_heads * head_size)
-    tile_size = triton.next_power_of_2(n)
+    tile_size = min(2048, triton.next_power_of_2(n))
     grid = (slot_mapping.shape[0], triton.cdiv(n, tile_size))
     query_fp8 = query_output is not None
     if query_output is None:
