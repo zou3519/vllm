@@ -10,6 +10,7 @@ from flashinfer.tllm_enums import SfLayout
 from vllm import _custom_ops as ops
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.model_executor.models.flat_gpt_oss_kernels import (
     fused_add_rms_norm_mxfp8_quant,
@@ -458,7 +459,7 @@ def flat_forward(
                     fused_experts.intermediate_size_per_partition,
                     fused_experts.ep_rank * fused_experts.local_num_experts,
                     fused_experts.local_num_experts,
-                    fused_experts.routing_method_type,
+                    RoutingMethodType.RenormalizeNaive,
                     1,
                     layer.mlp.hidden_size,
                 )
