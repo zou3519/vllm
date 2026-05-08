@@ -9,6 +9,103 @@ from vllm.triton_utils import tl, triton
 
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
+def _index_q_rope_quant_weights_kernel(
+    index_q_ptr,  # [num_tokens, n_heads, head_dim]
+    positions_ptr,  # [num_tokens]
+    cos_sin_cache_ptr,  # [max_position, rope_dim]
+    index_weights_ptr,  # [num_tokens, n_heads]
+    q_fp8_ptr,  # [num_tokens, n_heads, head_dim]
+    scaled_weights_ptr,  # [num_tokens, n_heads]
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_stride2,
+    weights_stride0,
+    weights_stride1,
+    q_fp8_stride0,
+    q_fp8_stride1,
+    q_fp8_stride2,
+    scaled_weights_stride0,
+    scaled_weights_stride1,
+    FACTOR: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < head_dim
+
+    vals = tl.load(
+        index_q_ptr
+        + token * index_q_stride0
+        + head * index_q_stride1
+        + cols * index_q_stride2,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    half_rope = rope_dim // 2
+    pos = tl.load(positions_ptr + token)
+    rope_pair = tl.where(cols < half_rope, cols, cols - half_rope)
+    rope_mask = cols < rope_dim
+    cos = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + rope_pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + half_rope + rope_pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_vals = tl.load(
+        index_q_ptr
+        + token * index_q_stride0
+        + head * index_q_stride1
+        + rope_pair * index_q_stride2,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    y_vals = tl.load(
+        index_q_ptr
+        + token * index_q_stride0
+        + head * index_q_stride1
+        + (rope_pair + half_rope) * index_q_stride2,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_rot = x_vals * cos - y_vals * sin
+    y_rot = y_vals * cos + x_vals * sin
+    vals = tl.where(cols < half_rope, x_rot, vals)
+    vals = tl.where((cols >= half_rope) & (cols < rope_dim), y_rot, vals)
+
+    absmax = tl.max(tl.abs(tl.where(mask, vals, 0.0)), axis=0)
+    scale = absmax / 448.0
+    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1.0e-10))))
+    q_vals = vals / scale
+    q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
+    tl.store(
+        q_fp8_ptr
+        + token * q_fp8_stride0
+        + head * q_fp8_stride1
+        + cols * q_fp8_stride2,
+        q_vals,
+        mask=mask,
+    )
+    weight = tl.load(
+        index_weights_ptr + token * weights_stride0 + head * weights_stride1
+    ).to(tl.float32)
+    tl.store(
+        scaled_weights_ptr
+        + token * scaled_weights_stride0
+        + head * scaled_weights_stride1,
+        weight * scale * FACTOR,
+    )
+
+
+@triton.jit
 def _mla_decode_q_concat_kernel(
     nope_ptr,  # [batch, heads, lora_rank]
     rope_ptr,  # [batch, heads, rope_dim]

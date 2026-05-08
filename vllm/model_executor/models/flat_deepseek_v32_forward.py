@@ -21,9 +21,9 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _index_q_rope_quant_weights_kernel,
     _indexer_layer_norm_kernel,
     _mla_decode_q_concat_kernel,
-    _scale_index_weights_kernel,
     triton_convert_req_index_to_global_index,
 )
 
@@ -253,7 +253,6 @@ def transformer_layer(
         else:
             index_q = F.linear(q_c, wq_b.weight, bias)
         index_q = index_q.view(-1, indexer.n_head, indexer.head_dim)
-        q_pe = index_q[..., : indexer.rope_dim]
 
         # Sparse indexer fused wk + weights projection.
         if indexer.is_fp4_ckpt:
@@ -370,58 +369,56 @@ def transformer_layer(
         rotary = wrapper.indexer_rope_emb
         k_pe_index = k_pe_index.unsqueeze(1)
         cos_sin_cache = rotary.cos_sin_cache
-        if cos_sin_cache.device != q_pe.device or cos_sin_cache.dtype != q_pe.dtype:
-            cos_sin_cache = cos_sin_cache.to(q_pe.device, dtype=q_pe.dtype)
+        if (
+            cos_sin_cache.device != index_q.device
+            or cos_sin_cache.dtype != index_q.dtype
+        ):
+            cos_sin_cache = cos_sin_cache.to(index_q.device, dtype=index_q.dtype)
         ops.rotary_embedding(
             positions.flatten(),
-            q_pe,
             k_pe_index,
+            None,
             indexer.rope_dim,
             cos_sin_cache,
             True,
         )
 
-        # Sparse indexer fp8 q quantization and weight scaling.
-        q_flat = index_q.view(-1, indexer.head_dim)
+        # Sparse indexer fused q RoPE, fp8 quantization, and weight scaling.
         q_fp8 = torch.empty(
-            q_flat.shape,
-            device=q_flat.device,
+            index_q.shape,
+            device=index_q.device,
             dtype=torch.float8_e4m3fn,
         )
-        q_scale = torch.empty(
-            q_flat.shape[:-1] + (q_flat.shape[-1] // indexer.quant_block_size,),
-            device=q_flat.device,
+        scaled_index_weights = torch.empty(
+            index_weights.shape,
+            device=index_weights.device,
             dtype=torch.float32,
         )
-        torch.ops._C.per_token_group_fp8_quant(
-            q_flat,
-            q_fp8,
-            q_scale,
-            indexer.quant_block_size,
-            1e-10,
-            -448.0,
-            448.0,
-            indexer.scale_fmt is not None,
-            False,
-            False,
-        )
-        q_fp8 = q_fp8.view(-1, indexer.n_head, indexer.head_dim)
-        q_scale = q_scale.view(-1, indexer.n_head)
-        assert indexer.n_head <= 256
-        scaled_index_weights = torch.empty_like(q_scale)
-        _scale_index_weights_kernel[(q_scale.shape[0],)](
+        assert indexer.head_dim <= 128
+        _index_q_rope_quant_weights_kernel[
+            (index_q.shape[0], index_q.shape[1])
+        ](
+            index_q,
+            positions.flatten(),
+            cos_sin_cache,
             index_weights,
-            q_scale,
+            q_fp8,
             scaled_index_weights,
-            q_scale.shape[1],
+            index_q.shape[1],
+            index_q.shape[2],
+            indexer.rope_dim,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q.stride(2),
             index_weights.stride(0),
             index_weights.stride(1),
-            q_scale.stride(0),
-            q_scale.stride(1),
+            q_fp8.stride(0),
+            q_fp8.stride(1),
+            q_fp8.stride(2),
             scaled_index_weights.stride(0),
             scaled_index_weights.stride(1),
             FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
-            BLOCK_N=256,
+            BLOCK_N=128,
         )
         index_weights = scaled_index_weights
 
