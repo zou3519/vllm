@@ -21,6 +21,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _scale_index_weights_kernel,
     triton_convert_req_index_to_global_index,
 )
 
@@ -391,8 +392,23 @@ def transformer_layer(
         )
         q_fp8 = q_fp8.view(-1, indexer.n_head, indexer.head_dim)
         q_scale = q_scale.view(-1, indexer.n_head)
-        index_weights = torch.mul(index_weights, q_scale)
-        index_weights.mul_(indexer.softmax_scale * indexer.n_head**-0.5)
+        assert indexer.n_head <= 256
+        scaled_index_weights = torch.empty_like(q_scale)
+        _scale_index_weights_kernel[(q_scale.shape[0],)](
+            index_weights,
+            q_scale,
+            scaled_index_weights,
+            q_scale.shape[1],
+            index_weights.stride(0),
+            index_weights.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(1),
+            scaled_index_weights.stride(0),
+            scaled_index_weights.stride(1),
+            FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
+            BLOCK_N=256,
+        )
+        index_weights = scaled_index_weights
 
         # Sparse indexer: profile allocation path.
         attn_metadata = forward_context.attn_metadata

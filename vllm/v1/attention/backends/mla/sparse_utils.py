@@ -9,6 +9,41 @@ from vllm.triton_utils import tl, triton
 
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
+def _scale_index_weights_kernel(
+    weights_ptr,  # [num_tokens, n_head]
+    scales_ptr,  # [num_tokens, n_head]
+    out_ptr,  # [num_tokens, n_head]
+    n_heads: tl.constexpr,
+    weights_stride0,
+    weights_stride1,
+    scales_stride0,
+    scales_stride1,
+    out_stride0,
+    out_stride1,
+    FACTOR: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < n_heads
+    weights = tl.load(
+        weights_ptr + row * weights_stride0 + cols * weights_stride1,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    scales = tl.load(
+        scales_ptr + row * scales_stride0 + cols * scales_stride1,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        out_ptr + row * out_stride0 + cols * out_stride1,
+        weights * scales * FACTOR,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _convert_req_index_to_global_index_kernel(
     req_id_ptr,  # int32 [num_tokens]
     block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
