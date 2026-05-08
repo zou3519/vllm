@@ -177,20 +177,17 @@ def transformer_layer(
     k_pe = k_pe.unsqueeze(1)
     rotary = wrapper.rotary_emb
     q_rot = q[..., wrapper.qk_nope_head_dim :]
-    k_rot = k_pe
     cos_sin_cache = rotary.cos_sin_cache
     if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
         cos_sin_cache = cos_sin_cache.to(q.device, dtype=q.dtype)
-    cos_sin = cos_sin_cache.index_select(0, positions.flatten())
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-    q_pair = torch.stack((-q_rot[..., 1::2], q_rot[..., ::2]), dim=-1)
-    k_pair = torch.stack((-k_rot[..., 1::2], k_rot[..., ::2]), dim=-1)
-    q_rotate = q_pair.flatten(-2)
-    k_rotate = k_pair.flatten(-2)
-    q[..., wrapper.qk_nope_head_dim :] = q_rot * cos + q_rotate * sin
-    k_pe = k_rot * cos + k_rotate * sin
+    ops.rotary_embedding(
+        positions.flatten(),
+        q_rot,
+        k_pe,
+        wrapper.qk_rope_head_dim,
+        cos_sin_cache,
+        False,
+    )
 
     # Sparse indexer q projection.
     if wrapper.indexer and wrapper.is_sparse:
@@ -339,33 +336,17 @@ def transformer_layer(
         )
         rotary = wrapper.indexer_rope_emb
         k_pe_index = k_pe_index.unsqueeze(1)
-        q_rot = q_pe
-        k_rot = k_pe_index
         cos_sin_cache = rotary.cos_sin_cache
-        if cos_sin_cache.device != q_rot.device or cos_sin_cache.dtype != q_rot.dtype:
-            cos_sin_cache = cos_sin_cache.to(q_rot.device, dtype=q_rot.dtype)
-        cos_sin = cos_sin_cache.index_select(0, positions.flatten())
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2).unsqueeze(-2)
-        sin = sin.repeat(1, 2).unsqueeze(-2)
-        q_rotate = torch.cat(
-            (
-                -q_rot[..., q_rot.shape[-1] // 2 :],
-                q_rot[..., : q_rot.shape[-1] // 2],
-            ),
-            dim=-1,
+        if cos_sin_cache.device != q_pe.device or cos_sin_cache.dtype != q_pe.dtype:
+            cos_sin_cache = cos_sin_cache.to(q_pe.device, dtype=q_pe.dtype)
+        ops.rotary_embedding(
+            positions.flatten(),
+            q_pe,
+            k_pe_index,
+            indexer.rope_dim,
+            cos_sin_cache,
+            True,
         )
-        k_rotate = torch.cat(
-            (
-                -k_rot[..., k_rot.shape[-1] // 2 :],
-                k_rot[..., : k_rot.shape[-1] // 2],
-            ),
-            dim=-1,
-        )
-        q_pe = q_rot * cos + q_rotate * sin
-        k_pe_index = k_rot * cos + k_rotate * sin
-        q_pe = q_pe.reshape(-1, indexer.n_head, indexer.rope_dim)
-        k_pe_index = k_pe_index.reshape(-1, 1, indexer.rope_dim)
         index_q = torch.cat([q_pe, q_nope], dim=-1)
         index_k = torch.cat([k_pe_index.squeeze(-2), k_nope], dim=-1)
 
