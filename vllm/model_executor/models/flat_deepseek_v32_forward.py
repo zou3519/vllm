@@ -6,6 +6,7 @@ from itertools import islice
 
 import torch
 import deep_gemm
+import flashinfer.comm as flashinfer_comm
 import torch.nn.functional as F
 
 import vllm.envs as envs
@@ -33,6 +34,9 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _fi_sparse_workspace: torch.Tensor | None = None
 _FI_AR_RESIDUAL_RMS_NORM_PATTERN = 1
+_FI_AR_RESIDUAL_RMS_NORM_FP4_QUANT_PATTERN = (
+    flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant
+)
 _FI_AR_MAX_TOKEN_NUM = 4681
 
 
@@ -46,6 +50,9 @@ def transformer_layer(
     tp_size,
 ):
     global _fi_sparse_workspace
+
+    qkv_input_fp4 = None
+    qkv_input_blockscale = None
 
     # Input RMSNorm and residual.
     if residual is None:
@@ -61,17 +68,50 @@ def transformer_layer(
     else:
         norm = layer.input_layernorm
         if hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM:
-            torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
-                hidden_states,
-                residual,
-                norm.weight.data,
-                norm.variance_epsilon,
-                tp_size,
-                True,
-                True,
-                _FI_AR_MAX_TOKEN_NUM,
-                _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
-            )
+            input_qkv_proj = layer.self_attn.mla_attn.fused_qkv_a_proj
+            if hasattr(input_qkv_proj, "weight_global_scale") and hasattr(
+                input_qkv_proj, "input_global_scale_inv"
+            ):
+                qkv_input_fp4 = torch.empty(
+                    (hidden_states.shape[0], hidden_states.shape[-1] // 2),
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+                qkv_input_blockscale = torch.empty(
+                    (
+                        ((hidden_states.shape[0] + 127) // 128) * 128,
+                        ((hidden_states.shape[-1] // 16 + 3) // 4),
+                    ),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+                torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+                    hidden_states,
+                    residual,
+                    norm.weight.data,
+                    norm.variance_epsilon,
+                    tp_size,
+                    True,
+                    True,
+                    _FI_AR_MAX_TOKEN_NUM,
+                    _FI_AR_RESIDUAL_RMS_NORM_FP4_QUANT_PATTERN,
+                    None,
+                    qkv_input_fp4,
+                    qkv_input_blockscale,
+                    input_qkv_proj.input_global_scale_inv,
+                )
+            else:
+                torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+                    hidden_states,
+                    residual,
+                    norm.weight.data,
+                    norm.variance_epsilon,
+                    tp_size,
+                    True,
+                    True,
+                    _FI_AR_MAX_TOKEN_NUM,
+                    _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
+                )
         else:
             hidden_states = torch.ops.vllm.all_reduce(
                 hidden_states, group_name=tp_group_name
@@ -127,12 +167,17 @@ def transformer_layer(
                 *hidden_states.shape[:-1],
                 fused_qkv_a_proj.output_size_per_partition,
             ]
-            x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                hidden_states,
-                fused_qkv_a_proj.input_global_scale_inv,
-                is_sf_swizzled_layout=True,
-                backend=fused_qkv_a_proj.quant_method.backend.value,
-            )
+            if qkv_input_fp4 is None:
+                x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                    hidden_states,
+                    fused_qkv_a_proj.input_global_scale_inv,
+                    is_sf_swizzled_layout=True,
+                    backend=fused_qkv_a_proj.quant_method.backend.value,
+                )
+            else:
+                x_fp4 = qkv_input_fp4
+                assert qkv_input_blockscale is not None
+                x_blockscale = qkv_input_blockscale
             if fused_qkv_a_proj.weights_padding_cols > 0:
                 x_fp4 = F.pad(
                     x_fp4, (0, fused_qkv_a_proj.weights_padding_cols)
