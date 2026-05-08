@@ -690,7 +690,7 @@ def triton_convert_req_index_to_global_index(
         ti_stride1,
         out_stride0,
         out_stride1,
-        num_warps=8,
+        num_warps=4,
     )
 
     if return_valid_counts:
