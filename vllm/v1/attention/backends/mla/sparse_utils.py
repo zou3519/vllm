@@ -357,6 +357,32 @@ def _mla_decode_q_concat_quant_fp8_kernel(
 
 
 @triton.jit
+def _nvfp4_rowmajor_scale_kernel(
+    input_ptr,  # [num_tokens, hidden_dim]
+    input_scale_ptr,  # scalar global scale
+    out_scale_ptr,  # [num_tokens, hidden_dim // 16], fp8 e4m3
+    hidden_dim: tl.constexpr,
+    input_stride0,
+    input_stride1,
+    out_stride0,
+    out_stride1,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+    vals = tl.load(
+        input_ptr + row * input_stride0 + cols * input_stride1,
+        mask=cols < hidden_dim,
+        other=0.0,
+    ).to(tl.float32)
+    vec_max = tl.max(tl.abs(vals), axis=0)
+    global_scale = tl.load(input_scale_ptr).to(tl.float32)
+    scale = vec_max * global_scale / 6.0
+    tl.store(out_scale_ptr + row * out_stride0 + block * out_stride1, scale)
+
+
+@triton.jit
 def _indexer_layer_norm_kernel(
     input_ptr,  # [num_tokens, head_dim]
     weight_ptr,  # [head_dim]
