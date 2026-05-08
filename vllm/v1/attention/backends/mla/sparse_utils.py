@@ -309,14 +309,14 @@ def _index_qk_rope_quant_cache_kernel(
             q_vals,
             mask=mask,
         )
-        weight = tl.load(
+        q_weight_scalar = tl.load(
             index_weights_ptr + token * weights_stride0 + lane * weights_stride1
         ).to(tl.float32)
         tl.store(
             scaled_weights_ptr
             + token * scaled_weights_stride0
             + lane * scaled_weights_stride1,
-            weight * scale * FACTOR,
+            q_weight_scalar * scale * FACTOR,
         )
     else:
         valid_token = token < num_k_tokens
@@ -329,9 +329,11 @@ def _index_qk_rope_quant_cache_kernel(
         centered = tl.where(mask, x - mean, 0.0)
         var = tl.sum(centered * centered, axis=0) / head_dim
         inv_std = tl.rsqrt(var + EPS)
-        weight = tl.load(norm_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        norm_weight_vals = tl.load(
+            norm_weight_ptr + cols, mask=mask, other=0.0
+        ).to(tl.float32)
         bias = tl.load(norm_bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        vals = centered * inv_std * weight + bias
+        vals = centered * inv_std * norm_weight_vals + bias
 
         x_pair = tl.load(
             index_k_ptr + token * index_k_stride0 + rope_pair * index_k_stride1,
