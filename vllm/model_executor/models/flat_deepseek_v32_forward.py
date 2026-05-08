@@ -1040,37 +1040,42 @@ def transformer_layer(
             ]
             torch.distributed.all_gather(gathered_gate_up, gate_up)
             gate_up = torch.cat(gathered_gate_up, dim=-1)
-        hidden_states = F.silu(gate_up[..., : gate_up.shape[-1] // 2]) * gate_up[
-            ..., gate_up.shape[-1] // 2 :
-        ]
         down_proj = mlp.down_proj
-        input_parallel = hidden_states
-        if not down_proj.input_is_parallel:
-            input_parallel = torch.chunk(hidden_states, down_proj.tp_size, dim=-1)[
-                down_proj.tp_rank
-            ].contiguous()
         bias = (
             None
             if (down_proj.tp_rank > 0 or down_proj.skip_bias_add)
             else down_proj.bias
         )
-        if hasattr(down_proj, "weight_global_scale") and hasattr(
-            down_proj, "input_global_scale_inv"
+        if (
+            down_proj.input_is_parallel
+            and hasattr(down_proj, "weight_global_scale")
+            and hasattr(down_proj, "input_global_scale_inv")
         ):
+            act_dim = gate_up.shape[-1] // 2
+            gate_up_2d = gate_up.reshape(-1, gate_up.shape[-1])
+            x_fp4 = torch.empty(
+                (gate_up_2d.shape[0], act_dim // 2),
+                dtype=torch.uint8,
+                device=gate_up.device,
+            )
+            x_blockscale = torch.zeros(
+                (
+                    ((gate_up_2d.shape[0] + 127) // 128) * 128,
+                    ((act_dim // 16 + 3) // 4),
+                ),
+                dtype=torch.int32,
+                device=gate_up.device,
+            )
+            torch.ops._C.silu_and_mul_nvfp4_quant(
+                x_fp4,
+                x_blockscale,
+                gate_up_2d,
+                down_proj.input_global_scale_inv,
+            )
             down_shape = [
-                *input_parallel.shape[:-1],
+                *gate_up.shape[:-1],
                 down_proj.output_size_per_partition,
             ]
-            x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                input_parallel,
-                down_proj.input_global_scale_inv,
-                is_sf_swizzled_layout=True,
-                backend=down_proj.quant_method.backend.value,
-            )
-            if down_proj.weights_padding_cols > 0:
-                x_fp4 = F.pad(
-                    x_fp4, (0, down_proj.weights_padding_cols)
-                ).contiguous()
             backend_name = down_proj.quant_method.backend.value[len("flashinfer-") :]
             hidden_states = torch.ops.vllm.flashinfer_mm_fp4(
                 x_fp4,
@@ -1078,7 +1083,7 @@ def transformer_layer(
                 x_blockscale.view(torch.uint8),
                 down_proj.weight_scale.view(torch.uint8).t(),
                 down_proj.alpha,
-                input_parallel.dtype,
+                gate_up.dtype,
                 backend_name == "trtllm" and x_fp4.shape[0] <= 32,
                 backend_name,
             )
@@ -1090,7 +1095,53 @@ def transformer_layer(
             if bias is not None:
                 hidden_states = hidden_states + bias
         else:
-            hidden_states = F.linear(input_parallel, down_proj.weight, bias)
+            hidden_states = F.silu(
+                gate_up[..., : gate_up.shape[-1] // 2]
+            ) * gate_up[..., gate_up.shape[-1] // 2 :]
+            input_parallel = hidden_states
+            if not down_proj.input_is_parallel:
+                input_parallel = torch.chunk(hidden_states, down_proj.tp_size, dim=-1)[
+                    down_proj.tp_rank
+                ].contiguous()
+            if hasattr(down_proj, "weight_global_scale") and hasattr(
+            down_proj, "input_global_scale_inv"
+            ):
+                down_shape = [
+                    *input_parallel.shape[:-1],
+                    down_proj.output_size_per_partition,
+                ]
+                x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                    input_parallel,
+                    down_proj.input_global_scale_inv,
+                    is_sf_swizzled_layout=True,
+                    backend=down_proj.quant_method.backend.value,
+                )
+                if down_proj.weights_padding_cols > 0:
+                    x_fp4 = F.pad(
+                        x_fp4, (0, down_proj.weights_padding_cols)
+                    ).contiguous()
+                backend_name = down_proj.quant_method.backend.value[
+                    len("flashinfer-") :
+                ]
+                hidden_states = torch.ops.vllm.flashinfer_mm_fp4(
+                    x_fp4,
+                    down_proj.weight.t(),
+                    x_blockscale.view(torch.uint8),
+                    down_proj.weight_scale.view(torch.uint8).t(),
+                    down_proj.alpha,
+                    input_parallel.dtype,
+                    backend_name == "trtllm" and x_fp4.shape[0] <= 32,
+                    backend_name,
+                )
+                if hidden_states.shape[-1] != down_proj.output_size_per_partition:
+                    hidden_states = hidden_states[
+                        ..., : down_proj.output_size_per_partition
+                    ].contiguous()
+                hidden_states = hidden_states.view(*down_shape)
+                if bias is not None:
+                    hidden_states = hidden_states + bias
+            else:
+                hidden_states = F.linear(input_parallel, down_proj.weight, bias)
 
     return hidden_states, residual
 
