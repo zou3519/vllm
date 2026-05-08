@@ -813,7 +813,7 @@ def transformer_layer(
                     dtype=torch.uint8,
                     device=gate_up.device,
                 )
-                x_blockscale = torch.zeros(
+                x_blockscale = torch.empty(
                     (
                         ((gate_up_2d.shape[0] + 127) // 128) * 128,
                         ((act_dim // 16 + 3) // 4),
@@ -1058,7 +1058,7 @@ def transformer_layer(
                 dtype=torch.uint8,
                 device=gate_up.device,
             )
-            x_blockscale = torch.zeros(
+            x_blockscale = torch.empty(
                 (
                     ((gate_up_2d.shape[0] + 127) // 128) * 128,
                     ((act_dim // 16 + 3) // 4),
