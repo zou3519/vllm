@@ -260,6 +260,55 @@ def _mla_decode_q_concat_kernel(
 
 
 @triton.jit
+def _mla_decode_q_concat_quant_fp8_kernel(
+    nope_ptr,  # [batch, heads, lora_rank]
+    rope_ptr,  # [batch, heads, rope_dim]
+    scale_ptr,  # scalar
+    out_ptr,  # [batch, heads, lora_rank + rope_dim]
+    total_elems,
+    heads: tl.constexpr,
+    lora_rank: tl.constexpr,
+    rope_dim: tl.constexpr,
+    out_dim: tl.constexpr,
+    nope_stride0,
+    nope_stride1,
+    nope_stride2,
+    rope_stride0,
+    rope_stride1,
+    rope_stride2,
+    BLOCK_N: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < total_elems
+    feature = offsets % out_dim
+    tmp = offsets // out_dim
+    head = tmp % heads
+    batch = tmp // heads
+    from_nope = feature < lora_rank
+    nope_vals = tl.load(
+        nope_ptr
+        + batch * nope_stride0
+        + head * nope_stride1
+        + feature * nope_stride2,
+        mask=mask & from_nope,
+        other=0.0,
+    ).to(tl.float32)
+    rope_feature = feature - lora_rank
+    rope_vals = tl.load(
+        rope_ptr
+        + batch * rope_stride0
+        + head * rope_stride1
+        + rope_feature * rope_stride2,
+        mask=mask & ~from_nope,
+        other=0.0,
+    ).to(tl.float32)
+    scale = tl.load(scale_ptr).to(tl.float32)
+    vals = tl.where(from_nope, nope_vals, rope_vals) / scale
+    vals = tl.minimum(tl.maximum(vals, -448.0), 448.0)
+    tl.store(out_ptr + offsets, vals, mask=mask)
+
+
+@triton.jit
 def _indexer_layer_norm_kernel(
     input_ptr,  # [num_tokens, head_dim]
     weight_ptr,  # [head_dim]
