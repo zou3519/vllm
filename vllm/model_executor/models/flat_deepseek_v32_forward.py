@@ -511,7 +511,7 @@ def transformer_layer(
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
             _index_qk_rope_quant_cache_head_block_kernel[
-                (index_q.shape[0], (index_q.shape[1] + 1) // 2 + 1)
+                (index_q.shape[0], (index_q.shape[1] + 3) // 4 + 1)
             ](
                 index_q,
                 index_k,
@@ -529,7 +529,7 @@ def transformer_layer(
                 index_q.shape[1],
                 indexer.head_dim,
                 indexer.rope_dim,
-                (index_q.shape[1] + 1) // 2,
+                (index_q.shape[1] + 3) // 4,
                 index_q.stride(0),
                 index_q.stride(1),
                 index_q.stride(2),
@@ -546,7 +546,7 @@ def transformer_layer(
                 indexer.k_cache.kv_cache.shape[2],
                 EPS=indexer.k_norm.eps,
                 FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
-                BLOCK_H=2,
+                BLOCK_H=4,
                 BLOCK_N=128,
                 num_warps=8,
             )
