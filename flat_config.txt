@@ -5,5 +5,5 @@ forward_file: vllm/model_executor/models/flat_deepseek_v32_forward.py
 model_file: vllm/model_executor/models/flat_deepseek_v32.py
 original_tpit_ms: 8.456
 flat_baseline_tpit_ms: 23.161
-best_flat_tpit_ms: 7.412
+best_flat_tpit_ms: 7.329
 tpit_benchmark: BS=1 sequential chat completions, 8 measured requests after 1 warmup, max_tokens=128, ignore_eos=true, temperature=0, prompt="Count upward from one. Output only integers separated by spaces. Do not explain."; metric=vllm:inter_token_latency_seconds delta, count matched expected 1016 for both runs; flat served with -cc.mode=none -cc.cudagraph_mode=full_decode_only --max-cudagraph-capture-size 1; original served with normal torch.compile and -cc.cudagraph_mode=full_decode_only --max-cudagraph-capture-size 1
