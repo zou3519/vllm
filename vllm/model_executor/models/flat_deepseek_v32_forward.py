@@ -688,7 +688,7 @@ def transformer_layer(
             device=mqa_ql_nope.device,
             dtype=torch.float8_e4m3fn,
         )
-        _mla_decode_q_concat_quant_fp8_kernel[((mqa_q.numel() + 255) // 256,)](
+        _mla_decode_q_concat_quant_fp8_kernel[((mqa_q.numel() + 511) // 512,)](
             mqa_ql_nope,
             mqa_q_pe,
             mla._q_scale,
@@ -704,7 +704,8 @@ def transformer_layer(
             mqa_q_pe.stride(0),
             mqa_q_pe.stride(1),
             mqa_q_pe.stride(2),
-            BLOCK_N=256,
+            BLOCK_N=512,
+            num_warps=8,
         )
 
         # FlashInfer sparse MLA decode.
