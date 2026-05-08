@@ -61,12 +61,48 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
   return static_cast<uint8_t>(key >> 8);
 }
 
-__device__ void naive_topk_cuda(const float* __restrict__ logits,
-                                int32_t* __restrict__ output_indices,
-                                int32_t seq_len) {
+template <bool Physical>
+__device__ __forceinline__ int32_t map_topk_index(
+    int32_t logical_idx, const int32_t* __restrict__ block_table,
+    int64_t block_table_stride0, int64_t block_table_stride1,
+    int32_t block_size, uint64_t batch_idx) {
+  if constexpr (Physical) {
+    if (logical_idx < 0) {
+      return -1;
+    }
+    const int32_t block_id = logical_idx / block_size;
+    const int32_t block_offset = logical_idx - block_id * block_size;
+    const int32_t physical_block =
+        block_table[batch_idx * block_table_stride0 +
+                    block_id * block_table_stride1];
+    return physical_block * block_size + block_offset;
+  } else {
+    return logical_idx;
+  }
+}
+
+template <bool Physical>
+__device__ __forceinline__ void write_topk_index(
+    int32_t* __restrict__ output_indices, int32_t output_pos,
+    int32_t logical_idx, const int32_t* __restrict__ block_table,
+    int64_t block_table_stride0, int64_t block_table_stride1,
+    int32_t block_size, uint64_t batch_idx) {
+  output_indices[output_pos] = map_topk_index<Physical>(
+      logical_idx, block_table, block_table_stride0, block_table_stride1,
+      block_size, batch_idx);
+}
+
+template <bool Physical>
+__device__ void naive_topk_cuda(
+    const float* __restrict__ logits, int32_t* __restrict__ output_indices,
+    int32_t seq_len, const int32_t* __restrict__ block_table = nullptr,
+    int64_t block_table_stride0 = 0, int64_t block_table_stride1 = 0,
+    int32_t block_size = 0, uint64_t batch_idx = 0) {
   const int thread_id = threadIdx.x;
   for (int i = thread_id; i < TopK; i += kThreadsPerBlock) {
-    output_indices[i] = (i < seq_len) ? i : -1;
+    write_topk_index<Physical>(output_indices, i, (i < seq_len) ? i : -1,
+                               block_table, block_table_stride0,
+                               block_table_stride1, block_size, batch_idx);
   }
 }
 
@@ -75,11 +111,15 @@ __device__ void naive_topk_cuda(const float* __restrict__ logits,
 // by: DarkSharpness
 // which at the same time is an optimized topk kernel copied from tilelang
 // kernel
+template <bool Physical>
 __device__ void fast_topk_cuda_tl(
     const float* __restrict__ logits,  // Input logits [seq_len]
     int* __restrict__ output_indices,  // Output top-k indices [TopK]
     int logits_offset,                 // Starting offset in logits array
-    int seq_len)                       // Number of valid logits to process
+    int seq_len,                       // Number of valid logits to process
+    const int32_t* __restrict__ block_table = nullptr,
+    int64_t block_table_stride0 = 0, int64_t block_table_stride1 = 0,
+    int32_t block_size = 0, uint64_t batch_idx = 0)
 {
   constexpr int RADIX = 256;
   constexpr int MAX_BUFFERED_ITEMS = kSmem / (2 * sizeof(int));
@@ -148,7 +188,9 @@ __device__ void fast_topk_cuda_tl(
       const int bin = convert_to_uint8(logits[idx + logits_offset]);
       if (bin > threshold_bin) {
         const int output_pos = ::atomicAdd(&shared_output_count, 1);
-        output_indices[output_pos] = idx;
+        write_topk_index<Physical>(
+            output_indices, output_pos, idx, block_table, block_table_stride0,
+            block_table_stride1, block_size, batch_idx);
       }
     }
     __syncthreads();
@@ -173,7 +215,9 @@ __device__ void fast_topk_cuda_tl(
     if (bin > threshold_bin) {
       // in top-k, write to output
       const int output_pos = ::atomicAdd(&shared_output_count, 1);
-      output_indices[output_pos] = idx;
+      write_topk_index<Physical>(
+          output_indices, output_pos, idx, block_table, block_table_stride0,
+          block_table_stride1, block_size, batch_idx);
     } else if (bin == threshold_bin) {
       // Candidate for top-k, needs refinement
       const int buffer_pos = ::atomicAdd(&shared_buffered_count[0], 1);
@@ -231,7 +275,9 @@ __device__ void fast_topk_cuda_tl(
         const int bin = (fp32_bits >> bit_offset) & 0xFF;
         if (bin > threshold_bin) {
           const int output_pos = ::atomicAdd(&shared_output_count, 1);
-          output_indices[output_pos] = idx;
+          write_topk_index<Physical>(
+              output_indices, output_pos, idx, block_table,
+              block_table_stride0, block_table_stride1, block_size, batch_idx);
         }
       }
       __syncthreads();
@@ -254,14 +300,19 @@ __device__ void fast_topk_cuda_tl(
       if (bin > threshold_bin) {
         // Definitely in top-k
         const int output_pos = ::atomicAdd(&shared_output_count, 1);
-        output_indices[output_pos] = idx;
+        write_topk_index<Physical>(
+            output_indices, output_pos, idx, block_table, block_table_stride0,
+            block_table_stride1, block_size, batch_idx);
       } else if (bin == threshold_bin) {
         if (pass == 3) {
           // Final pass (bits [7:0]): No more refinement possible
           // Fill remaining slots in reverse order to maintain descending order
           const int slot = ::atomicAdd(&shared_final_k, -1);
           if (slot > 0) {
-            output_indices[TopK - slot] = idx;
+            write_topk_index<Physical>(
+                output_indices, TopK - slot, idx, block_table,
+                block_table_stride0, block_table_stride1, block_size,
+                batch_idx);
           }
         } else {
           // Buffer for next pass and build next histogram
@@ -292,9 +343,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_kernel(
 
   if (seq_len <= TopK) {
     // Shortcut: All elements are in top-k
-    return naive_topk_cuda(logits, output_indices, seq_len);
+    return naive_topk_cuda<false>(logits, output_indices, seq_len);
   } else {
-    return fast_topk_cuda_tl(logits, output_indices, logits_offset, seq_len);
+    return fast_topk_cuda_tl<false>(logits, output_indices, logits_offset,
+                                    seq_len);
   }
 }
 
@@ -308,25 +360,20 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   const float* logits = input + batch_idx * input_stride;
 
   if (seq_len <= TopK) {
-    naive_topk_cuda(logits, output_indices, seq_len);
+    naive_topk_cuda<true>(logits, output_indices, seq_len, params.block_table,
+                          params.block_table_stride0,
+                          params.block_table_stride1, params.block_size,
+                          batch_idx);
   } else {
-    fast_topk_cuda_tl(logits, output_indices, logits_offset, seq_len);
+    fast_topk_cuda_tl<true>(
+        logits, output_indices, logits_offset, seq_len, params.block_table,
+        params.block_table_stride0, params.block_table_stride1,
+        params.block_size, batch_idx);
   }
   __syncthreads();
 
   if (threadIdx.x == 0) {
     params.valid_counts[batch_idx] = min(seq_len, TopK);
-  }
-  for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
-    int logical_idx = output_indices[i];
-    if (logical_idx >= 0) {
-      const int block_id = logical_idx / params.block_size;
-      const int block_offset = logical_idx - block_id * params.block_size;
-      const int physical_block =
-          params.block_table[batch_idx * params.block_table_stride0 +
-                             block_id * params.block_table_stride1];
-      output_indices[i] = physical_block * params.block_size + block_offset;
-    }
   }
 }
 
