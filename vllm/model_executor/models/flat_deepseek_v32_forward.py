@@ -273,7 +273,8 @@ def transformer_layer(
         slot_mapping = forward_context.slot_mapping
         assert isinstance(slot_mapping, dict)
         layer_slot_mapping = slot_mapping.get(mla.layer_name)
-    if mla.kv_cache.numel() != 0 and not mla.calculate_kv_scales:
+    assert not mla.calculate_kv_scales
+    if mla.kv_cache.numel() != 0:
         ops.concat_and_cache_mla_rope_fused(
             positions.flatten(),
             q_rot,
@@ -629,17 +630,6 @@ def transformer_layer(
                         indexer.topk_tokens,
                     )
 
-    if mla.calculate_kv_scales:
-        torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, mla.layer_name)
-        if mla.kv_cache.numel() != 0:
-            ops.concat_and_cache_mla(
-                kv_c_normed,
-                k_pe.squeeze(1),
-                mla.kv_cache,
-                layer_slot_mapping.flatten(),
-                kv_cache_dtype=mla.kv_cache_dtype,
-                scale=mla._k_scale,
-            )
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[mla.layer_name]
