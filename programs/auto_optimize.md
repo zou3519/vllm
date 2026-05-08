@@ -13,6 +13,11 @@ BS=1 decode latency (TPIT) for a flat vLLM model.
 Read `flat_config.txt` in the repo root for the serve command, file
 paths, and baseline TPITs (written by `flat_model.md`).
 
+Also read any model-specific optimization summary in the repo root, e.g.
+`flat_<model>_optimization.md`, plus the current `results.tsv` if it exists.
+Treat that history as the source of truth for what already failed, what was
+kept, and what the current best verified TPIT is.
+
 Assume the current shell is already inside the correct conda environment.
 That environment should already have `torch` and `vllm` installed. Do not
 create a virtualenv and do not install packages. Confirm the environment
@@ -38,7 +43,8 @@ To set up:
 3. **Verify the flat no-compile FULL_DECODE_ONLY baseline TPIT** from
    `flat_config.txt` by re-measuring (see Benchmarking below). This loop
    optimizes that flat path, not a torch.compile variant.
-4. **Initialize results.tsv** with just the header row.
+4. **Initialize results.tsv** with just the header row if it does not already
+   exist. If it exists, append to it; do not erase old experiments.
 5. **Confirm and go**: tell the user the flat baseline TPIT, the original
    model TPIT (from `flat_config.txt`), the roofline, and the gap.
    Then start optimizing.
@@ -65,6 +71,12 @@ work. Redirect output to a log file and run in background. Wait for
 stale vLLM server/EngineCore processes from previous runs; after each run, stop
 the server and verify none remain.
 
+Do not change target-defining serve flags while comparing optimizations. In
+particular, keep `--max-num-batched-tokens` exactly as specified by the target
+serve command, even if smaller values look faster. If you intentionally measure
+an off-target serve flag, log it as invalid/off-target and do not count it as
+the best TPIT.
+
 For the auto-optimize target, torch.compile must be disabled while full decode
 CUDA graphs remain enabled. The startup log must show
 `CompilationMode.NONE` and `CUDAGraphMode.FULL_DECODE_ONLY` (or equivalent
@@ -85,6 +97,12 @@ metric count:
 5. Check that `delta_count == num_requests * (generated_tokens_per_request - 1)`.
    If it does not, an engine output event may contain multiple token IDs; do
    not report the histogram mean as TPIT without explaining the mismatch.
+
+For context, periodically benchmark the regular non-flat model with the normal
+vLLM torch.compile path using the same prompt, token count, stream interval, and
+Prometheus count validation. This comparison answers whether the flat path is
+actually better than the production compiled path, not just better than an
+earlier flat baseline.
 
 This measures engine-core inter-token latency. It is the right signal for
 kernel/runtime optimization when the count validation passes, but it is not
@@ -119,6 +137,13 @@ broke precision — revert.
 - Write benchmarking scripts
 - Search the internet for state-of-the-art kernel implementations,
   optimization techniques, and relevant papers
+- Specialize on BS=1 when the target is explicitly BS=1 decode. BS=1-only
+  branches, fixed top-k kernels, capture-size-1 assumptions, and specialized
+  routing/finalize layouts are allowed if the generic path still works or the
+  specialization is guarded by shape checks.
+- Change internal weight/layout formats for performance if the flat loader or
+  cached params can produce the new layout once, correctness is preserved, and
+  the target serve command still loads the same checkpoint.
 - Inline backend wrappers further when they hide concrete pointwise,
   reduction, routing, quantization, or allocation work. For example, a method
   named `forward_cuda` may still be Python orchestration; inspect until you
@@ -140,8 +165,10 @@ above 70% is good.
 
 ## Logging results
 
-Log every experiment to `results.tsv` (tab-separated). Do NOT commit
-this file — leave it untracked.
+Log every experiment to `results.tsv` (tab-separated). During the optimization
+loop, append results immediately so the process can be killed without losing
+measurements. Keep it uncommitted while iterating unless the user asks for a
+snapshot or you are explicitly wrapping up a documented optimization phase.
 
 ```
 commit	tpit_ms	status	description
@@ -173,7 +200,9 @@ LOOP FOREVER:
 6. **Measure TPIT** (3-5 runs).
 7. **Log** the result to results.tsv.
 8. If TPIT improved AND quality is preserved: **keep** the commit.
-9. If TPIT regressed OR quality degraded: **revert** (`git reset --hard HEAD~1`).
+9. If TPIT regressed OR quality degraded: **revert with `git revert`** so the
+   failed experiment remains visible in history. Avoid destructive reset unless
+   the human explicitly asks for it.
 10. Go to 1.
 
 ## Optimization ideas (roughly ordered by impact)
@@ -189,6 +218,12 @@ For BS=1, the GEMM is really a matrix-vector multiply. A custom GEMV
 kernel can beat CUTLASS when K is large (the GEMV streams weights from
 HBM with better cache utilization than tensor cores at M=1).
 
+For quantized MoE, this is only true if the custom path still uses the right
+math primitive. Scalar BF16xMXFP4 dequant-FMA GEMV prototypes were much slower
+than FlashInfer TRTLLM tensor-core MoE. A serious MoE replacement should use
+tensor-core/blockscaled GEMM primitives, CuTe/CUTLASS-style MMA, or a proven
+low-latency MoE kernel, not one threadblock doing scalar dot products per row.
+
 ### BF16-input GEMV (skip activation quantize)
 Instead of quantize → FP4 GEMV, feed BF16 activations directly to a GEMV
 that only dequantizes the weights. Eliminates a kernel launch and avoids
@@ -199,6 +234,23 @@ the 4× larger read is negligible vs weight reads.
 Allocate intermediate tensors once and reuse across layers. This reduces
 allocation and Python/runtime overhead in the no-compile flat path, and can
 reduce capture-time allocations for full decode CUDA graphs.
+
+Preallocation is a hypothesis, not a guaranteed win. Reusing MoE outputs,
+letting FlashInfer allocate padded output, and persistent decode MoE output
+buffers all regressed in prior GPT-OSS experiments. Benchmark every allocation
+change instead of assuming it helps.
+
+### Fuse pointwise/reduction work around heavyweight kernels
+Low-latency decode usually wants fewer launches. Look for pointwise and
+reduction work adjacent to a heavyweight kernel and either fuse it into an
+existing custom kernel or into a new adjacent kernel. Good candidates include
+RMSNorm, residual add, activation quantization, top-k packing, routing-weight
+application, final reduction, RoPE, and KV-cache writes. KV-cache writes can
+often be fused into surrounding RoPE/QKV handling.
+
+If an existing backend kernel already fuses the work internally, do not split it
+out unless you have a concrete replacement. The FlashInfer native MoE finalizer
+beat a custom Triton `do_finalize=False` top-k finalizer in prior GPT-OSS work.
 
 ## Gotchas from prior work
 
@@ -214,6 +266,16 @@ These bugs wasted hours. Watch for them:
   projections whose output enters the residual stream (e.g. O projection,
   down projection). QKV and Gate+Up feed through attention which amplifies
   the error.
+
+- **MoE scalar GEMV is not near-optimal**: for GPT-OSS MXFP4/MXFP8, raw CUDA
+  scalar dequant-FMA MoE kernels were 15-22ms TPIT, far slower than FlashInfer.
+  If replacing MoE, keep tensor-core blockscaled math and specialize on the
+  actual shape (BS=1, top-k=4, padded dimensions) instead of writing a generic
+  scalar GEMV.
+
+- **GPT-OSS w13 row layout is interleaved**: gate/up rows are paired as
+  `2*i` and `2*i+1`; do not assume half-split gate then up rows when writing
+  custom kernels.
 
 - **Triton constexpr divergence**: the same Triton kernel compiled with
   different `tl.constexpr` values produces subtly different floating-point
@@ -251,10 +313,24 @@ These bugs wasted hours. Watch for them:
   or Python-side tensor value checks to the forward path unless the diagnostic
   is temporary and removed before committing.
 
+- **Keep FULL_DECODE_ONLY even with torch.compile off**: the target is
+  `CompilationMode.NONE` plus `CUDAGraphMode.FULL_DECODE_ONLY`, not eager-only
+  execution. The full decode graph usually matters more than small Python
+  cleanups.
+
 - **Backend selection is part of the benchmark**: environment variables such
   as MoE backend selectors can materially change the op sequence. Assert or
   log the selected attention/MoE backend and specialize only for the backend
   used by the target serve command.
+
+- **FlashInfer autotune/cache matters**: disabling FlashInfer autotune or
+  forcing alternative cached tactics can regress. Log cache/tactic experiments
+  separately. If an autotune cache miss happens because a shape changed, wait
+  for startup tuning to complete before benchmarking.
+
+- **PDL can matter**: for FlashInfer TRTLLM MoE on GPT-OSS, disabling PDL
+  quality-passed but regressed TPIT. Leave PDL enabled unless the experiment is
+  specifically testing it.
 
 - **CUDA device mismatch**: when running standalone kernel benchmarks,
   use `CUDA_VISIBLE_DEVICES=<gpu>` to match the server's device. Using

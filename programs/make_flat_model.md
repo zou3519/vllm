@@ -18,6 +18,11 @@ optimization runs, also use `--max-cudagraph-capture-size 1`; larger capture
 sizes only slow down setup for that target. Prefill and mixed prefill/decode
 behavior still need to be preserved by the flat model.
 
+If the user's serve command includes throughput/capacity flags such as
+`--max-num-batched-tokens`, keep them fixed when comparing flat-vs-original or
+later optimization results. Changing those flags changes the target and can
+make off-target results look better.
+
 ## Setup
 
 The user will give you a `vllm serve` command, e.g.:
@@ -99,6 +104,18 @@ backends, or calls another wrapper before reaching the real kernel, inline that
 body until `transformer_layer()` shows the concrete PyTorch ops and concrete
 CUDA/custom ops that actually run for the target serve command.
 
+Record backend selectors that are required for the chosen path. For example,
+GPT-OSS MXFP4/MXFP8 needs `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1` to select
+the intended FlashInfer TRTLLM MoE path. The flat serve command in
+`flat_config.txt` should include these environment variables, not rely on
+ambient shell state.
+
+For MoE models, capture the exact loaded layout and padded dimensions in the
+flat parameter cache or summary notes. GPT-OSS `w13` gate/up rows are
+interleaved pairs (`2*i`, `2*i+1`), and FlashInfer TRTLLM pads the relevant
+dimensions to kernel-friendly sizes. These details matter for later BS=1
+custom kernels and prevent wrong half-split assumptions.
+
 Make the KV-cache write explicit in the flat definition. Prefer a torch-native
 cache update specialized to the active attention backend/cache layout/hardware,
 then call vLLM's attention op directly, ideally
@@ -113,6 +130,11 @@ graphs. For BS=1 decode-only optimization, set
 `--max-cudagraph-capture-size 1`. If the log says cudagraph mode was overridden
 to `NONE`, treat that as a setup failure and fix the serve command/config before
 benchmarking.
+
+When the user later narrows optimization to BS=1 decode, BS=1-specific branches
+are allowed in the flat forward or kernels if guarded by shape checks. The base
+flat model should still preserve prefill/decode correctness unless the user
+explicitly accepts a decode-only model.
 
 ## The Test Loop
 
@@ -142,7 +164,10 @@ LOOP FOREVER until the flat model produces correct output:
 
 5. **If output is correct**: measure TPIT/TTIT for both the flat model and
    the original (non-flat) model using the user's `vllm serve` command
-   without `--hf-overrides`. TPIT/TTIT means streaming inter-token latency:
+   without `--hf-overrides`. Also measure the regular model in its normal
+   torch.compile configuration unless the user explicitly asks for eager-only
+   comparison; this is the number that says whether the flat path beats
+   production vLLM. TPIT/TTIT means streaming inter-token latency:
    time each generated token arrives after the previous generated token.
    Measure engine-side TPIT by reading `/metrics` before and after a fixed
    workload and using `vllm:inter_token_latency_seconds` only after validating
@@ -168,4 +193,26 @@ LOOP FOREVER until the flat model produces correct output:
    flat_baseline_tpit_ms: <measured>
    tpit_benchmark: <exact metric/workload used>
    ```
-   Commit everything (including `flat_config.txt`), done.
+   Also write or update a concise `flat_<model>_optimization.md` summary if the
+   optimization history has become nontrivial. Include the run command, current
+   flat-vs-regular torch.compile TPIT, fused ops, known failed ideas, and links
+   to the relevant flat files and `results.tsv`.
+
+   Commit everything (including `flat_config.txt` and the summary if created),
+   done.
+
+## Lessons to preserve for the optimizer
+
+- Flat testing normally means `CompilationMode.NONE` plus
+  `CUDAGraphMode.FULL_DECODE_ONLY`, not torch.compile and not eager-only.
+- Capture size 1 is appropriate for BS=1 decode optimization, but target serve
+  flags such as `--max-num-batched-tokens` should remain unchanged.
+- Compare against regular vLLM with torch.compile; flat can improve over its
+  own baseline while still losing to production compiled vLLM.
+- Keep required backend env vars in `flat_config.txt`.
+- Expose pointwise/reduction work in the flat forward. The optimizer needs to
+  see residual add, RMSNorm, quantization, RoPE, KV-cache write, top-k/routing
+  prep, and final reduction boundaries to decide what to fuse.
+- Do not assume custom scalar GEMV is a good MoE replacement. For quantized MoE,
+  future custom kernels should preserve tensor-core/blockscaled math or build
+  directly on a proven low-latency backend.
