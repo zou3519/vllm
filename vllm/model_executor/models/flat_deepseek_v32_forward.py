@@ -211,20 +211,40 @@ def transformer_layer(
 
     # MLA RoPE.
     q = q.view(-1, wrapper.num_heads, wrapper.qk_head_dim)
-    k_pe = k_pe.unsqueeze(1)
     rotary = wrapper.rotary_emb
     q_rot = q[..., wrapper.qk_nope_head_dim :]
     cos_sin_cache = rotary.cos_sin_cache
     if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
         cos_sin_cache = cos_sin_cache.to(q.device, dtype=q.dtype)
-    ops.rotary_embedding(
-        positions.flatten(),
-        q_rot,
-        k_pe,
-        wrapper.qk_rope_head_dim,
-        cos_sin_cache,
-        False,
-    )
+    mla = wrapper.mla_attn
+    layer_slot_mapping = None
+    if mla.kv_cache.numel() != 0:
+        slot_mapping = forward_context.slot_mapping
+        assert isinstance(slot_mapping, dict)
+        layer_slot_mapping = slot_mapping.get(mla.layer_name)
+    if mla.kv_cache.numel() != 0 and not mla.calculate_kv_scales:
+        ops.concat_and_cache_mla_rope_fused(
+            positions.flatten(),
+            q_rot,
+            k_pe,
+            kv_c_normed,
+            cos_sin_cache,
+            False,
+            layer_slot_mapping.flatten(),
+            mla.kv_cache,
+            mla.kv_cache_dtype,
+            mla._k_scale,
+        )
+    else:
+        k_pe = k_pe.unsqueeze(1)
+        ops.rotary_embedding(
+            positions.flatten(),
+            q_rot,
+            k_pe,
+            wrapper.qk_rope_head_dim,
+            cos_sin_cache,
+            False,
+        )
 
     # Sparse indexer q projection.
     if wrapper.indexer and wrapper.is_sparse:
@@ -548,25 +568,20 @@ def transformer_layer(
                         indexer.topk_tokens,
                     )
 
-    # MLA KV-cache write.
-    mla = wrapper.mla_attn
     if mla.calculate_kv_scales:
         torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, mla.layer_name)
+        if mla.kv_cache.numel() != 0:
+            ops.concat_and_cache_mla(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                mla.kv_cache,
+                layer_slot_mapping.flatten(),
+                kv_cache_dtype=mla.kv_cache_dtype,
+                scale=mla._k_scale,
+            )
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[mla.layer_name]
-    slot_mapping = forward_context.slot_mapping
-    assert isinstance(slot_mapping, dict)
-    if mla.kv_cache.numel() != 0:
-        layer_slot_mapping = slot_mapping.get(mla.layer_name)
-        ops.concat_and_cache_mla(
-            kv_c_normed,
-            k_pe.squeeze(1),
-            mla.kv_cache,
-            layer_slot_mapping.flatten(),
-            kv_cache_dtype=mla.kv_cache_dtype,
-            scale=mla._k_scale,
-        )
 
     output_shape = (hidden_states.shape[0], wrapper.num_heads * wrapper.v_head_dim)
     attn_output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
