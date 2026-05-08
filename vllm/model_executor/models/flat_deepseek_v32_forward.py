@@ -25,7 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_q_rope_quant_weights_kernel,
     _mla_qkv_a_rmsnorm_kernel,
     _mla_decode_q_project_concat_quant_fp8_kernel,
-    triton_convert_req_index_to_global_index,
+    _convert_req_index_to_global_index_kernel,
 )
 
 
@@ -690,14 +690,30 @@ def transformer_layer(
         req_id = attn_metadata.req_id_per_token[:num_actual_toks]
         block_table = attn_metadata.block_table
         block_size = attn_metadata.block_size
-        topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
+        topk_indices_physical = torch.empty_like(topk_indices)
+        seq_lens = torch.empty(
+            req_id.shape[0], dtype=torch.int32, device=topk_indices.device
+        )
+        _convert_req_index_to_global_index_kernel[(req_id.shape[0], 1)](
             req_id,
             block_table,
             topk_indices,
-            BLOCK_SIZE=block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            BLOCK_N=topk_indices.shape[1],
-            return_valid_counts=True,
+            topk_indices_physical,
+            seq_lens,
+            None,
+            None,
+            block_table.shape[1],
+            block_size,
+            topk_indices.shape[1],
+            False,
+            True,
+            True,
+            block_table.stride(0),
+            block_table.stride(1),
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            topk_indices_physical.stride(0),
+            topk_indices_physical.stride(1),
         )
         if impl._workspace_buffer is None:
             if _fi_sparse_workspace is None:
