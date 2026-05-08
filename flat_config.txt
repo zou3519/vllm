@@ -1,0 +1,7 @@
+serve_cmd: VLLM_USE_FLASHINFER_MOE_FP4=1 vllm serve nvidia/DeepSeek-V3.2-NVFP4 --trust-remote-code --kernel-config.enable_flashinfer_autotune=False --kv-cache-dtype fp8 --tensor-parallel-size 4 --attention-backend FLASHINFER_MLA_SPARSE --tokenizer-mode deepseek_v32 --tool-call-parser deepseek_v32 --enable-auto-tool-choice --reasoning-parser deepseek_v3
+flat_serve_cmd: VLLM_USE_FLASHINFER_MOE_FP4=1 vllm serve nvidia/DeepSeek-V3.2-NVFP4 --trust-remote-code --kernel-config.enable_flashinfer_autotune=False --kv-cache-dtype fp8 --tensor-parallel-size 4 --attention-backend FLASHINFER_MLA_SPARSE --tokenizer-mode deepseek_v32 --tool-call-parser deepseek_v32 --enable-auto-tool-choice --reasoning-parser deepseek_v3 -cc.mode=none -cc.cudagraph_mode=full_decode_only --hf-overrides '{"architectures": ["FlatDeepseekV32ForCausalLM"]}'
+forward_file: vllm/model_executor/models/flat_deepseek_v32_forward.py
+model_file: vllm/model_executor/models/flat_deepseek_v32.py
+original_tpit_ms: not_measured
+flat_baseline_tpit_ms: not_measured
+tpit_benchmark: not_run
