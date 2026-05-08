@@ -32,7 +32,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _fi_sparse_workspace: torch.Tensor | None = None
 _FI_AR_RESIDUAL_RMS_NORM_PATTERN = 1
-_FI_AR_RESIDUAL_RMS_NORM_FP4_QUANT_PATTERN = 3
 _FI_AR_MAX_TOKEN_NUM = 4681
 
 
@@ -808,67 +807,22 @@ def transformer_layer(
         hidden_states = F.linear(input_parallel, o_proj.weight, bias)
     # Post-attention TP all-reduce fused with residual add and RMSNorm.
     norm = layer.post_attention_layernorm
-    shared_gate_up_x_fp4 = None
-    shared_gate_up_x_blockscale = None
-    shared_gate_up_uses_quant_norm = False
-    if isinstance(layer.mlp, DeepseekV2MoE) and layer.mlp.shared_experts is not None:
-        gate_up_proj_for_norm = layer.mlp.shared_experts.gate_up_proj
-        shared_gate_up_uses_quant_norm = (
-            o_proj.reduce_results
-            and o_proj.tp_size > 1
-            and hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM
-            and hasattr(gate_up_proj_for_norm, "weight_global_scale")
-            and hasattr(gate_up_proj_for_norm, "input_global_scale_inv")
-            and gate_up_proj_for_norm.weights_padding_cols == 0
-            and gate_up_proj_for_norm.input_global_scale_inv.numel() == 1
-        )
-        if shared_gate_up_uses_quant_norm:
-            shared_gate_up_x_fp4 = torch.empty(
-                (hidden_states.shape[0], hidden_states.shape[1] // 2),
-                dtype=torch.uint8,
-                device=hidden_states.device,
-            )
-            shared_gate_up_x_blockscale = torch.empty(
-                (
-                    ((hidden_states.shape[0] + 127) // 128) * 128,
-                    ((hidden_states.shape[1] // 16 + 3) // 4),
-                ),
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
     if (
         o_proj.reduce_results
         and o_proj.tp_size > 1
         and hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM
     ):
-        if shared_gate_up_uses_quant_norm:
-            torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
-                hidden_states,
-                residual,
-                norm.weight.data,
-                norm.variance_epsilon,
-                o_proj.tp_size,
-                True,
-                True,
-                _FI_AR_MAX_TOKEN_NUM,
-                _FI_AR_RESIDUAL_RMS_NORM_FP4_QUANT_PATTERN,
-                None,
-                shared_gate_up_x_fp4,
-                shared_gate_up_x_blockscale,
-                gate_up_proj_for_norm.input_global_scale_inv,
-            )
-        else:
-            torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
-                hidden_states,
-                residual,
-                norm.weight.data,
-                norm.variance_epsilon,
-                o_proj.tp_size,
-                True,
-                True,
-                _FI_AR_MAX_TOKEN_NUM,
-                _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
-            )
+        torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+            o_proj.tp_size,
+            True,
+            True,
+            _FI_AR_MAX_TOKEN_NUM,
+            _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
+        )
     else:
         if o_proj.reduce_results and o_proj.tp_size > 1:
             hidden_states = torch.ops.vllm.all_reduce(
@@ -900,20 +854,16 @@ def transformer_layer(
                     *hidden_states.shape[:-1],
                     gate_up_proj.output_size_per_partition,
                 ]
-                if shared_gate_up_x_fp4 is not None:
-                    x_fp4 = shared_gate_up_x_fp4
-                    x_blockscale = shared_gate_up_x_blockscale
-                else:
-                    x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                        hidden_states,
-                        gate_up_proj.input_global_scale_inv,
-                        is_sf_swizzled_layout=True,
-                        backend=gate_up_proj.quant_method.backend.value,
-                    )
-                    if gate_up_proj.weights_padding_cols > 0:
-                        x_fp4 = F.pad(
-                            x_fp4, (0, gate_up_proj.weights_padding_cols)
-                        ).contiguous()
+                x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                    hidden_states,
+                    gate_up_proj.input_global_scale_inv,
+                    is_sf_swizzled_layout=True,
+                    backend=gate_up_proj.quant_method.backend.value,
+                )
+                if gate_up_proj.weights_padding_cols > 0:
+                    x_fp4 = F.pad(
+                        x_fp4, (0, gate_up_proj.weights_padding_cols)
+                    ).contiguous()
                 backend_name = gate_up_proj.quant_method.backend.value[
                     len("flashinfer-") :
                 ]
@@ -924,11 +874,7 @@ def transformer_layer(
                     gate_up_proj.weight_scale.view(torch.uint8).t(),
                     gate_up_proj.alpha,
                     hidden_states.dtype,
-                    (
-                        backend_name == "trtllm"
-                        and x_fp4.shape[0] <= 32
-                        and shared_gate_up_x_fp4 is None
-                    ),
+                    backend_name == "trtllm" and x_fp4.shape[0] <= 32,
                     backend_name,
                 )
                 if gate_up.shape[-1] != gate_up_proj.output_size_per_partition:
