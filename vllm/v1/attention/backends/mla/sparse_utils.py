@@ -9,6 +9,21 @@ from vllm.triton_utils import tl, triton
 
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
+def _scale_add_inplace_kernel(
+    out_ptr,
+    add_ptr,
+    total_elems,
+    FACTOR: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < total_elems
+    out_vals = tl.load(out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    add_vals = tl.load(add_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + offsets, out_vals * FACTOR + add_vals, mask=mask)
+
+
+@triton.jit
 def _mla_decode_q_concat_kernel(
     nope_ptr,  # [batch, heads, lora_rank]
     rope_ptr,  # [batch, heads, rope_dim]

@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
     _indexer_layer_norm_kernel,
     _mla_decode_q_concat_kernel,
+    _scale_add_inplace_kernel,
     _scale_index_weights_kernel,
     triton_convert_req_index_to_global_index,
 )
@@ -1023,10 +1024,14 @@ def transformer_layer(
         )[0]
 
         if shared_output is not None:
-            final_hidden_states = torch.add(
-                shared_output,
+            _scale_add_inplace_kernel[
+                ((final_hidden_states.numel() + 255) // 256,)
+            ](
                 final_hidden_states,
-                alpha=moe.routed_scaling_factor,
+                shared_output,
+                final_hidden_states.numel(),
+                FACTOR=moe.routed_scaling_factor,
+                BLOCK_N=256,
             )
         else:
             final_hidden_states *= moe.routed_scaling_factor
