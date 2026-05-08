@@ -711,7 +711,7 @@ def transformer_layer(
             mla.W_UK_T.stride(0),
             mla.W_UK_T.stride(1),
             mla.W_UK_T.stride(2),
-            BLOCK_N=64,
+            BLOCK_N=32,
             BLOCK_K=128,
         )
 
