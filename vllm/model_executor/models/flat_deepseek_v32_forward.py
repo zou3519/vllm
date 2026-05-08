@@ -23,8 +23,9 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_qk_rope_quant_cache_kernel,
     _index_q_rope_quant_weights_kernel,
+    _mla_decode_q_project_rope_concat_quant_fp8_kernel,
     _mla_qkv_a_rmsnorm_kernel,
-    _mla_decode_q_project_concat_quant_fp8_kernel,
+    _mla_k_rope_cache_fp8_kernel,
     triton_convert_req_index_to_global_index,
 )
 
@@ -267,6 +268,7 @@ def transformer_layer(
             cached_cos_sin = cos_sin_cache.to(q.device, dtype=q.dtype)
             rotary._flat_cos_sin_cache = cached_cos_sin
         cos_sin_cache = cached_cos_sin
+    mla_cos_sin_cache = cos_sin_cache
     mla = wrapper.mla_attn
     layer_slot_mapping = None
     if mla.kv_cache.numel() != 0:
@@ -275,17 +277,27 @@ def transformer_layer(
         layer_slot_mapping = slot_mapping.get(mla.layer_name)
     assert not mla.calculate_kv_scales
     if mla.kv_cache.numel() != 0:
-        ops.concat_and_cache_mla_rope_fused(
-            positions.flatten(),
-            q_rot,
+        _mla_k_rope_cache_fp8_kernel[
+            (kv_c_normed.shape[0],)
+        ](
             k_pe,
             kv_c_normed,
-            cos_sin_cache,
-            False,
+            positions.flatten(),
+            mla_cos_sin_cache,
             layer_slot_mapping.flatten(),
-            mla.kv_cache,
-            mla.kv_cache_dtype,
+            mla.kv_cache.view(torch.float8_e4m3fn),
             mla._k_scale,
+            kv_c_normed.shape[0],
+            wrapper.qk_rope_head_dim,
+            wrapper.kv_lora_rank,
+            k_pe.stride(0),
+            k_pe.stride(1),
+            kv_c_normed.stride(0),
+            kv_c_normed.stride(1),
+            mla.kv_cache.shape[1],
+            mla.kv_cache.shape[2],
+            BLOCK_N=1024,
+            num_warps=8,
         )
     else:
         k_pe = k_pe.unsqueeze(1)
@@ -674,7 +686,7 @@ def transformer_layer(
             device=q.device,
             dtype=torch.float8_e4m3fn,
         )
-        _mla_decode_q_project_concat_quant_fp8_kernel[
+        _mla_decode_q_project_rope_concat_quant_fp8_kernel[
             (
                 q.shape[0],
                 q.shape[1],
@@ -683,6 +695,8 @@ def transformer_layer(
         ](
             q,
             mla.W_UK_T,
+            positions.flatten(),
+            mla_cos_sin_cache,
             mla._q_scale,
             mqa_q,
             q.shape[1],
