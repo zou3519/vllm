@@ -21,7 +21,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
-    _index_k_norm_rope_cache_kernel,
+    _index_qk_rope_quant_cache_kernel,
     _index_q_rope_quant_weights_kernel,
     _mla_qkv_a_rmsnorm_kernel,
     _mla_decode_q_project_concat_quant_fp8_kernel,
@@ -444,7 +444,7 @@ def transformer_layer(
                 rotary._flat_cos_sin_cache = cached_cos_sin
             cos_sin_cache = cached_cos_sin
 
-        # Sparse indexer fused q RoPE, fp8 quantization, and weight scaling.
+        # Sparse indexer q/k prep outputs.
         q_fp8 = torch.empty(
             index_q.shape,
             device=index_q.device,
@@ -456,37 +456,37 @@ def transformer_layer(
             dtype=torch.float32,
         )
         assert indexer.head_dim <= 128
-        _index_q_rope_quant_weights_kernel[
-            (index_q.shape[0], index_q.shape[1])
-        ](
-            index_q,
-            positions.flatten(),
-            cos_sin_cache,
-            index_weights,
-            q_fp8,
-            scaled_index_weights,
-            index_q.shape[1],
-            index_q.shape[2],
-            indexer.rope_dim,
-            index_q.stride(0),
-            index_q.stride(1),
-            index_q.stride(2),
-            index_weights.stride(0),
-            index_weights.stride(1),
-            q_fp8.stride(0),
-            q_fp8.stride(1),
-            q_fp8.stride(2),
-            scaled_index_weights.stride(0),
-            scaled_index_weights.stride(1),
-            FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
-            BLOCK_N=128,
-        )
-        index_weights = scaled_index_weights
 
         # Sparse indexer: profile allocation path.
         attn_metadata = forward_context.attn_metadata
         fp8_dtype = torch.float8_e4m3fn
         if not isinstance(attn_metadata, dict):
+            _index_q_rope_quant_weights_kernel[
+                (index_q.shape[0], index_q.shape[1])
+            ](
+                index_q,
+                positions.flatten(),
+                cos_sin_cache,
+                index_weights,
+                q_fp8,
+                scaled_index_weights,
+                index_q.shape[1],
+                index_q.shape[2],
+                indexer.rope_dim,
+                index_q.stride(0),
+                index_q.stride(1),
+                index_q.stride(2),
+                index_weights.stride(0),
+                index_weights.stride(1),
+                q_fp8.stride(0),
+                q_fp8.stride(1),
+                q_fp8.stride(2),
+                scaled_index_weights.stride(0),
+                scaled_index_weights.stride(1),
+                FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
+                BLOCK_N=128,
+            )
+            index_weights = scaled_index_weights
             _ = torch.empty(
                 (indexer.max_total_seq_len, indexer.head_dim),
                 dtype=torch.float8_e4m3fn,
@@ -510,26 +510,44 @@ def transformer_layer(
             has_prefill = index_metadata.num_prefills > 0
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
-            assert indexer.head_dim <= 128
-            _index_k_norm_rope_cache_kernel[(index_k.shape[0],)](
+            _index_qk_rope_quant_cache_kernel[
+                (index_q.shape[0], index_q.shape[1] + 1)
+            ](
+                index_q,
                 index_k,
                 positions.flatten(),
                 cos_sin_cache,
+                index_weights,
+                q_fp8,
+                scaled_index_weights,
                 indexer.k_norm.weight,
                 indexer.k_norm.bias,
                 slot_mapping,
                 indexer.k_cache.kv_cache.view(torch.float8_e4m3fn),
                 indexer.k_cache.kv_cache.view(torch.float32),
                 index_k.shape[0],
+                index_q.shape[1],
                 indexer.head_dim,
                 indexer.rope_dim,
+                index_q.stride(0),
+                index_q.stride(1),
+                index_q.stride(2),
                 index_k.stride(0),
                 index_k.stride(1),
+                index_weights.stride(0),
+                index_weights.stride(1),
+                q_fp8.stride(0),
+                q_fp8.stride(1),
+                q_fp8.stride(2),
+                scaled_index_weights.stride(0),
+                scaled_index_weights.stride(1),
                 indexer.k_cache.kv_cache.shape[1],
                 indexer.k_cache.kv_cache.shape[2],
                 EPS=indexer.k_norm.eps,
+                FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
                 BLOCK_N=128,
             )
+            index_weights = scaled_index_weights
             topk_indices_buffer = indexer.topk_indices_buffer
 
             # Sparse indexer: prefill MQA logits and per-row top-k.
