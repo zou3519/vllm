@@ -258,7 +258,15 @@ def transformer_layer(
     q_rot = q[..., wrapper.qk_nope_head_dim :]
     cos_sin_cache = rotary.cos_sin_cache
     if cos_sin_cache.device != q.device or cos_sin_cache.dtype != q.dtype:
-        cos_sin_cache = cos_sin_cache.to(q.device, dtype=q.dtype)
+        cached_cos_sin = getattr(rotary, "_flat_cos_sin_cache", None)
+        if (
+            cached_cos_sin is None
+            or cached_cos_sin.device != q.device
+            or cached_cos_sin.dtype != q.dtype
+        ):
+            cached_cos_sin = cos_sin_cache.to(q.device, dtype=q.dtype)
+            rotary._flat_cos_sin_cache = cached_cos_sin
+        cos_sin_cache = cached_cos_sin
     mla = wrapper.mla_attn
     layer_slot_mapping = None
     if mla.kv_cache.numel() != 0:
@@ -425,7 +433,15 @@ def transformer_layer(
             cos_sin_cache.device != index_q.device
             or cos_sin_cache.dtype != index_q.dtype
         ):
-            cos_sin_cache = cos_sin_cache.to(index_q.device, dtype=index_q.dtype)
+            cached_cos_sin = getattr(rotary, "_flat_cos_sin_cache", None)
+            if (
+                cached_cos_sin is None
+                or cached_cos_sin.device != index_q.device
+                or cached_cos_sin.dtype != index_q.dtype
+            ):
+                cached_cos_sin = cos_sin_cache.to(index_q.device, dtype=index_q.dtype)
+                rotary._flat_cos_sin_cache = cached_cos_sin
+            cos_sin_cache = cached_cos_sin
 
         # Sparse indexer fused q RoPE, fp8 quantization, and weight scaling.
         q_fp8 = torch.empty(
