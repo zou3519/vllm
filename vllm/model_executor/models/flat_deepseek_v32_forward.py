@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_k_norm_rope_cache_kernel,
     _index_q_rope_quant_weights_kernel,
+    _mla_qkv_a_rmsnorm_kernel,
     _mla_decode_q_concat_quant_fp8_kernel,
     triton_convert_req_index_to_global_index,
 )
@@ -133,21 +134,38 @@ def transformer_layer(
         else:
             qkv_lora = F.linear(hidden_states, fused_qkv_a_proj.weight, bias)
 
-    q_c, kv_lora = qkv_lora.split(
-        [wrapper.q_lora_rank, wrapper.kv_lora_rank + wrapper.qk_rope_head_dim],
-        dim=-1,
+    q_c = torch.empty(
+        (*qkv_lora.shape[:-1], wrapper.q_lora_rank),
+        dtype=qkv_lora.dtype,
+        device=qkv_lora.device,
     )
-
-    # q_a RMSNorm.
-    norm = wrapper.q_a_layernorm
-    q_c_normed = torch.empty_like(q_c)
-    ops.rms_norm(
-        q_c_normed,
+    kv_c_normed = torch.empty(
+        (*qkv_lora.shape[:-1], wrapper.kv_lora_rank),
+        dtype=qkv_lora.dtype,
+        device=qkv_lora.device,
+    )
+    assert wrapper.q_lora_rank <= 2048 and wrapper.kv_lora_rank <= 2048
+    assert (
+        wrapper.q_a_layernorm.variance_epsilon
+        == wrapper.kv_a_layernorm.variance_epsilon
+    )
+    _mla_qkv_a_rmsnorm_kernel[(qkv_lora.shape[0], 2)](
+        qkv_lora,
+        wrapper.q_a_layernorm.weight.data,
+        wrapper.kv_a_layernorm.weight.data,
         q_c,
-        norm.weight.data,
-        norm.variance_epsilon,
+        kv_c_normed,
+        wrapper.q_lora_rank,
+        wrapper.kv_lora_rank,
+        qkv_lora.stride(0),
+        qkv_lora.stride(1),
+        q_c.stride(0),
+        q_c.stride(1),
+        kv_c_normed.stride(0),
+        kv_c_normed.stride(1),
+        EPS=wrapper.q_a_layernorm.variance_epsilon,
+        BLOCK_N=2048,
     )
-    q_c = q_c_normed
 
     # q_b projection.
     q_b_proj = wrapper.q_b_proj
@@ -187,18 +205,9 @@ def transformer_layer(
         torch.distributed.all_gather(gathered_q, q)
         q = torch.cat(gathered_q, dim=-1)
 
-    # kv_a RMSNorm.
-    kv_c, k_pe = kv_lora.split(
-        [wrapper.kv_lora_rank, wrapper.qk_rope_head_dim], dim=-1
-    )
-    norm = wrapper.kv_a_layernorm
-    kv_c_normed = torch.empty_like(kv_c)
-    ops.rms_norm(
-        kv_c_normed,
-        kv_c,
-        norm.weight.data,
-        norm.variance_epsilon,
-    )
+    k_pe = qkv_lora[
+        ..., wrapper.q_lora_rank + wrapper.kv_lora_rank :
+    ]
 
     # MLA RoPE.
     q = q.view(-1, wrapper.num_heads, wrapper.qk_head_dim)

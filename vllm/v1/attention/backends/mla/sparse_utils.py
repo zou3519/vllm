@@ -211,6 +211,54 @@ def _index_q_rope_quant_weights_kernel(
 
 
 @triton.jit
+def _mla_qkv_a_rmsnorm_kernel(
+    qkv_ptr,  # [num_tokens, q_rank + kv_rank + rope_dim]
+    q_weight_ptr,  # [q_rank]
+    kv_weight_ptr,  # [kv_rank]
+    q_out_ptr,  # [num_tokens, q_rank]
+    kv_out_ptr,  # [num_tokens, kv_rank]
+    q_rank: tl.constexpr,
+    kv_rank: tl.constexpr,
+    qkv_stride0,
+    qkv_stride1,
+    q_out_stride0,
+    q_out_stride1,
+    kv_out_stride0,
+    kv_out_stride1,
+    EPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    segment = tl.program_id(1)
+    cols = tl.arange(0, BLOCK_N)
+    dim = tl.where(segment == 0, q_rank, kv_rank)
+    mask = cols < dim
+    input_offset = tl.where(segment == 0, 0, q_rank)
+
+    x = tl.load(
+        qkv_ptr + token * qkv_stride0 + (input_offset + cols) * qkv_stride1,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
+    inv_rms = tl.rsqrt(sum_sq / dim + EPS)
+    q_weight = tl.load(q_weight_ptr + cols, mask=mask & (segment == 0), other=0.0)
+    kv_weight = tl.load(kv_weight_ptr + cols, mask=mask & (segment == 1), other=0.0)
+    weight = tl.where(segment == 0, q_weight, kv_weight).to(tl.float32)
+    vals = x * inv_rms * weight
+    tl.store(
+        q_out_ptr + token * q_out_stride0 + cols * q_out_stride1,
+        vals,
+        mask=mask & (segment == 0),
+    )
+    tl.store(
+        kv_out_ptr + token * kv_out_stride0 + cols * kv_out_stride1,
+        vals,
+        mask=mask & (segment == 1),
+    )
+
+
+@triton.jit
 def _mla_decode_q_concat_kernel(
     nope_ptr,  # [batch, heads, lora_rank]
     rope_ptr,  # [batch, heads, rope_dim]
