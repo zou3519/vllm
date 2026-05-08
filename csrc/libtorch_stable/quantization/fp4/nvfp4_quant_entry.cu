@@ -28,14 +28,6 @@ void scaled_fp4_quant_sm1xxa(torch::stable::Tensor const& output,
                              torch::stable::Tensor const& output_sf,
                              torch::stable::Tensor const& input_sf,
                              bool is_sf_swizzled_layout);
-void scaled_fp4_quant_dual_8x4_128x4_sm1xxa(
-    torch::stable::Tensor const& output8x4,
-    torch::stable::Tensor const& input,
-    torch::stable::Tensor const& output_sf8x4,
-    torch::stable::Tensor const& input_sf8x4,
-    torch::stable::Tensor const& output128x4,
-    torch::stable::Tensor const& output_sf128x4,
-    torch::stable::Tensor const& input_sf128x4);
 #endif
 
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
@@ -123,38 +115,6 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> scaled_fp4_quant_func(
   scaled_fp4_quant_out(input, input_sf, is_sf_swizzled_layout, output,
                        output_sf);
   return {output, output_sf};
-}
-
-std::tuple<torch::stable::Tensor, torch::stable::Tensor, torch::stable::Tensor,
-           torch::stable::Tensor>
-scaled_fp4_quant_dual_8x4_128x4_func(
-    torch::stable::Tensor const& input,
-    torch::stable::Tensor const& input_sf8x4,
-    torch::stable::Tensor const& input_sf128x4) {
-  int64_t n = input.size(-1);
-  int64_t m = input.numel() / n;
-  auto device = input.device();
-
-  auto output8x4 = torch::stable::empty(
-      {m, n / 2}, torch::headeronly::ScalarType::Byte, std::nullopt, device);
-  auto [sf8x4_m, sf8x4_n] = vllm::computeSwizzledSFShape8x4(m, n);
-  auto output_sf8x4 =
-      torch::stable::empty({sf8x4_m, sf8x4_n},
-                           torch::headeronly::ScalarType::Byte, std::nullopt,
-                           device);
-
-  auto output128x4 = torch::stable::empty(
-      {m, n / 2}, torch::headeronly::ScalarType::Byte, std::nullopt, device);
-  auto [sf128x4_m, sf128x4_n] = vllm::computeSwizzledSFShape(m, n);
-  auto output_sf128x4 =
-      torch::stable::empty({sf128x4_m, sf128x4_n},
-                           torch::headeronly::ScalarType::Int, std::nullopt,
-                           device);
-
-  scaled_fp4_quant_dual_8x4_128x4_sm1xxa(
-      output8x4, input, output_sf8x4, input_sf8x4, output128x4,
-      output_sf128x4, input_sf128x4);
-  return {output8x4, output_sf8x4, output128x4, output_sf128x4};
 }
 
 void scaled_fp4_experts_quant(

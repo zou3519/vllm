@@ -121,10 +121,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "scaled_fp4_quant(Tensor input,"
       "                 Tensor input_scale, bool "
       "is_sf_swizzled_layout) -> (Tensor, Tensor)");
-  ops.def(
-      "scaled_fp4_quant_dual_8x4_128x4(Tensor input,"
-      " Tensor input_scale_8x4, Tensor input_scale_128x4)"
-      " -> (Tensor, Tensor, Tensor, Tensor)");
 
   // Out variant
   // TODO: Add out_variant tag once PyTorch supports it (added in 2.11)
@@ -232,8 +228,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // FP4/NVFP4 ops
   ops.impl("cutlass_scaled_fp4_mm", TORCH_BOX(&cutlass_scaled_fp4_mm));
   ops.impl("scaled_fp4_quant", TORCH_BOX(&scaled_fp4_quant_func));
-  ops.impl("scaled_fp4_quant_dual_8x4_128x4",
-           TORCH_BOX(&scaled_fp4_quant_dual_8x4_128x4_func));
   ops.impl("scaled_fp4_quant.out", TORCH_BOX(&scaled_fp4_quant_out));
   ops.impl("scaled_fp4_experts_quant", TORCH_BOX(&scaled_fp4_experts_quant));
   ops.impl("silu_and_mul_scaled_fp4_experts_quant",

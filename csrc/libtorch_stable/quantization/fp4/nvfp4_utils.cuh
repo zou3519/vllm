@@ -67,14 +67,6 @@ inline std::pair<int64_t, int64_t> computeSwizzledSFShape(int64_t m,
   return {rounded_m, rounded_n / 4};
 }
 
-inline std::pair<int64_t, int64_t> computeSwizzledSFShape8x4(int64_t m,
-                                                             int64_t n) {
-  int64_t rounded_m = round_up(m, static_cast<int64_t>(8));
-  int64_t scale_n = n / CVT_FP4_SF_VEC_SIZE;
-  int64_t rounded_n = round_up(scale_n, static_cast<int64_t>(4));
-  return {rounded_m, rounded_n};
-}
-
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec8_to_e2m1(float (&array)[8]) {
   uint32_t val;
@@ -203,29 +195,6 @@ __device__ __forceinline__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(
   int64_t SFOffset = (static_cast<int64_t>(mTileIdx) * numKTiles + kTileIdx)
                          << 9 |
                      (outerMIdx << 4) | (innerMIdx << 2) | innerKIdx;
-
-  return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
-}
-
-template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ __forceinline__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset_8x4(
-    int rowIdx, int colIdx, int32_t numKTiles, SFType* SFout) {
-  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 ||
-                CVT_FP4_NUM_THREADS_PER_SF == 2);
-
-  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF != 0) {
-    return nullptr;
-  }
-
-  int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
-  int32_t mTileIdx = rowIdx >> 3;
-  int32_t innerMIdx = rowIdx & 7;
-  int32_t kTileIdx = kIdx >> 2;
-  int32_t innerKIdx = kIdx & 3;
-
-  int64_t SFOffset =
-      ((static_cast<int64_t>(mTileIdx) * numKTiles + kTileIdx) << 5) |
-      (innerMIdx << 2) | innerKIdx;
 
   return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
 }
