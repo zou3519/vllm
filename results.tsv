@@ -1,0 +1,74 @@
+commit	tpit_ms	status	description
+c509963	0.0	crash	wrapped MXFP8 quantize as custom op; MoE FlashInfer JIT still traced during compile
+6ddb97a	0.0	crash	wrapped MXFP8 quantize and MoE as custom ops; compile/cudagraph succeeded, API failed loading Harmony vocab before benchmark
+9a284c6	0.0	discard	defaulted Harmony tiktoken cache; server started but MoE out custom op produced no final content
+27d24e8	0.0	discard	returned explicit MoE output buffer; still ignored FlashInfer returned tensor and produced no final content
+80df95d	0.0	discard	returned FlashInfer MoE result tensor; compiled graph still omitted KV update and produced garbage/empty content
+84c2cc6	2.602140	keep	used unified_kv_cache_update dependency in flat attention; quality passed and 3x512 streaming ITL count matched 1533
+faa8702	2.727527	discard	disabled FlashInfer PDL in flat MXFP8 quantize and MoE; quality passed but TPIT regressed
+3296ed7	5.386773	keep	flat no-compile FULL_DECODE_ONLY baseline after target clarification; quality passed and ITL count matched 1533
+4026d3f	4.165489	keep	used vLLM fused RMSNorm kernels in flat path; quality passed and 3x512 streaming ITL count matched 1533
+b2da818	3.253919	keep	used vLLM fused RoPE kernel in flat path; quality passed and 3x512 streaming ITL count matched 1533
+d5d9ac4	3.069839	keep	used vLLM static FP8 quant op for flat attention query; quality passed and 3x512 streaming ITL count matched 1533
+f2f95be	3.051894	keep	tuned FlashInfer TRTLLM MXFP4 MoE for one decode token; quality passed and 3x512 streaming ITL count matched 1533
+f2f95be+no_pdl	3.179246	discard	disabled FlashInfer PDL under flat no-compile FULL_DECODE_ONLY; quality passed but TPIT regressed
+f2f95be+router_no_to	3.053075	discard	removed explicit router logits bf16 cast around MoE; quality passed but TPIT did not improve
+f2f95be+strided_rope	3.054385	discard	removed contiguous Q/K copies before fused RoPE; quality passed but TPIT did not improve
+f2f95be+flashinfer_rope	0.0	discard	FlashInfer RoPE failed startup because cos_sin_cache must be float32
+f2f95be+flat_rope_cache	2.974313	keep	fused flat RoPE with FP8 KV-cache write in one Triton kernel; quality passed and 3x512 streaming ITL count matched 1533
+58f9125+flat_q_quant	2.919150	keep	fused flat Q RoPE and static FP8 quantization into the RoPE/KV-cache Triton kernel; quality passed and 3x512 streaming ITL count matched 1533
+d63b9b4+rope_tile4096	2.938396	discard	increased fused RoPE/KV/Q-quant Triton tile to 4096; quality passed but TPIT regressed
+d63b9b4+rope_warps4	2.939935	discard	used 4 warps for fused RoPE/KV/Q-quant Triton kernel; TPIT regressed
+d63b9b4+flashinfer_attn	0.0	discard	forced FlashInfer/TRTLLM attention backend; startup failed because attention sinks are not supported for this configuration
+d63b9b4+moe_bf16	0.0	discard	used FlashInfer MXFP4 BF16 MoE backend; flat path rejected it because it is specialized for MXFP8 activations
+d63b9b4+post_norm_mxfp8	2.820898	keep	fused post-attention add+RMSNorm with FlashInfer-compatible MXFP8 activation quantization for MoE; quality passed and 3x512 streaming ITL count matched 1533
+664b4d1+post_norm_warps4	0.0	discard	used 4 warps for fused post-attention norm+MXFP8 kernel; microbenchmark regressed versus 8 warps
+664b4d1+post_norm_warps16	0.0	discard	used 16 warps for fused post-attention norm+MXFP8 kernel; microbenchmark regressed versus 8 warps
+35d0b6a	0.0	discard	tried FlashInfer CUTLASS MXFP4/MXFP8 MoE weight format in flat path; startup first failed on padded output shape, then stalled during profile after shape fix
+7703a94	2.828519	discard	skipped temporary K tensor write in fused RoPE/KV kernel for single-token decode; quality passed but 5x512 TPIT regressed
+5dc0506	3.360075	discard	replaced decode O projection F.linear with custom Triton GEMV; quality passed but TPIT regressed badly
+be6f441	0.0	crash	removed RoPE cache cast globally; startup profile prefill hit vLLM rotary dtype mismatch because cached table is float32
+4f1310	2.485723	keep	skip RoPE cache bf16 cast on flat decode path while retaining cast for prefill; quality passed and 5x512 ITL count matched 2555
+69dd19b	2.477788	keep	skip q/k contiguous copies on flat decode with separate FP8 query-output stride; quality passed and 5x512 ITL count matched 2555
+b441f1c	2.468724	keep	skip storing rotated K back to temporary decode tensor after fused KV-cache write; quality passed and 5x512 ITL count matched 2555
+b13eaa3	2.470681	discard	skipped K/V reshapes before Triton decoder attention on cache-update path; quality passed but TPIT regressed slightly
+e6b8e17	2.469049	discard	removed no-op MoE output slice after FlashInfer custom op; quality passed but TPIT regressed slightly
+536f746	2.468310	keep	early-return nonzero fused RoPE tiles after Q work so only tile 0 performs KV-cache logic; quality passed and 5x512 ITL count matched 2555
+06d27a9	2.467747	keep	reuse the existing KV cache tensor as the fused RoPE/cache attention dependency instead of allocating an empty tensor; quality passed and 5x512 ITL count matched 2555
+regular	2.539576	baseline	regular non-flat GptOssForCausalLM with default VLLM_COMPILE and max-cudagraph-capture-size=1; 5x512 ITL count matched 2555
+f39ffc1	2.468452	discard	returned MXFP8 scale buffer as 2D shape to remove a forward reshape; quality passed but TPIT regressed slightly
+cd19a5c	2.468412	discard	removed explicit router_logits bf16 cast before FlashInfer MoE; quality passed but TPIT regressed slightly
+67cd857	2.478419	discard	used one 4096-wide fused RoPE/KV tile instead of two 2048 tiles after early-return change; quality passed but TPIT regressed
+61fe78c	2.478563	discard	used 4 warps for fused RoPE/KV/Q-quant kernel after early-return change; quality passed but TPIT regressed
+97ae6e4	2.468164	discard	removed flat positions flatten; quality passed and 5x512 ITL count matched 2555 but TPIT regressed slightly
+a64973a	2.478052	discard	reused hidden_states as the FlashInfer MoE output buffer; quality passed but TPIT regressed
+499f57a	2.593074	discard	disabled PDL for FlashInfer TRTLLM MXFP4/MXFP8 MoE; quality passed but TPIT regressed significantly
+3dfd030	2.468155	discard	dropped the attention dummy dependency after fused KV-cache write in no-compile decode; quality passed but TPIT regressed slightly
+1252599	2.470066	discard	used num_stages=1 for fused flat RoPE/KV/Q-quant Triton kernel; quality passed but TPIT regressed
+e74b59d	0.0	crash	precomputed BS1 top-4 routing and called FlashInfer MoE with topk ids/weights; startup passed but quality failed with empty max-length outputs
+aa59cb6	2.744103	discard	used vLLM topk_softmax plus packed routed FlashInfer MoE for BS=1 decode; quality passed but extra launches regressed TPIT
+73de26b	2.566308	discard	packed BS=1 top-4 router weights in one Triton kernel and used FlashInfer routed MoE; quality passed but routed interface still regressed TPIT
+32402c2	2.483701	discard	used 2 warps for fused post-attention norm+MXFP8 quant; quality passed but TPIT regressed versus 8 warps
+68a402a	2.468323	discard	reused the Q slice of the QKV buffer for decode attention output; quality passed but TPIT did not improve
+1ce977f+no_fi_autotune	2.554349	discard	served current flat path with --no-enable-flashinfer-autotune; quality passed but TPIT regressed versus cached tuned tactic
+1ce977f+tactic_16_377	2.481234	discard	forced FlashInfer M=1 MoE tactic [16,377] in autotune cache; quality passed but TPIT regressed
+1ce977f+tactic_16_391	2.487411	discard	forced FlashInfer M=1 MoE tactic [16,391] in autotune cache; quality passed but TPIT regressed
+1ce977f+tactic_8_451	2.490563	discard	forced FlashInfer M=1 MoE tactic [8,451] in autotune cache; quality passed but TPIT regressed
+1ce977f+mbt1024	2.466774	discard	served current flat path with --max-num-batched-tokens 1024; quality passed but this changes the target serve command
+1ce977f+mbt512	2.456266	discard	served current flat path with --max-num-batched-tokens 512; quality passed but this changes the target serve command
+1ce977f+mbt256	2.466303	discard	served current flat path with --max-num-batched-tokens 256; quality passed but this changes the target serve command
+2800a60	2.470664	discard	used 16 warps for fused RoPE/KV/Q-quant kernel; quality passed but TPIT regressed
+65758eb	3.493215	discard	replaced flat router F.linear with a BS1 Triton matmul; quality passed but TPIT regressed
+c145ce8	2.511026	discard	used 2 warps for fused RoPE/KV/Q-quant kernel after early-return change; quality passed but TPIT regressed
+2facd94	2.480538	discard	forced FlashInfer RenormalizeNaive routing in flat monolithic MoE; quality passed but TPIT regressed
+00e0a11	2.468797	discard	set flat FlashInfer MoE tune_max_num_tokens to 2; quality passed but TPIT did not improve
+abbc16f	2.484654	discard	reuse flat hidden_states as FlashInfer MoE output buffer
+d6ebb16	0.0	discard	custom BF16xMXFP4 BS1 MoE prototype with half-split w13 activation rows; quality failed with empty outputs
+14df04f	15.119709	discard	custom BF16xMXFP4 BS1 MoE with one CTA per output row; quality passed but row-level GEMV is far slower than FlashInfer
+60c3169	22.298992	discard	custom BF16xMXFP4 BS1 MoE with 8-row cooperative CTAs; quality passed but slower than one-row CTA
+479ca6b	15.753998	discard	custom BF16xMXFP4 BS1 MoE with warp-per-row reductions; quality passed but scalar GEMV remains far slower than FlashInfer
+5efa65395	2.592595	discard	disabled PDL for flat FlashInfer MoE; quality passed but TPIT regressed
+745a39a97	2.495630	discard	used a single 4096-element tile for flat RoPE/KV/Q quant; quality passed but TPIT regressed
+a89e50464	2.502972	discard	used FlashInfer do_finalize=false plus custom Triton top-4 finalizer; quality passed but TPIT regressed
+bcf36f490	2.475045	discard	let FlashInfer allocate padded MoE output instead of passing empty_like; quality passed but TPIT did not beat best flat result
+13322ebb7	2.487326	discard	used persistent per-layer decode MoE output buffers; quality passed but TPIT regressed
