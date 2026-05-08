@@ -1036,7 +1036,8 @@ def transformer_layer(
             is_sf_swizzled_layout=quant_config.is_nvfp4_scale_swizzled,
         )
         assert fused_experts.routing_method_type == RoutingMethodType.DeepSeekV3
-        router_logits = router_logits.to(torch.float32)
+        if router_logits.dtype != torch.float32:
+            router_logits = router_logits.to(torch.float32)
         e_score_correction_bias = moe.experts.e_score_correction_bias
         if e_score_correction_bias is not None:
             cached_bias = getattr(moe.experts, "_flat_e_score_bias_bf16", None)
@@ -1050,6 +1051,20 @@ def transformer_layer(
         assert a1q_scale is not None
         assert quant_config.w1_scale is not None
         assert quant_config.w2_scale is not None
+        w1_scale_fp8 = getattr(moe.experts, "_flat_w1_scale_fp8", None)
+        if (
+            w1_scale_fp8 is None
+            or w1_scale_fp8.device != quant_config.w1_scale.device
+        ):
+            w1_scale_fp8 = quant_config.w1_scale.view(torch.float8_e4m3fn)
+            moe.experts._flat_w1_scale_fp8 = w1_scale_fp8
+        w2_scale_fp8 = getattr(moe.experts, "_flat_w2_scale_fp8", None)
+        if (
+            w2_scale_fp8 is None
+            or w2_scale_fp8.device != quant_config.w2_scale.device
+        ):
+            w2_scale_fp8 = quant_config.w2_scale.view(torch.float8_e4m3fn)
+            moe.experts._flat_w2_scale_fp8 = w2_scale_fp8
 
         import flashinfer
 
@@ -1063,13 +1078,13 @@ def transformer_layer(
                 *a1q.shape[:-1], -1
             ),
             gemm1_weights=moe.experts.w13_weight,
-            gemm1_weights_scale=quant_config.w1_scale.view(torch.float8_e4m3fn),
+            gemm1_weights_scale=w1_scale_fp8,
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
             gemm2_weights=moe.experts.w2_weight,
-            gemm2_weights_scale=quant_config.w2_scale.view(torch.float8_e4m3fn),
+            gemm2_weights_scale=w2_scale_fp8,
             gemm2_bias=None,
             output1_scale_scalar=fused_experts.g1_scale_c,
             output1_scale_gate_scalar=quant_config.g1_alphas,
