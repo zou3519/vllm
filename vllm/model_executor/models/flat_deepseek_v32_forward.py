@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
+)
 
 
 _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
@@ -591,20 +594,14 @@ def transformer_layer(
         req_id = attn_metadata.req_id_per_token[:num_actual_toks]
         block_table = attn_metadata.block_table
         block_size = attn_metadata.block_size
-        block_id = torch.div(topk_indices, block_size, rounding_mode="floor")
-        inblock_offset = topk_indices % block_size
-        invalid_topk = topk_indices < 0
-        max_blocks = block_table.shape[1]
-        valid_block = (block_id >= 0) & (block_id < max_blocks)
-        safe_block_id = block_id.clamp(min=0, max=max_blocks - 1)
-        req_block_table = block_table.index_select(0, req_id.to(torch.long))
-        block_slots = torch.gather(req_block_table, 1, safe_block_id)
-        topk_indices_physical = block_slots * block_size + inblock_offset
-        topk_indices_physical = topk_indices_physical.masked_fill(
-            invalid_topk | ~valid_block,
-            -1,
+        topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
+            req_id,
+            block_table,
+            topk_indices,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
         )
-        seq_lens = (topk_indices_physical >= 0).sum(dim=1).to(torch.int32)
         if impl._workspace_buffer is None:
             if _fi_sparse_workspace is None:
                 _fi_sparse_workspace = torch.zeros(
