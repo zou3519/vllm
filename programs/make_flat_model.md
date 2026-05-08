@@ -226,6 +226,11 @@ LOOP FOREVER until the flat model produces correct output:
   vertical and horizontal fusion across adjacent decode-only operations,
   especially pointwise, reduction, quantization, RoPE, cache-write, routing, and
   same-shape independent streams.
+- Do not make the flat structure hostile to tuning fused kernels: preserve clear
+  tensor shapes, strides, backend constants, and cached one-time layout
+  transforms so an optimizer can tune tile sizes, launch grids, branch
+  specialization, and cached buffers before abandoning a quality-preserving
+  fusion.
 - Do not assume custom scalar GEMV is a good MoE replacement. For quantized MoE,
   future custom kernels should preserve tensor-core/blockscaled math or build
   directly on a proven low-latency backend.

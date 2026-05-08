@@ -217,10 +217,17 @@ LOOP FOREVER:
 6. **Measure TPIT** (3-5 runs).
 7. **Log** the result to results.tsv.
 8. If TPIT improved AND quality is preserved: **keep** the commit.
-9. If TPIT regressed OR quality degraded: **revert with `git revert`** so the
+9. If quality is preserved but TPIT regressed only modestly, decide whether the
+   fused kernel likely has tunable issues before discarding it. Try obvious
+   tuning passes such as tile sizes, launch grid shape, branch specialization,
+   vectorization, cached buffers, avoiding extra copies, and splitting one
+   over-branched fusion into two better-shaped fused kernels. Prefer tuning a
+   launch-reducing fusion when the regression looks like kernel shape overhead
+   rather than extra HBM traffic or worse math.
+10. If TPIT still regressed OR quality degraded: **revert with `git revert`** so the
    failed experiment remains visible in history. Avoid destructive reset unless
    the human explicitly asks for it.
-10. Go to 1.
+11. Go to 1.
 
 ## Optimization ideas (roughly ordered by impact)
 
@@ -231,6 +238,9 @@ decode layer for adjacent pointwise/reduction/cache/quantization work and for
 same-shape independent streams that can reasonably share one kernel launch.
 Prefer one larger guarded BS=1 decode kernel when it removes multiple launches,
 temporary tensors, or repeated HBM reads.
+If a larger fusion initially regresses but keeps quality, do not discard it
+automatically; first check whether the kernel just needs tuning or a less
+branchy decomposition that keeps most of the launch-count reduction.
 - LayerNorm + quantize → one Triton kernel
 - Activation + multiply + quantize → one Triton kernel
 - RoPE + KV cache write → one Triton kernel
