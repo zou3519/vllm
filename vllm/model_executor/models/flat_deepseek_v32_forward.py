@@ -313,7 +313,7 @@ def transformer_layer(
             mla.kv_cache.shape[2],
             EPS=wrapper.kv_a_layernorm.variance_epsilon,
             BLOCK_N=1024,
-            num_warps=8,
+            num_warps=4,
         )
     else:
         k_pe = k_pe.unsqueeze(1)
