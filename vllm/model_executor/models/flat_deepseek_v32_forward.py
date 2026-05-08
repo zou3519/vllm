@@ -25,7 +25,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_q_rope_quant_weights_kernel,
     _mla_qkv_a_rmsnorm_kernel,
     _mla_decode_q_concat_quant_fp8_kernel,
-    _nvfp4_rowmajor_scale_kernel,
     triton_convert_req_index_to_global_index,
 )
 
@@ -878,37 +877,13 @@ def transformer_layer(
                     == gate_up_proj.input_size_per_partition
                 )
                 if reuse_moe_input_quant:
-                    x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                        hidden_states,
-                        gate_up_proj.input_global_scale_inv,
-                        is_sf_swizzled_layout=True,
-                        backend=gate_up_proj.quant_method.backend.value,
-                    )
-                    a1q = x_fp4
-                    a1q_scale = torch.empty(
-                        (
-                            hidden_states.shape[0],
-                            hidden_states.shape[1] // 16,
-                        ),
-                        device=hidden_states.device,
-                        dtype=torch.float8_e4m3fn,
-                    )
-                    _nvfp4_rowmajor_scale_kernel[
-                        (
-                            hidden_states.shape[0],
-                            hidden_states.shape[1] // 16,
-                        )
-                    ](
+                    a1q, a1q_scale = ops.scaled_fp4_quant(
                         hidden_states,
                         input_sf,
-                        a1q_scale,
-                        hidden_states.shape[1],
-                        hidden_states.stride(0),
-                        hidden_states.stride(1),
-                        a1q_scale.stride(0),
-                        a1q_scale.stride(1),
-                        BLOCK_N=16,
+                        is_sf_swizzled_layout=False,
                     )
+                    x_fp4 = a1q
+                    x_blockscale = a1q_scale
                 else:
                     x_fp4, x_blockscale = ops.scaled_fp4_quant(
                         hidden_states,
@@ -930,7 +905,11 @@ def transformer_layer(
                     gate_up_proj.weight_scale.view(torch.uint8).t(),
                     gate_up_proj.alpha,
                     hidden_states.dtype,
-                    backend_name == "trtllm" and x_fp4.shape[0] <= 32,
+                    (
+                        backend_name == "trtllm"
+                        and x_fp4.shape[0] <= 32
+                        and not reuse_moe_input_quant
+                    ),
                     backend_name,
                 )
                 if gate_up.shape[-1] != gate_up_proj.output_size_per_partition:
