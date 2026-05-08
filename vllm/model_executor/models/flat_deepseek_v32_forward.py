@@ -167,10 +167,27 @@ def transformer_layer(
         BLOCK_N=2048,
     )
 
-    # q_b projection.
+    # q_b projection, optionally horizontally fused with sparse indexer q.
     q_b_proj = wrapper.q_b_proj
+    indexer = wrapper.indexer if wrapper.indexer and wrapper.is_sparse else None
+    wq_b = indexer.wq_b if indexer is not None else None
+    index_q = None
     bias = q_b_proj.bias if not q_b_proj.skip_bias_add else None
-    if hasattr(q_b_proj, "weight_global_scale") and hasattr(
+    if (
+        wq_b is not None
+        and not hasattr(q_b_proj, "weight_global_scale")
+        and not hasattr(wq_b, "weight_global_scale")
+        and bias is None
+        and (wq_b.bias is None or wq_b.skip_bias_add)
+    ):
+        combined_weight = getattr(wrapper, "_flat_qb_index_q_weight", None)
+        if combined_weight is None:
+            combined_weight = torch.cat((q_b_proj.weight, wq_b.weight), dim=0)
+            wrapper._flat_qb_index_q_weight = combined_weight
+        q_and_index_q = F.linear(q_c, combined_weight, None)
+        q = q_and_index_q[..., : q_b_proj.output_size_per_partition]
+        index_q = q_and_index_q[..., q_b_proj.output_size_per_partition :]
+    elif hasattr(q_b_proj, "weight_global_scale") and hasattr(
         q_b_proj, "input_global_scale_inv"
     ):
         q_shape = [*q_c.shape[:-1], q_b_proj.output_size_per_partition]
@@ -247,11 +264,11 @@ def transformer_layer(
         )
 
     # Sparse indexer q projection.
-    if wrapper.indexer and wrapper.is_sparse:
-        indexer = wrapper.indexer
-        wq_b = indexer.wq_b
+    if indexer is not None:
         bias = wq_b.bias if not wq_b.skip_bias_add else None
-        if hasattr(wq_b, "weight_global_scale") and hasattr(
+        if index_q is not None:
+            pass
+        elif hasattr(wq_b, "weight_global_scale") and hasattr(
             wq_b, "input_global_scale_inv"
         ):
             index_q_shape = [*q_c.shape[:-1], wq_b.output_size_per_partition]
