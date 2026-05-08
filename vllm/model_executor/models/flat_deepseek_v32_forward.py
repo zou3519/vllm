@@ -612,17 +612,23 @@ def transformer_layer(
                 topk_indices = topk_indices_buffer[
                     :num_padded_tokens, : indexer.topk_tokens
                 ]
-                assert not decode_metadata.use_large_context_topk
-                torch.ops._C.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    decode_metadata.seq_lens,
-                    topk_indices,
-                    logits.shape[0],
-                    logits.stride(0),
-                    logits.stride(1),
-                    indexer.topk_tokens,
-                )
+                if decode_metadata.use_large_context_topk:
+                    assert next_n == 1
+                    lengths = decode_metadata.seq_lens
+                    torch.ops._C.large_context_topk(
+                        logits, topk_indices, lengths, None
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_decode(
+                        logits,
+                        next_n,
+                        decode_metadata.seq_lens,
+                        topk_indices,
+                        logits.shape[0],
+                        logits.stride(0),
+                        logits.stride(1),
+                        indexer.topk_tokens,
+                    )
 
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
