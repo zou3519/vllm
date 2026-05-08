@@ -848,8 +848,6 @@ def transformer_layer(
         moe = layer.mlp
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        shared_gate_up_x_fp4 = None
-        shared_gate_up_x_blockscale = None
 
         # Optional shared experts.
         shared_output = None
@@ -870,9 +868,6 @@ def transformer_layer(
                     is_sf_swizzled_layout=True,
                     backend=gate_up_proj.quant_method.backend.value,
                 )
-                if gate_up_proj.weights_padding_cols == 0:
-                    shared_gate_up_x_fp4 = x_fp4
-                    shared_gate_up_x_blockscale = x_blockscale
                 if gate_up_proj.weights_padding_cols > 0:
                     x_fp4 = F.pad(
                         x_fp4, (0, gate_up_proj.weights_padding_cols)
@@ -1045,19 +1040,7 @@ def transformer_layer(
         assert quant_config.block_shape is None
         import flashinfer
 
-        reuse_shared_gate_up_quant = False
-        if shared_gate_up_x_fp4 is not None:
-            cached_reuse = getattr(gate_up_proj, "_flat_reuse_routed_quant", None)
-            if cached_reuse is None:
-                cached_reuse = bool(
-                    torch.equal(gate_up_proj.input_global_scale_inv, input_sf)
-                )
-                gate_up_proj._flat_reuse_routed_quant = cached_reuse
-            reuse_shared_gate_up_quant = cached_reuse
-        if reuse_shared_gate_up_quant:
-            a1q = shared_gate_up_x_fp4
-            a1q_scale = shared_gate_up_x_blockscale
-        elif quant_config.is_nvfp4_scale_swizzled:
+        if quant_config.is_nvfp4_scale_swizzled:
             a1q, a1q_scale = ops.scaled_fp4_quant(
                 hidden_states,
                 input_sf,
