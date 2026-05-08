@@ -1030,11 +1030,23 @@ def transformer_layer(
         assert quant_config.use_nvfp4_w4a4
         assert quant_config.quant_dtype == "nvfp4"
         assert quant_config.block_shape is None
-        a1q, a1q_scale = ops.scaled_fp4_quant(
-            hidden_states,
-            input_sf,
-            is_sf_swizzled_layout=quant_config.is_nvfp4_scale_swizzled,
-        )
+        import flashinfer
+
+        if quant_config.is_nvfp4_scale_swizzled:
+            a1q, a1q_scale = ops.scaled_fp4_quant(
+                hidden_states,
+                input_sf,
+                is_sf_swizzled_layout=True,
+            )
+        else:
+            a1q, a1q_scale = flashinfer.fp4_quantize(
+                hidden_states,
+                input_sf,
+                sf_vec_size=16,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+                is_sf_8x4_layout=False,
+            )
         assert fused_experts.routing_method_type == RoutingMethodType.DeepSeekV3
         router_logits = router_logits.to(torch.float32)
         e_score_correction_bias = moe.experts.e_score_correction_bias
@@ -1050,8 +1062,6 @@ def transformer_layer(
         assert a1q_scale is not None
         assert quant_config.w1_scale is not None
         assert quant_config.w2_scale is not None
-
-        import flashinfer
 
         assert moe.experts.activation.value == "silu"
         activation_type = 3
