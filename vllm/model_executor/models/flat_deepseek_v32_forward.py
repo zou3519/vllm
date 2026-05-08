@@ -422,7 +422,6 @@ def transformer_layer(
             )
 
             topk_indices_buffer = indexer.topk_indices_buffer
-            topk_indices_buffer[: hidden_states.shape[0]] = -1
 
             # Sparse indexer: prefill MQA logits and per-row top-k.
             if has_prefill:
