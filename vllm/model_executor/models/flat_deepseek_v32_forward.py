@@ -86,7 +86,34 @@ def transformer_layer(
     attn = layer.self_attn
     wrapper = attn.mla_attn
     fused_qkv_a_proj = wrapper.fused_qkv_a_proj
-    if getattr(fused_qkv_a_proj, "_use_min_latency_gemm", False):
+    indexer = wrapper.indexer if wrapper.indexer and wrapper.is_sparse else None
+    wk_weights_proj_for_qkv = (
+        indexer.wk_weights_proj
+        if indexer is not None and indexer.is_fp4_ckpt
+        else None
+    )
+    kw = None
+    if (
+        wk_weights_proj_for_qkv is not None
+        and not hasattr(fused_qkv_a_proj, "weight_global_scale")
+        and not hasattr(wk_weights_proj_for_qkv, "weight_global_scale")
+        and (fused_qkv_a_proj.bias is None or fused_qkv_a_proj.skip_bias_add)
+        and (
+            wk_weights_proj_for_qkv.bias is None
+            or wk_weights_proj_for_qkv.skip_bias_add
+        )
+    ):
+        combined_weight = getattr(wrapper, "_flat_qkv_kw_weight", None)
+        if combined_weight is None:
+            combined_weight = torch.cat(
+                (fused_qkv_a_proj.weight, wk_weights_proj_for_qkv.weight),
+                dim=0,
+            )
+            wrapper._flat_qkv_kw_weight = combined_weight
+        qkv_kw = F.linear(hidden_states, combined_weight, None)
+        qkv_lora = qkv_kw[..., : fused_qkv_a_proj.output_size_per_partition]
+        kw = qkv_kw[..., fused_qkv_a_proj.output_size_per_partition :]
+    elif getattr(fused_qkv_a_proj, "_use_min_latency_gemm", False):
         qkv_lora = torch.ops.vllm.min_latency_fused_qkv_a_proj(
             hidden_states, fused_qkv_a_proj.weight
         )
@@ -169,7 +196,6 @@ def transformer_layer(
 
     # q_b projection, optionally horizontally fused with sparse indexer q.
     q_b_proj = wrapper.q_b_proj
-    indexer = wrapper.indexer if wrapper.indexer and wrapper.is_sparse else None
     wq_b = indexer.wq_b if indexer is not None else None
     index_q = None
     bias = q_b_proj.bias if not q_b_proj.skip_bias_add else None
@@ -308,7 +334,9 @@ def transformer_layer(
                 if not wk_weights_proj.skip_bias_add
                 else None
             )
-            if hasattr(wk_weights_proj, "weight_global_scale") and hasattr(
+            if kw is not None:
+                pass
+            elif hasattr(wk_weights_proj, "weight_global_scale") and hasattr(
                 wk_weights_proj, "input_global_scale_inv"
             ):
                 kw_shape = [
