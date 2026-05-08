@@ -436,6 +436,122 @@ def _mla_qkv_a_rmsnorm_kernel(
 
 
 @triton.jit
+def _mla_q_a_rmsnorm_kernel(
+    qkv_ptr,  # [num_tokens, q_rank + kv_rank + rope_dim]
+    q_weight_ptr,  # [q_rank]
+    q_out_ptr,  # [num_tokens, q_rank]
+    q_rank: tl.constexpr,
+    qkv_stride0,
+    qkv_stride1,
+    q_out_stride0,
+    q_out_stride1,
+    EPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < q_rank
+
+    x = tl.load(
+        qkv_ptr + token * qkv_stride0 + cols * qkv_stride1,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    sum_sq = tl.sum(tl.where(mask, x * x, 0.0), axis=0)
+    inv_rms = tl.rsqrt(sum_sq / q_rank + EPS)
+    weight = tl.load(q_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    vals = x * inv_rms * weight
+    tl.store(
+        q_out_ptr + token * q_out_stride0 + cols * q_out_stride1,
+        vals,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _mla_kv_a_rmsnorm_rope_cache_fp8_kernel(
+    qkv_ptr,  # [num_tokens, q_rank + kv_rank + rope_dim]
+    kv_weight_ptr,  # [kv_rank]
+    positions_ptr,  # [num_tokens]
+    cos_sin_cache_ptr,  # [max_position, rope_dim]
+    slot_mapping_ptr,  # [num_tokens]
+    kv_cache_fp8_ptr,  # flat fp8 view of [num_blocks, block_size, cache_stride]
+    scale_ptr,  # scalar
+    num_tokens,
+    q_rank: tl.constexpr,
+    kv_lora_rank: tl.constexpr,
+    rope_dim: tl.constexpr,
+    qkv_stride0,
+    qkv_stride1,
+    cache_block_size: tl.constexpr,
+    cache_stride: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_N)
+    kv_mask = offsets < kv_lora_rank
+    total_dim = kv_lora_rank + rope_dim
+    mask = offsets < total_dim
+
+    kv_raw = tl.load(
+        qkv_ptr + token * qkv_stride0 + (q_rank + offsets) * qkv_stride1,
+        mask=kv_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sum_sq = tl.sum(tl.where(kv_mask, kv_raw * kv_raw, 0.0), axis=0)
+    inv_rms = tl.rsqrt(sum_sq / kv_lora_rank + EPS)
+    kv_weight = tl.load(kv_weight_ptr + offsets, mask=kv_mask, other=0.0).to(
+        tl.float32
+    )
+    kv_vals = kv_raw * inv_rms * kv_weight
+
+    rope_feature = offsets - kv_lora_rank
+    pair = rope_feature // 2
+    x_feature = pair * 2
+    y_feature = x_feature + 1
+    pos = tl.load(positions_ptr + token)
+    rope_mask = mask & (offsets >= kv_lora_rank)
+    cos = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + rope_dim // 2 + pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    rope_base = q_rank + kv_lora_rank
+    x_vals = tl.load(
+        qkv_ptr + token * qkv_stride0 + (rope_base + x_feature) * qkv_stride1,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    y_vals = tl.load(
+        qkv_ptr + token * qkv_stride0 + (rope_base + y_feature) * qkv_stride1,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    rope_vals = tl.where(
+        (rope_feature % 2) == 0,
+        x_vals * cos - y_vals * sin,
+        y_vals * cos + x_vals * sin,
+    )
+    vals = tl.where(offsets < kv_lora_rank, kv_vals, rope_vals)
+
+    slot = tl.load(slot_mapping_ptr + token, mask=token < num_tokens, other=-1)
+    valid = slot >= 0
+    block_idx = slot // cache_block_size
+    block_offset = slot - block_idx * cache_block_size
+    cache_offset = block_idx * cache_block_size * cache_stride + block_offset * cache_stride
+    scale = tl.load(scale_ptr).to(tl.float32)
+    q_vals = vals / scale
+    q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
+    tl.store(kv_cache_fp8_ptr + cache_offset + offsets, q_vals, mask=mask & valid)
+
+
+@triton.jit
 def _mla_decode_q_concat_kernel(
     nope_ptr,  # [batch, heads, lora_rank]
     rope_ptr,  # [batch, heads, rope_dim]

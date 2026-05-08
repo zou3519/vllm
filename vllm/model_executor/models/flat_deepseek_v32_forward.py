@@ -24,8 +24,9 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_qk_rope_quant_cache_kernel,
     _index_q_rope_quant_weights_kernel,
     _mla_decode_q_project_rope_concat_quant_fp8_kernel,
+    _mla_kv_a_rmsnorm_rope_cache_fp8_kernel,
     _mla_qkv_a_rmsnorm_kernel,
-    _mla_k_rope_cache_fp8_kernel,
+    _mla_q_a_rmsnorm_kernel,
     triton_convert_req_index_to_global_index,
 )
 
@@ -167,33 +168,49 @@ def transformer_layer(
         dtype=qkv_lora.dtype,
         device=qkv_lora.device,
     )
-    kv_c_normed = torch.empty(
-        (*qkv_lora.shape[:-1], wrapper.kv_lora_rank),
-        dtype=qkv_lora.dtype,
-        device=qkv_lora.device,
-    )
-    assert wrapper.q_lora_rank <= 2048 and wrapper.kv_lora_rank <= 2048
-    assert (
-        wrapper.q_a_layernorm.variance_epsilon
-        == wrapper.kv_a_layernorm.variance_epsilon
-    )
-    _mla_qkv_a_rmsnorm_kernel[(qkv_lora.shape[0], 2)](
-        qkv_lora,
-        wrapper.q_a_layernorm.weight.data,
-        wrapper.kv_a_layernorm.weight.data,
-        q_c,
-        kv_c_normed,
-        wrapper.q_lora_rank,
-        wrapper.kv_lora_rank,
-        qkv_lora.stride(0),
-        qkv_lora.stride(1),
-        q_c.stride(0),
-        q_c.stride(1),
-        kv_c_normed.stride(0),
-        kv_c_normed.stride(1),
-        EPS=wrapper.q_a_layernorm.variance_epsilon,
-        BLOCK_N=2048,
-    )
+    mla = wrapper.mla_attn
+    if mla.kv_cache.numel() != 0:
+        assert wrapper.q_lora_rank <= 2048
+        _mla_q_a_rmsnorm_kernel[(qkv_lora.shape[0],)](
+            qkv_lora,
+            wrapper.q_a_layernorm.weight.data,
+            q_c,
+            wrapper.q_lora_rank,
+            qkv_lora.stride(0),
+            qkv_lora.stride(1),
+            q_c.stride(0),
+            q_c.stride(1),
+            EPS=wrapper.q_a_layernorm.variance_epsilon,
+            BLOCK_N=2048,
+        )
+    else:
+        kv_c_normed = torch.empty(
+            (*qkv_lora.shape[:-1], wrapper.kv_lora_rank),
+            dtype=qkv_lora.dtype,
+            device=qkv_lora.device,
+        )
+        assert wrapper.q_lora_rank <= 2048 and wrapper.kv_lora_rank <= 2048
+        assert (
+            wrapper.q_a_layernorm.variance_epsilon
+            == wrapper.kv_a_layernorm.variance_epsilon
+        )
+        _mla_qkv_a_rmsnorm_kernel[(qkv_lora.shape[0], 2)](
+            qkv_lora,
+            wrapper.q_a_layernorm.weight.data,
+            wrapper.kv_a_layernorm.weight.data,
+            q_c,
+            kv_c_normed,
+            wrapper.q_lora_rank,
+            wrapper.kv_lora_rank,
+            qkv_lora.stride(0),
+            qkv_lora.stride(1),
+            q_c.stride(0),
+            q_c.stride(1),
+            kv_c_normed.stride(0),
+            kv_c_normed.stride(1),
+            EPS=wrapper.q_a_layernorm.variance_epsilon,
+            BLOCK_N=2048,
+        )
 
     # q_b projection, optionally horizontally fused with sparse indexer q.
     q_b_proj = wrapper.q_b_proj
@@ -269,7 +286,6 @@ def transformer_layer(
             rotary._flat_cos_sin_cache = cached_cos_sin
         cos_sin_cache = cached_cos_sin
     mla_cos_sin_cache = cos_sin_cache
-    mla = wrapper.mla_attn
     layer_slot_mapping = None
     topk_indices_physical = None
     sparse_seq_lens = None
@@ -279,25 +295,23 @@ def transformer_layer(
         layer_slot_mapping = slot_mapping.get(mla.layer_name)
     assert not mla.calculate_kv_scales
     if mla.kv_cache.numel() != 0:
-        _mla_k_rope_cache_fp8_kernel[
-            (kv_c_normed.shape[0],)
-        ](
-            k_pe,
-            kv_c_normed,
+        _mla_kv_a_rmsnorm_rope_cache_fp8_kernel[(qkv_lora.shape[0],)](
+            qkv_lora,
+            wrapper.kv_a_layernorm.weight.data,
             positions.flatten(),
             mla_cos_sin_cache,
             layer_slot_mapping.flatten(),
             mla.kv_cache.view(torch.float8_e4m3fn),
             mla._k_scale,
-            kv_c_normed.shape[0],
-            wrapper.qk_rope_head_dim,
+            qkv_lora.shape[0],
+            wrapper.q_lora_rank,
             wrapper.kv_lora_rank,
-            k_pe.stride(0),
-            k_pe.stride(1),
-            kv_c_normed.stride(0),
-            kv_c_normed.stride(1),
+            wrapper.qk_rope_head_dim,
+            qkv_lora.stride(0),
+            qkv_lora.stride(1),
             mla.kv_cache.shape[1],
             mla.kv_cache.shape[2],
+            EPS=wrapper.kv_a_layernorm.variance_epsilon,
             BLOCK_N=1024,
             num_warps=8,
         )
