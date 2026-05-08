@@ -297,7 +297,7 @@ def transformer_layer(
             mla.kv_cache.shape[1],
             mla.kv_cache.shape[2],
             BLOCK_N=1024,
-            num_warps=8,
+            num_warps=4,
         )
     else:
         k_pe = k_pe.unsqueeze(1)
