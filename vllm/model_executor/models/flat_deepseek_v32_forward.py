@@ -250,11 +250,7 @@ def transformer_layer(
         else:
             index_q = F.linear(q_c, wq_b.weight, bias)
         index_q = index_q.view(-1, indexer.n_head, indexer.head_dim)
-        q_pe, q_nope = torch.split(
-            index_q,
-            [indexer.rope_dim, indexer.head_dim - indexer.rope_dim],
-            dim=-1,
-        )
+        q_pe = index_q[..., : indexer.rope_dim]
 
         # Sparse indexer fused wk + weights projection.
         if indexer.is_fp4_ckpt:
@@ -354,11 +350,7 @@ def transformer_layer(
             indexer.k_norm.bias,
             indexer.k_norm.eps,
         ).type_as(index_k)
-        k_pe_index, k_nope = torch.split(
-            index_k,
-            [indexer.rope_dim, indexer.head_dim - indexer.rope_dim],
-            dim=-1,
-        )
+        k_pe_index = index_k[..., : indexer.rope_dim]
         rotary = wrapper.indexer_rope_emb
         k_pe_index = k_pe_index.unsqueeze(1)
         cos_sin_cache = rotary.cos_sin_cache
@@ -372,8 +364,6 @@ def transformer_layer(
             cos_sin_cache,
             True,
         )
-        index_q = torch.cat([q_pe, q_nope], dim=-1)
-        index_k = torch.cat([k_pe_index.squeeze(-2), k_nope], dim=-1)
 
         # Sparse indexer fp8 q quantization and weight scaling.
         q_flat = index_q.view(-1, indexer.head_dim)
