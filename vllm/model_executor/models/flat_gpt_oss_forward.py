@@ -76,7 +76,6 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
     gemm2_bias: torch.Tensor,
-    decode_output: torch.Tensor,
     num_experts: int,
     top_k: int,
     intermediate_size: int,
@@ -85,10 +84,7 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     routing_method_type: int,
     tune_max_num_tokens: int,
 ) -> torch.Tensor:
-    if output_like.shape[0] == 1:
-        output = decode_output
-    else:
-        output = torch.empty_like(output_like)
+    output = torch.empty_like(output_like)
     return trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=None,
@@ -136,7 +132,6 @@ def _flashinfer_trtllm_fp4_block_scale_moe_fake(
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
     gemm2_bias: torch.Tensor,
-    decode_output: torch.Tensor,
     num_experts: int,
     top_k: int,
     intermediate_size: int,
@@ -198,7 +193,6 @@ def transformer_layer(
         moe_w2_scale,
         moe_w1_bias,
         moe_w2_bias,
-        moe_decode_output,
         moe_gemm1_alpha,
         moe_gemm1_beta,
         moe_gemm1_clamp_limit,
@@ -345,7 +339,6 @@ def transformer_layer(
         moe_w2,
         moe_w2_scale,
         moe_w2_bias,
-        moe_decode_output,
         moe_global_num_experts,
         moe_topk,
         moe_intermediate_size,
@@ -457,11 +450,6 @@ def flat_forward(
                     fused_experts.w2_scale,
                     fused_experts.w1_bias,
                     fused_experts.w2_bias,
-                    torch.empty(
-                        (1, layer.mlp.hidden_size),
-                        dtype=qkv_proj.weight.dtype,
-                        device=qkv_proj.weight.device,
-                    ),
                     fused_experts.gemm1_alpha,
                     fused_experts.gemm1_beta,
                     fused_experts.gemm1_clamp_limit,
