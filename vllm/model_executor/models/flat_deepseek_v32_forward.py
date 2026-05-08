@@ -63,7 +63,7 @@ def transformer_layer(
                 norm.variance_epsilon,
                 tp_size,
                 True,
-                True,
+                False,
                 _FI_AR_MAX_TOKEN_NUM,
                 _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
             )
@@ -722,7 +722,7 @@ def transformer_layer(
             norm.variance_epsilon,
             o_proj.tp_size,
             True,
-            True,
+            False,
             _FI_AR_MAX_TOKEN_NUM,
             _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
         )
@@ -1105,7 +1105,7 @@ def flat_forward(
             norm.variance_epsilon,
             tp_size,
             True,
-            True,
+            False,
             _FI_AR_MAX_TOKEN_NUM,
             _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
         )
