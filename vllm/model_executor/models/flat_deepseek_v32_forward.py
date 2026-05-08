@@ -691,7 +691,6 @@ def transformer_layer(
                 mla.W_UK_T.stride(2),
                 BLOCK_N=32,
                 BLOCK_K=128,
-                num_warps=1,
             )
         else:
             mqa_q_nope, mqa_q_pe = q.split(
