@@ -266,7 +266,6 @@ def transformer_layer(
         ):
             cached_cos_sin = cos_sin_cache.to(q.device, dtype=q.dtype)
             rotary._flat_cos_sin_cache = cached_cos_sin
-            rotary.cos_sin_cache = cached_cos_sin
         cos_sin_cache = cached_cos_sin
     mla = wrapper.mla_attn
     layer_slot_mapping = None
@@ -442,7 +441,6 @@ def transformer_layer(
             ):
                 cached_cos_sin = cos_sin_cache.to(index_q.device, dtype=index_q.dtype)
                 rotary._flat_cos_sin_cache = cached_cos_sin
-                rotary.cos_sin_cache = cached_cos_sin
             cos_sin_cache = cached_cos_sin
 
         # Sparse indexer fused q RoPE, fp8 quantization, and weight scaling.
