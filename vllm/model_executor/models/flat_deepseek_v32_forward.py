@@ -1023,7 +1023,14 @@ def transformer_layer(
         router_logits = router_logits.to(torch.float32)
         e_score_correction_bias = moe.experts.e_score_correction_bias
         if e_score_correction_bias is not None:
-            e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
+            cached_bias = getattr(moe.experts, "_flat_e_score_bias_bf16", None)
+            if (
+                cached_bias is None
+                or cached_bias.device != e_score_correction_bias.device
+            ):
+                cached_bias = e_score_correction_bias.to(torch.bfloat16)
+                moe.experts._flat_e_score_bias_bf16 = cached_bias
+            e_score_correction_bias = cached_bias
         assert a1q_scale is not None
         assert quant_config.w1_scale is not None
         assert quant_config.w2_scale is not None
