@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_q_rope_quant_weights_kernel,
     _mla_qkv_a_rmsnorm_kernel,
     _mla_decode_q_concat_quant_fp8_kernel,
+    _mla_decode_q_project_concat_quant_fp8_kernel,
     triton_convert_req_index_to_global_index,
 )
 
@@ -653,12 +654,49 @@ def transformer_layer(
         q = q[:num_actual_toks]
         attn_output_actual = attn_output[:num_actual_toks]
 
-        # MLA decode q nope projection using preprocessed W_UK_T.
-        mqa_q_nope, mqa_q_pe = q.split(
-            [wrapper.qk_nope_head_dim, wrapper.qk_rope_head_dim], dim=-1
-        )
-        mqa_q_nope = mqa_q_nope.transpose(0, 1)
-        if mla.q_pad_num_heads is not None:
+        # MLA decode q nope projection, concat, and FP8 quantization.
+        if mla.q_pad_num_heads is None:
+            _, _, lora_rank = mla.W_UK_T.shape
+            mqa_q = torch.empty(
+                (
+                    q.shape[0],
+                    q.shape[1],
+                    lora_rank + wrapper.qk_rope_head_dim,
+                ),
+                device=q.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            _mla_decode_q_project_concat_quant_fp8_kernel[
+                (
+                    q.shape[0],
+                    q.shape[1],
+                    (mqa_q.shape[2] + 31) // 32,
+                )
+            ](
+                q,
+                mla.W_UK_T,
+                mla._q_scale,
+                mqa_q,
+                q.shape[1],
+                wrapper.qk_nope_head_dim,
+                wrapper.qk_rope_head_dim,
+                lora_rank,
+                q.shape[2],
+                mqa_q.shape[2],
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                mla.W_UK_T.stride(0),
+                mla.W_UK_T.stride(1),
+                mla.W_UK_T.stride(2),
+                BLOCK_N=32,
+                BLOCK_K=128,
+            )
+        else:
+            mqa_q_nope, mqa_q_pe = q.split(
+                [wrapper.qk_nope_head_dim, wrapper.qk_rope_head_dim], dim=-1
+            )
+            mqa_q_nope = mqa_q_nope.transpose(0, 1)
             bsz, heads, rope_dim = mqa_q_pe.shape
             mqa_pe_padded = mqa_q_pe.new_empty(
                 (bsz, mla.q_pad_num_heads, rope_dim)
@@ -667,45 +705,42 @@ def transformer_layer(
             mqa_pe_padded.copy_(mqa_q_pe)
             mqa_q_pe = mqa_pe_padded
 
-        heads, batch, _ = mqa_q_nope.shape
-        _, _, lora_rank = mla.W_UK_T.shape
-        if mla.q_pad_num_heads is not None:
+            heads, batch, _ = mqa_q_nope.shape
+            _, _, lora_rank = mla.W_UK_T.shape
             mqa_ql_nope = mqa_q_nope.new_empty(
                 (mla.q_pad_num_heads, batch, lora_rank)
             )
             mqa_ql_nope.resize_((heads, batch, lora_rank))
-        else:
-            mqa_ql_nope = mqa_q_nope.new_empty((heads, batch, lora_rank))
-        torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
-        mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+            torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
+            mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-        mqa_q = torch.empty(
-            (
-                mqa_ql_nope.shape[0],
-                mqa_ql_nope.shape[1],
-                mqa_ql_nope.shape[2] + mqa_q_pe.shape[2],
-            ),
-            device=mqa_ql_nope.device,
-            dtype=torch.float8_e4m3fn,
-        )
-        _mla_decode_q_concat_quant_fp8_kernel[((mqa_q.numel() + 255) // 256,)](
-            mqa_ql_nope,
-            mqa_q_pe,
-            mla._q_scale,
-            mqa_q,
-            mqa_q.numel(),
-            mqa_q.shape[1],
-            mqa_ql_nope.shape[2],
-            mqa_q_pe.shape[2],
-            mqa_q.shape[2],
-            mqa_ql_nope.stride(0),
-            mqa_ql_nope.stride(1),
-            mqa_ql_nope.stride(2),
-            mqa_q_pe.stride(0),
-            mqa_q_pe.stride(1),
-            mqa_q_pe.stride(2),
-            BLOCK_N=256,
-        )
+            mqa_q = torch.empty(
+                (
+                    mqa_ql_nope.shape[0],
+                    mqa_ql_nope.shape[1],
+                    mqa_ql_nope.shape[2] + mqa_q_pe.shape[2],
+                ),
+                device=mqa_ql_nope.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            _mla_decode_q_concat_quant_fp8_kernel[((mqa_q.numel() + 255) // 256,)](
+                mqa_ql_nope,
+                mqa_q_pe,
+                mla._q_scale,
+                mqa_q,
+                mqa_q.numel(),
+                mqa_q.shape[1],
+                mqa_ql_nope.shape[2],
+                mqa_q_pe.shape[2],
+                mqa_q.shape[2],
+                mqa_ql_nope.stride(0),
+                mqa_ql_nope.stride(1),
+                mqa_ql_nope.stride(2),
+                mqa_q_pe.stride(0),
+                mqa_q_pe.stride(1),
+                mqa_q_pe.stride(2),
+                BLOCK_N=256,
+            )
 
         # FlashInfer sparse MLA decode.
         impl = mla.impl

@@ -357,6 +357,83 @@ def _mla_decode_q_concat_quant_fp8_kernel(
 
 
 @triton.jit
+def _mla_decode_q_project_concat_quant_fp8_kernel(
+    q_ptr,  # [batch, heads, nope_dim + rope_dim]
+    w_ptr,  # [heads, nope_dim, lora_rank]
+    scale_ptr,  # scalar
+    out_ptr,  # [batch, heads, lora_rank + rope_dim]
+    heads: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    lora_rank: tl.constexpr,
+    q_dim: tl.constexpr,
+    out_dim: tl.constexpr,
+    q_stride0,
+    q_stride1,
+    q_stride2,
+    w_stride0,
+    w_stride1,
+    w_stride2,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    block = tl.program_id(2)
+    offs_n = block * BLOCK_N + tl.arange(0, BLOCK_N)
+    scale = tl.load(scale_ptr).to(tl.float32)
+
+    if block * BLOCK_N < lora_rank:
+        offs_k = tl.arange(0, BLOCK_K)
+        q_vals = tl.load(
+            q_ptr + batch * q_stride0 + head * q_stride1 + offs_k * q_stride2,
+            mask=offs_k < nope_dim,
+            other=0.0,
+        )
+        w_vals = tl.load(
+            w_ptr
+            + head * w_stride0
+            + offs_k[:, None] * w_stride1
+            + offs_n[None, :] * w_stride2,
+            mask=(offs_k[:, None] < nope_dim) & (offs_n[None, :] < lora_rank),
+            other=0.0,
+        )
+        vals = tl.reshape(tl.dot(q_vals[None, :], w_vals), [BLOCK_N]).to(
+            tl.float32
+        )
+        vals = vals / scale
+        vals = tl.minimum(tl.maximum(vals, -448.0), 448.0)
+        tl.store(
+            out_ptr
+            + batch * heads * out_dim
+            + head * out_dim
+            + offs_n,
+            vals,
+            mask=offs_n < lora_rank,
+        )
+    else:
+        rope_feature = offs_n - lora_rank
+        vals = tl.load(
+            q_ptr
+            + batch * q_stride0
+            + head * q_stride1
+            + (nope_dim + rope_feature) * q_stride2,
+            mask=rope_feature < rope_dim,
+            other=0.0,
+        ).to(tl.float32)
+        vals = vals / scale
+        vals = tl.minimum(tl.maximum(vals, -448.0), 448.0)
+        tl.store(
+            out_ptr
+            + batch * heads * out_dim
+            + head * out_dim
+            + offs_n,
+            vals,
+            mask=rope_feature < rope_dim,
+        )
+
+
+@triton.jit
 def _indexer_layer_norm_kernel(
     input_ptr,  # [num_tokens, head_dim]
     weight_ptr,  # [head_dim]
