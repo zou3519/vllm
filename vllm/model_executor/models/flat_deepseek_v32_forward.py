@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+import vllm.compilation.passes.fusion.allreduce_rms_fusion  # noqa: F401
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
@@ -26,6 +27,8 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 
 _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _fi_sparse_workspace: torch.Tensor | None = None
+_FI_AR_RESIDUAL_RMS_NORM_PATTERN = 1
+_FI_AR_MAX_TOKEN_NUM = 4681
 
 
 def transformer_layer(
@@ -688,19 +691,35 @@ def transformer_layer(
             hidden_states = hidden_states + bias
     else:
         hidden_states = F.linear(input_parallel, o_proj.weight, bias)
-    if o_proj.reduce_results and o_proj.tp_size > 1:
-        hidden_states = torch.ops.vllm.all_reduce(
-            hidden_states, group_name=tp_group_name
-        )
-
-    # Post-attention RMSNorm and residual.
+    # Post-attention TP all-reduce fused with residual add and RMSNorm.
     norm = layer.post_attention_layernorm
-    ops.fused_add_rms_norm(
-        hidden_states,
-        residual,
-        norm.weight.data,
-        norm.variance_epsilon,
-    )
+    if (
+        o_proj.reduce_results
+        and o_proj.tp_size > 1
+        and hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM
+    ):
+        torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+            o_proj.tp_size,
+            True,
+            True,
+            _FI_AR_MAX_TOKEN_NUM,
+            _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
+        )
+    else:
+        if o_proj.reduce_results and o_proj.tp_size > 1:
+            hidden_states = torch.ops.vllm.all_reduce(
+                hidden_states, group_name=tp_group_name
+            )
+        ops.fused_add_rms_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+        )
 
     # MLP or MoE.
     if isinstance(layer.mlp, DeepseekV2MoE):
