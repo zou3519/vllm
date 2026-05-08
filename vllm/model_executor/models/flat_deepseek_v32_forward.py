@@ -37,34 +37,21 @@ def transformer_layer(
     if residual is None:
         residual = hidden_states.clone()
         norm = layer.input_layernorm
-        x_f = hidden_states.to(torch.float32)
-        x_var = (
-            x_f
-            if norm.variance_size_override is None
-            else x_f[:, :, : norm.variance_size_override]
+        hidden_states = torch.empty_like(hidden_states)
+        ops.rms_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
         )
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-        hidden_states = (
-            x_f * torch.rsqrt(variance + norm.variance_epsilon)
-        ).to(hidden_states.dtype)
-        if norm.has_weight:
-            hidden_states = hidden_states * norm.weight.data
     else:
         norm = layer.input_layernorm
-        orig_dtype = hidden_states.dtype
-        x_f = hidden_states.to(torch.float32) + residual
-        residual = x_f.to(orig_dtype)
-        x_var = (
-            x_f
-            if norm.variance_size_override is None
-            else x_f[:, :, : norm.variance_size_override]
+        ops.fused_add_rms_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
         )
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-        hidden_states = (x_f * torch.rsqrt(variance + norm.variance_epsilon)).to(
-            orig_dtype
-        )
-        if norm.has_weight:
-            hidden_states = hidden_states * norm.weight.data
 
     # MLA fused q/kv A projection.
     attn = layer.self_attn
@@ -125,16 +112,14 @@ def transformer_layer(
 
     # q_a RMSNorm.
     norm = wrapper.q_a_layernorm
-    x_f = q_c.to(torch.float32)
-    x_var = (
-        x_f
-        if norm.variance_size_override is None
-        else x_f[:, :, : norm.variance_size_override]
+    q_c_normed = torch.empty_like(q_c)
+    ops.rms_norm(
+        q_c_normed,
+        q_c,
+        norm.weight.data,
+        norm.variance_epsilon,
     )
-    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-    q_c = (x_f * torch.rsqrt(variance + norm.variance_epsilon)).to(q_c.dtype)
-    if norm.has_weight:
-        q_c = q_c * norm.weight.data
+    q_c = q_c_normed
 
     # q_b projection.
     q_b_proj = wrapper.q_b_proj
@@ -179,16 +164,13 @@ def transformer_layer(
         [wrapper.kv_lora_rank, wrapper.qk_rope_head_dim], dim=-1
     )
     norm = wrapper.kv_a_layernorm
-    x_f = kv_c.to(torch.float32)
-    x_var = (
-        x_f
-        if norm.variance_size_override is None
-        else x_f[:, :, : norm.variance_size_override]
+    kv_c_normed = torch.empty_like(kv_c)
+    ops.rms_norm(
+        kv_c_normed,
+        kv_c,
+        norm.weight.data,
+        norm.variance_epsilon,
     )
-    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-    kv_c_normed = (x_f * torch.rsqrt(variance + norm.variance_epsilon)).to(kv_c.dtype)
-    if norm.has_weight:
-        kv_c_normed = kv_c_normed * norm.weight.data
 
     # MLA RoPE.
     q = q.view(-1, wrapper.num_heads, wrapper.qk_head_dim)
@@ -732,20 +714,12 @@ def transformer_layer(
 
     # Post-attention RMSNorm and residual.
     norm = layer.post_attention_layernorm
-    orig_dtype = hidden_states.dtype
-    x_f = hidden_states.to(torch.float32) + residual
-    residual = x_f.to(orig_dtype)
-    x_var = (
-        x_f
-        if norm.variance_size_override is None
-        else x_f[:, :, : norm.variance_size_override]
+    ops.fused_add_rms_norm(
+        hidden_states,
+        residual,
+        norm.weight.data,
+        norm.variance_epsilon,
     )
-    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-    hidden_states = (x_f * torch.rsqrt(variance + norm.variance_epsilon)).to(
-        orig_dtype
-    )
-    if norm.has_weight:
-        hidden_states = hidden_states * norm.weight.data
 
     # MLP or MoE.
     if isinstance(layer.mlp, DeepseekV2MoE):
@@ -1095,20 +1069,12 @@ def flat_forward(
 
     # Final RMSNorm.
     norm = model.norm
-    orig_dtype = hidden_states.dtype
-    x_f = hidden_states.to(torch.float32) + residual
-    residual = x_f.to(orig_dtype)
-    x_var = (
-        x_f
-        if norm.variance_size_override is None
-        else x_f[:, :, : norm.variance_size_override]
+    ops.fused_add_rms_norm(
+        hidden_states,
+        residual,
+        norm.weight.data,
+        norm.variance_epsilon,
     )
-    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-    hidden_states = (x_f * torch.rsqrt(variance + norm.variance_epsilon)).to(
-        orig_dtype
-    )
-    if norm.has_weight:
-        hidden_states = hidden_states * norm.weight.data
     del residual
 
     if len(aux_hidden_states) > 0:
