@@ -222,6 +222,10 @@ LOOP FOREVER until the flat model produces correct output:
 - Expose pointwise/reduction work in the flat forward. The optimizer needs to
   see residual add, RMSNorm, quantization, RoPE, KV-cache write, top-k/routing
   prep, and final reduction boundaries to decide what to fuse.
+- Keep the flat forward shaped so later optimization can attempt aggressive
+  vertical and horizontal fusion across adjacent decode-only operations,
+  especially pointwise, reduction, quantization, RoPE, cache-write, routing, and
+  same-shape independent streams.
 - Do not assume custom scalar GEMV is a good MoE replacement. For quantized MoE,
   future custom kernels should preserve tensor-core/blockscaled math or build
   directly on a proven low-latency backend.

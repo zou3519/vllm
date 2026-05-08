@@ -226,6 +226,11 @@ LOOP FOREVER:
 
 ### Kernel fusions
 Fuse adjacent small kernels into one launch. Low risk, no quality impact.
+Bias toward aggressive vertical and horizontal fusions: look across the whole
+decode layer for adjacent pointwise/reduction/cache/quantization work and for
+same-shape independent streams that can reasonably share one kernel launch.
+Prefer one larger guarded BS=1 decode kernel when it removes multiple launches,
+temporary tensors, or repeated HBM reads.
 - LayerNorm + quantize → one Triton kernel
 - Activation + multiply + quantize → one Triton kernel
 - RoPE + KV cache write → one Triton kernel
