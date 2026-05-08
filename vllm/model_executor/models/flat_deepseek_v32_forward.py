@@ -345,7 +345,7 @@ def transformer_layer(
 
         # Sparse indexer K LayerNorm and RoPE.
         index_k = F.layer_norm(
-            index_k.float(),
+            index_k,
             (indexer.k_norm.dim,),
             indexer.k_norm.weight,
             indexer.k_norm.bias,
