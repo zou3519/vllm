@@ -841,6 +841,20 @@ def transformer_layer(
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        quant_method = moe.experts.quant_method
+        kernel = quant_method.moe_kernel
+        assert kernel is not None and kernel.is_monolithic
+        assert isinstance(kernel.fused_experts, TrtLlmNvFp4ExpertsMonolithic)
+        fused_experts = kernel.fused_experts
+        quant_config = fused_experts.quant_config
+        assert not fused_experts.expects_unquantized_inputs
+        input_sf = quant_config.a1_gscale
+        assert quant_config.use_nvfp4_w4a4
+        assert quant_config.quant_dtype == "nvfp4"
+        assert quant_config.block_shape is None
+        a1q = None
+        a1q_scale = None
+
         # Optional shared experts.
         shared_output = None
         if moe.shared_experts is not None:
@@ -854,16 +868,33 @@ def transformer_layer(
                     *hidden_states.shape[:-1],
                     gate_up_proj.output_size_per_partition,
                 ]
-                x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                    hidden_states,
-                    gate_up_proj.input_global_scale_inv,
-                    is_sf_swizzled_layout=True,
-                    backend=gate_up_proj.quant_method.backend.value,
+                reuse_moe_input_quant = (
+                    gate_up_proj.weights_padding_cols == 0
+                    and not quant_config.is_nvfp4_scale_swizzled
+                    and gate_up_proj.input_global_scale_inv.numel() == 1
+                    and input_sf.numel() == 1
+                    and hidden_states.shape[-1]
+                    == gate_up_proj.input_size_per_partition
                 )
-                if gate_up_proj.weights_padding_cols > 0:
-                    x_fp4 = F.pad(
-                        x_fp4, (0, gate_up_proj.weights_padding_cols)
-                    ).contiguous()
+                if reuse_moe_input_quant:
+                    a1q, a1q_scale = ops.scaled_fp4_quant(
+                        hidden_states,
+                        input_sf,
+                        is_sf_swizzled_layout=False,
+                    )
+                    x_fp4 = a1q
+                    x_blockscale = a1q_scale
+                else:
+                    x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                        hidden_states,
+                        gate_up_proj.input_global_scale_inv,
+                        is_sf_swizzled_layout=True,
+                        backend=gate_up_proj.quant_method.backend.value,
+                    )
+                    if gate_up_proj.weights_padding_cols > 0:
+                        x_fp4 = F.pad(
+                            x_fp4, (0, gate_up_proj.weights_padding_cols)
+                        ).contiguous()
                 backend_name = gate_up_proj.quant_method.backend.value[
                     len("flashinfer-") :
                 ]
@@ -874,7 +905,11 @@ def transformer_layer(
                     gate_up_proj.weight_scale.view(torch.uint8).t(),
                     gate_up_proj.alpha,
                     hidden_states.dtype,
-                    backend_name == "trtllm" and x_fp4.shape[0] <= 32,
+                    (
+                        backend_name == "trtllm"
+                        and x_fp4.shape[0] <= 32
+                        and not reuse_moe_input_quant
+                    ),
                     backend_name,
                 )
                 if gate_up.shape[-1] != gate_up_proj.output_size_per_partition:
@@ -1019,22 +1054,12 @@ def transformer_layer(
                 router_logits = router_logits.to(gate.out_dtype)
 
         # FlashInfer TRTLLM NVFP4 monolithic MoE.
-        quant_method = moe.experts.quant_method
-        kernel = quant_method.moe_kernel
-        assert kernel is not None and kernel.is_monolithic
-        assert isinstance(kernel.fused_experts, TrtLlmNvFp4ExpertsMonolithic)
-        fused_experts = kernel.fused_experts
-        quant_config = fused_experts.quant_config
-        assert not fused_experts.expects_unquantized_inputs
-        input_sf = quant_config.a1_gscale
-        assert quant_config.use_nvfp4_w4a4
-        assert quant_config.quant_dtype == "nvfp4"
-        assert quant_config.block_shape is None
-        a1q, a1q_scale = ops.scaled_fp4_quant(
-            hidden_states,
-            input_sf,
-            is_sf_swizzled_layout=quant_config.is_nvfp4_scale_swizzled,
-        )
+        if a1q is None:
+            a1q, a1q_scale = ops.scaled_fp4_quant(
+                hidden_states,
+                input_sf,
+                is_sf_swizzled_layout=quant_config.is_nvfp4_scale_swizzled,
+            )
         assert fused_experts.routing_method_type == RoutingMethodType.DeepSeekV3
         router_logits = router_logits.to(torch.float32)
         e_score_correction_bias = moe.experts.e_score_correction_bias
