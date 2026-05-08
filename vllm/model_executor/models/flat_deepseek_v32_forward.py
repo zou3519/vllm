@@ -662,10 +662,6 @@ def transformer_layer(
         out_view = attn_output_actual.view(-1, mla.num_heads, mla.v_head_dim)
         out_t = out_view.transpose(0, 1)
         torch.bmm(x, mla.W_UV, out=out_t)
-        out_new = out_t.transpose(0, 1).reshape(-1, mla.num_heads * mla.v_head_dim)
-        n_heads, batch, v_dim = out_t.shape
-        out_t.resize_((batch, n_heads * v_dim))
-        out_t.copy_(out_new)
 
     # MLA o projection.
     o_proj = wrapper.o_proj
