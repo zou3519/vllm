@@ -972,10 +972,14 @@ def transformer_layer(
             activation_type=activation_type,
         )[0]
 
-        final_hidden_states *= moe.routed_scaling_factor
-
         if shared_output is not None:
-            final_hidden_states += shared_output
+            final_hidden_states = torch.add(
+                shared_output,
+                final_hidden_states,
+                alpha=moe.routed_scaling_factor,
+            )
+        else:
+            final_hidden_states *= moe.routed_scaling_factor
 
         hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
     else:
