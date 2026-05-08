@@ -9,66 +9,6 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 
 
 @triton.jit
-def _moe_finalize_top4_kernel(
-    gemm2_output_ptr,
-    expert_weights_ptr,
-    expanded_idx_to_permuted_idx_ptr,
-    output_ptr,
-    gemm2_stride: tl.int64,
-    expert_weights_stride: tl.int64,
-    output_stride: tl.int64,
-    hidden_size: tl.constexpr,
-    TOP_K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(axis=0)
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < hidden_size
-
-    acc = tl.full((BLOCK_SIZE,), 0.0, tl.float32)
-    for k in range(TOP_K):
-        permuted_idx = tl.load(
-            expanded_idx_to_permuted_idx_ptr + row * TOP_K + k
-        ).to(tl.int64)
-        weight = tl.load(expert_weights_ptr + row * expert_weights_stride + k).to(
-            tl.float32
-        )
-        values = tl.load(
-            gemm2_output_ptr + permuted_idx * gemm2_stride + offs,
-            mask=mask & (permuted_idx >= 0),
-            other=0.0,
-        ).to(tl.float32)
-        acc += values * weight
-
-    tl.store(output_ptr + row * output_stride + offs, acc, mask=mask)
-
-
-def moe_finalize_top4(
-    gemm2_output: torch.Tensor,
-    expert_weights: torch.Tensor,
-    expanded_idx_to_permuted_idx: torch.Tensor,
-    output_like: torch.Tensor,
-) -> torch.Tensor:
-    hidden_size = output_like.shape[-1]
-    output = torch.empty_like(output_like)
-    block_size = triton.next_power_of_2(hidden_size)
-    _moe_finalize_top4_kernel[(output_like.shape[0],)](
-        gemm2_output,
-        expert_weights,
-        expanded_idx_to_permuted_idx,
-        output,
-        gemm2_output.stride(0),
-        expert_weights.stride(0),
-        output.stride(0),
-        hidden_size,
-        expert_weights.shape[-1],
-        block_size,
-        num_warps=8,
-    )
-    return output
-
-
-@triton.jit
 def _fused_add_rms_norm_mxfp8_quant_kernel(
     input_ptr,
     residual_ptr,

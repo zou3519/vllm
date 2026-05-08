@@ -13,7 +13,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.model_executor.models.flat_gpt_oss_kernels import (
     fused_add_rms_norm_mxfp8_quant,
-    moe_finalize_top4,
     rope_and_cache,
 )
 from vllm.sequence import IntermediateTensors
@@ -85,45 +84,38 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     routing_method_type: int,
     tune_max_num_tokens: int,
 ) -> torch.Tensor:
-    gemm2_output, expert_weights, expanded_idx_to_permuted_idx = (
-        trtllm_fp4_block_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=None,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=gemm1_weights,
-            gemm1_weights_scale=gemm1_weights_scale,
-            gemm1_bias=gemm1_bias,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_beta=gemm1_beta,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-            gemm2_weights=gemm2_weights,
-            gemm2_weights_scale=gemm2_weights_scale,
-            gemm2_bias=gemm2_bias,
-            output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
-            num_experts=num_experts,
-            top_k=top_k,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=intermediate_size,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=routing_method_type,
-            do_finalize=False,
-            enable_pdl=True,
-            tune_max_num_tokens=tune_max_num_tokens,
-            output=None,
-        )
-    )
-    return moe_finalize_top4(
-        gemm2_output,
-        expert_weights,
-        expanded_idx_to_permuted_idx,
-        output_like,
-    )
+    output = torch.empty_like(output_like)
+    return trtllm_fp4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=gemm1_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=gemm2_bias,
+        output1_scale_scalar=None,
+        output1_scale_gate_scalar=None,
+        output2_scale_scalar=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type,
+        do_finalize=True,
+        enable_pdl=True,
+        tune_max_num_tokens=tune_max_num_tokens,
+        output=output,
+    )[0]
 
 
 def _flashinfer_trtllm_fp4_block_scale_moe_fake(
