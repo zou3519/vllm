@@ -9,6 +9,42 @@ from vllm.triton_utils import tl, triton
 
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
+def _indexer_layer_norm_kernel(
+    input_ptr,  # [num_tokens, head_dim]
+    weight_ptr,  # [head_dim]
+    bias_ptr,  # [head_dim]
+    out_ptr,  # [num_tokens, head_dim]
+    head_dim: tl.constexpr,
+    input_stride0,
+    input_stride1,
+    out_stride0,
+    out_stride1,
+    EPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < head_dim
+    x = tl.load(
+        input_ptr + row * input_stride0 + cols * input_stride1,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    mean = tl.sum(tl.where(mask, x, 0.0), axis=0) / head_dim
+    centered = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / head_dim
+    inv_std = tl.rsqrt(var + EPS)
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = centered * inv_std * weight + bias
+    tl.store(
+        out_ptr + row * out_stride0 + cols * out_stride1,
+        y,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _scale_index_weights_kernel(
     weights_ptr,  # [num_tokens, n_head]
     scales_ptr,  # [num_tokens, n_head]

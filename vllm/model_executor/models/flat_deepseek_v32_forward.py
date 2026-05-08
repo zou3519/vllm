@@ -21,6 +21,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _indexer_layer_norm_kernel,
     _scale_index_weights_kernel,
     triton_convert_req_index_to_global_index,
 )
@@ -344,13 +345,26 @@ def transformer_layer(
             index_weights = F.linear(hidden_states, weights_proj.weight, bias)
 
         # Sparse indexer K LayerNorm and RoPE.
-        index_k = F.layer_norm(
-            index_k.float(),
-            (indexer.k_norm.dim,),
+        assert indexer.k_norm.dim <= 256
+        index_k_normed = torch.empty(
+            index_k.shape,
+            dtype=index_k.dtype,
+            device=index_k.device,
+        )
+        _indexer_layer_norm_kernel[(index_k.shape[0],)](
+            index_k,
             indexer.k_norm.weight,
             indexer.k_norm.bias,
-            indexer.k_norm.eps,
-        ).type_as(index_k)
+            index_k_normed,
+            indexer.k_norm.dim,
+            index_k.stride(0),
+            index_k.stride(1),
+            index_k_normed.stride(0),
+            index_k_normed.stride(1),
+            EPS=indexer.k_norm.eps,
+            BLOCK_N=256,
+        )
+        index_k = index_k_normed
         k_pe_index = index_k[..., : indexer.rope_dim]
         rotary = wrapper.indexer_rope_emb
         k_pe_index = k_pe_index.unsqueeze(1)
