@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
@@ -33,6 +34,7 @@ def transformer_layer(
     hidden_states,
     residual,
     forward_context,
+    tp_group_name,
 ):
     global _fi_sparse_workspace
 
@@ -687,7 +689,9 @@ def transformer_layer(
     else:
         hidden_states = F.linear(input_parallel, o_proj.weight, bias)
     if o_proj.reduce_results and o_proj.tp_size > 1:
-        torch.distributed.all_reduce(hidden_states)
+        hidden_states = torch.ops.vllm.all_reduce(
+            hidden_states, group_name=tp_group_name
+        )
 
     # Post-attention RMSNorm and residual.
     norm = layer.post_attention_layernorm
@@ -809,7 +813,9 @@ def transformer_layer(
             else:
                 shared_output = F.linear(input_parallel, down_proj.weight, bias)
             if down_proj.reduce_results and down_proj.tp_size > 1:
-                torch.distributed.all_reduce(shared_output)
+                shared_output = torch.ops.vllm.all_reduce(
+                    shared_output, group_name=tp_group_name
+                )
 
         # Router.
         gate = moe.gate
@@ -900,7 +906,9 @@ def transformer_layer(
             final_hidden_states += shared_output
 
         if moe.tp_size > 1:
-            torch.distributed.all_reduce(final_hidden_states)
+            final_hidden_states = torch.ops.vllm.all_reduce(
+                final_hidden_states, group_name=tp_group_name
+            )
         hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
     else:
         mlp = layer.mlp
@@ -1003,7 +1011,9 @@ def transformer_layer(
         else:
             hidden_states = F.linear(input_parallel, down_proj.weight, bias)
         if down_proj.reduce_results and down_proj.tp_size > 1:
-            torch.distributed.all_reduce(hidden_states)
+            hidden_states = torch.ops.vllm.all_reduce(
+                hidden_states, group_name=tp_group_name
+            )
 
     return hidden_states, residual
 
@@ -1029,6 +1039,7 @@ def flat_forward(
 
     # Decoder stack.
     forward_context = get_forward_context()
+    tp_group_name = get_tp_group().unique_name
     aux_hidden_states = []
     for idx, layer in enumerate(
         islice(model.layers, model.start_layer, model.end_layer),
@@ -1042,6 +1053,7 @@ def flat_forward(
             hidden_states,
             residual,
             forward_context,
+            tp_group_name,
         )
 
     # Final RMSNorm.
