@@ -510,6 +510,14 @@ def transformer_layer(
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
             assert indexer.head_dim <= 128
+            k_cache_fp8 = getattr(indexer.k_cache, "_flat_kv_cache_fp8", None)
+            if k_cache_fp8 is None:
+                k_cache_fp8 = indexer.k_cache.kv_cache.view(torch.float8_e4m3fn)
+                indexer.k_cache._flat_kv_cache_fp8 = k_cache_fp8
+            k_cache_f32 = getattr(indexer.k_cache, "_flat_kv_cache_f32", None)
+            if k_cache_f32 is None:
+                k_cache_f32 = indexer.k_cache.kv_cache.view(torch.float32)
+                indexer.k_cache._flat_kv_cache_f32 = k_cache_f32
             _index_k_norm_rope_cache_kernel[(index_k.shape[0],)](
                 index_k,
                 positions.flatten(),
@@ -517,8 +525,8 @@ def transformer_layer(
                 indexer.k_norm.weight,
                 indexer.k_norm.bias,
                 slot_mapping,
-                indexer.k_cache.kv_cache.view(torch.float8_e4m3fn),
-                indexer.k_cache.kv_cache.view(torch.float32),
+                k_cache_fp8,
+                k_cache_f32,
                 index_k.shape[0],
                 indexer.head_dim,
                 indexer.rope_dim,
@@ -741,7 +749,10 @@ def transformer_layer(
 
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
-        kv_cache_fp8 = mla.kv_cache.view(torch.float8_e4m3fn)
+        kv_cache_fp8 = getattr(mla, "_flat_kv_cache_fp8", None)
+        if kv_cache_fp8 is None:
+            kv_cache_fp8 = mla.kv_cache.view(torch.float8_e4m3fn)
+            mla._flat_kv_cache_fp8 = kv_cache_fp8
         sparse_out = trtllm_batch_decode_with_kv_cache_mla(
             query=mqa_q.unsqueeze(1),
             kv_cache=kv_cache_fp8.unsqueeze(1),
@@ -1050,6 +1061,14 @@ def transformer_layer(
         assert a1q_scale is not None
         assert quant_config.w1_scale is not None
         assert quant_config.w2_scale is not None
+        w1_scale_fp8 = getattr(moe.experts, "_flat_w1_scale_fp8", None)
+        if w1_scale_fp8 is None:
+            w1_scale_fp8 = quant_config.w1_scale.view(torch.float8_e4m3fn)
+            moe.experts._flat_w1_scale_fp8 = w1_scale_fp8
+        w2_scale_fp8 = getattr(moe.experts, "_flat_w2_scale_fp8", None)
+        if w2_scale_fp8 is None:
+            w2_scale_fp8 = quant_config.w2_scale.view(torch.float8_e4m3fn)
+            moe.experts._flat_w2_scale_fp8 = w2_scale_fp8
 
         import flashinfer
 
@@ -1063,13 +1082,13 @@ def transformer_layer(
                 *a1q.shape[:-1], -1
             ),
             gemm1_weights=moe.experts.w13_weight,
-            gemm1_weights_scale=quant_config.w1_scale.view(torch.float8_e4m3fn),
+            gemm1_weights_scale=w1_scale_fp8,
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
             gemm2_weights=moe.experts.w2_weight,
-            gemm2_weights_scale=quant_config.w2_scale.view(torch.float8_e4m3fn),
+            gemm2_weights_scale=w2_scale_fp8,
             gemm2_bias=None,
             output1_scale_scalar=fused_experts.g1_scale_c,
             output1_scale_gate_scalar=quant_config.g1_alphas,
