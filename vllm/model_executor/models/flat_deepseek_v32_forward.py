@@ -577,6 +577,14 @@ def transformer_layer(
             [wrapper.qk_nope_head_dim, wrapper.qk_rope_head_dim], dim=-1
         )
         mqa_q_nope = mqa_q_nope.transpose(0, 1)
+        if mla.q_pad_num_heads is not None:
+            bsz, heads, rope_dim = mqa_q_pe.shape
+            mqa_pe_padded = mqa_q_pe.new_empty(
+                (bsz, mla.q_pad_num_heads, rope_dim)
+            )
+            mqa_pe_padded.resize_((bsz, heads, rope_dim))
+            mqa_pe_padded.copy_(mqa_q_pe)
+            mqa_q_pe = mqa_pe_padded
 
         heads, batch, _ = mqa_q_nope.shape
         _, _, lora_rank = mla.W_UK_T.shape
