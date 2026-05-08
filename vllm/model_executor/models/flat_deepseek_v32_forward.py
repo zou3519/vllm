@@ -22,6 +22,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
     _indexer_layer_norm_kernel,
+    _mla_decode_q_concat_kernel,
     _scale_index_weights_kernel,
     triton_convert_req_index_to_global_index,
 )
@@ -614,7 +615,30 @@ def transformer_layer(
         torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
         mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-        decode_q0 = torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1)
+        decode_q0 = mqa_ql_nope.new_empty(
+            (
+                mqa_ql_nope.shape[0],
+                mqa_ql_nope.shape[1],
+                mqa_ql_nope.shape[2] + mqa_q_pe.shape[2],
+            )
+        )
+        _mla_decode_q_concat_kernel[((decode_q0.numel() + 255) // 256,)](
+            mqa_ql_nope,
+            mqa_q_pe,
+            decode_q0,
+            decode_q0.numel(),
+            decode_q0.shape[1],
+            mqa_ql_nope.shape[2],
+            mqa_q_pe.shape[2],
+            decode_q0.shape[2],
+            mqa_ql_nope.stride(0),
+            mqa_ql_nope.stride(1),
+            mqa_ql_nope.stride(2),
+            mqa_q_pe.stride(0),
+            mqa_q_pe.stride(1),
+            mqa_q_pe.stride(2),
+            BLOCK_N=256,
+        )
         decode_q_flat = decode_q0.reshape(decode_q0.shape[0], -1)
         mqa_q, _ = ops.scaled_fp8_quant(
             decode_q_flat,
