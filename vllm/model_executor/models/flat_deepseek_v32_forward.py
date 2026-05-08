@@ -1075,9 +1075,11 @@ def transformer_layer(
             activation_type=activation_type,
         )[0]
 
-        assert shared_output is not None
-        shared_output.add_(final_hidden_states, alpha=moe.routed_scaling_factor)
-        final_hidden_states = shared_output
+        if shared_output is not None:
+            shared_output.add_(final_hidden_states, alpha=moe.routed_scaling_factor)
+            final_hidden_states = shared_output
+        else:
+            final_hidden_states *= moe.routed_scaling_factor
 
         hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
     else:
