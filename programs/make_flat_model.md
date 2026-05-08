@@ -151,6 +151,13 @@ LOOP FOREVER until the flat model produces correct output:
    `--hf-overrides '{"architectures": ["Flat<Model>ForCausalLM"]}'` to
    use your flat model. Redirect output to a log file and run in background.
    Wait for "Application startup complete" in the log.
+   If the agent is getting killed by OOM attribution while the vLLM server is
+   alive, start vLLM with `systemd-run --user --collect --unit=<name>` as a
+   transient user service and pass required env vars explicitly, especially
+   `PATH`, `HOME`, backend selector env vars, and offline/cache env vars. Check
+   `systemctl --user status <name>.service` and confirm the server cgroup is
+   under `user@<uid>.service/app.slice/`, then stop it with
+   `systemctl --user stop <name>.service`.
 
 2. **Test correctness** — send these prompts and check the answers:
    - "What is 2+2?" → should answer 4

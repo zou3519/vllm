@@ -68,6 +68,26 @@ complete" in the log. Before each start, check for and stop stale vLLM
 server/EngineCore processes from previous runs; after each run, stop the server
 and verify none remain.
 
+If the host OOM manager keeps killing the agent because vLLM memory is charged
+to the agent sandbox cgroup, launch vLLM as a separate user systemd service.
+Prefer a transient service over `--scope` when resource delegation fails:
+```bash
+systemd-run --user --collect --unit=vllm-auto-<hash> \
+  --working-directory="$PWD" \
+  --setenv=HOME="$HOME" \
+  --setenv=USER="$USER" \
+  --setenv=PATH="$PATH" \
+  --setenv=VLLM_USE_FLASHINFER_MOE_FP4=1 \
+  /usr/bin/bash -lc 'exec vllm serve ... > /tmp/vllm-auto-<hash>.log 2>&1'
+```
+Pass every required environment variable explicitly, including `PATH` so JIT
+tools such as `ninja` are visible. In offline runs, pass the local checkpoint
+snapshot path and `--served-model-name <original-model-name>`, plus the required
+offline/cache env vars. Verify placement with
+`systemctl --user status vllm-auto-<hash>.service`; the cgroup should be under
+`user@<uid>.service/app.slice/`, not the agent sandbox slice. Stop it with
+`systemctl --user stop vllm-auto-<hash>.service`.
+
 Do not change target-defining serve flags while comparing optimizations. In
 particular, keep `--max-num-batched-tokens` exactly as specified by the target
 serve command, even if smaller values look faster. If you intentionally measure
