@@ -38,6 +38,7 @@ def transformer_layer(
     residual,
     forward_context,
     tp_group_name,
+    tp_size,
 ):
     global _fi_sparse_workspace
 
@@ -54,12 +55,28 @@ def transformer_layer(
         )
     else:
         norm = layer.input_layernorm
-        ops.fused_add_rms_norm(
-            hidden_states,
-            residual,
-            norm.weight.data,
-            norm.variance_epsilon,
-        )
+        if hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM:
+            torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+                hidden_states,
+                residual,
+                norm.weight.data,
+                norm.variance_epsilon,
+                tp_size,
+                True,
+                True,
+                _FI_AR_MAX_TOKEN_NUM,
+                _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
+            )
+        else:
+            hidden_states = torch.ops.vllm.all_reduce(
+                hidden_states, group_name=tp_group_name
+            )
+            ops.fused_add_rms_norm(
+                hidden_states,
+                residual,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
 
     # MLA fused q/kv A projection.
     attn = layer.self_attn
@@ -924,10 +941,6 @@ def transformer_layer(
         if shared_output is not None:
             final_hidden_states += shared_output
 
-        if moe.tp_size > 1:
-            final_hidden_states = torch.ops.vllm.all_reduce(
-                final_hidden_states, group_name=tp_group_name
-            )
         hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
     else:
         mlp = layer.mlp
@@ -1029,10 +1042,6 @@ def transformer_layer(
                 hidden_states = hidden_states + bias
         else:
             hidden_states = F.linear(input_parallel, down_proj.weight, bias)
-        if down_proj.reduce_results and down_proj.tp_size > 1:
-            hidden_states = torch.ops.vllm.all_reduce(
-                hidden_states, group_name=tp_group_name
-            )
 
     return hidden_states, residual
 
@@ -1058,14 +1067,24 @@ def flat_forward(
 
     # Decoder stack.
     forward_context = get_forward_context()
-    tp_group_name = get_tp_group().unique_name
+    tp_group = get_tp_group()
+    tp_group_name = tp_group.unique_name
+    tp_size = tp_group.world_size
     aux_hidden_states = []
     for idx, layer in enumerate(
         islice(model.layers, model.start_layer, model.end_layer),
         start=model.start_layer,
     ):
         if idx in model.aux_hidden_state_layers:
-            aux_hidden_states.append(hidden_states + residual)
+            if residual is None:
+                aux_hidden_states.append(hidden_states)
+            else:
+                aux_hidden_states.append(
+                    torch.ops.vllm.all_reduce(
+                        hidden_states, group_name=tp_group_name
+                    )
+                    + residual
+                )
         hidden_states, residual = transformer_layer(
             layer,
             positions,
@@ -1073,16 +1092,33 @@ def flat_forward(
             residual,
             forward_context,
             tp_group_name,
+            tp_size,
         )
 
-    # Final RMSNorm.
+    # Final TP all-reduce fused with RMSNorm.
     norm = model.norm
-    ops.fused_add_rms_norm(
-        hidden_states,
-        residual,
-        norm.weight.data,
-        norm.variance_epsilon,
-    )
+    if hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM:
+        torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+            tp_size,
+            True,
+            True,
+            _FI_AR_MAX_TOKEN_NUM,
+            _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
+        )
+    else:
+        hidden_states = torch.ops.vllm.all_reduce(
+            hidden_states, group_name=tp_group_name
+        )
+        ops.fused_add_rms_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+        )
     del residual
 
     if len(aux_hidden_states) > 0:
