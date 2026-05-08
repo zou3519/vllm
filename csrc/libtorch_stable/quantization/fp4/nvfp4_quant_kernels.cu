@@ -198,38 +198,18 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
   for (int rowIdx = blockIdx.x; rowIdx < sf_m_128x4; rowIdx += gridDim.x) {
     if (colIdx < num_padded_cols) {
-      bool valid = (rowIdx < numRows) && (elem_idx < numCols);
-      if (!valid) {
-        uint8_t* sf_out_8x4 = nullptr;
-        if (rowIdx < sf_m_8x4) {
-          sf_out_8x4 =
-              cvt_quant_to_fp4_get_sf_out_offset_8x4<uint32_t,
-                                                     CVT_FP4_NUM_THREADS_PER_SF>(
-                  rowIdx, colIdx, numKTiles, SFout8x4);
-        }
-        if (sf_out_8x4) {
-          *sf_out_8x4 = 0x00;
-        }
-        auto sf_out_128x4 =
-            cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                               CVT_FP4_NUM_THREADS_PER_SF>(
-                rowIdx, colIdx, numKTiles, SFout128x4);
-        if (sf_out_128x4) {
-          *sf_out_128x4 = 0x00;
-        }
-        continue;
-      }
-
       PackedVec in_vec;
       int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+
+      bool valid = (rowIdx < numRows) && (elem_idx < numCols);
       if constexpr (CVT_FP4_PACK16) {
         ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
                          &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
-                         true);
+                         valid);
       } else {
         ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec),
                          &reinterpret_cast<const uint32_t*>(in)[inOffset * 4],
-                         true);
+                         valid);
       }
 
       uint8_t* sf_out_8x4 = nullptr;
@@ -251,17 +231,19 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
           cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
               in_vec, global_scale_128x4, sf_out_128x4);
 
-      if constexpr (CVT_FP4_PACK16) {
-        int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-        uint64_t packed8x4 =
-            (uint64_t(out_val_8x4.hi) << 32) | uint64_t(out_val_8x4.lo);
-        uint64_t packed128x4 =
-            (uint64_t(out_val_128x4.hi) << 32) | uint64_t(out_val_128x4.lo);
-        reinterpret_cast<uint64_t*>(out8x4)[outOffset >> 1] = packed8x4;
-        reinterpret_cast<uint64_t*>(out128x4)[outOffset >> 1] = packed128x4;
-      } else {
-        out8x4[inOffset] = out_val_8x4;
-        out128x4[inOffset] = out_val_128x4;
+      if (valid) {
+        if constexpr (CVT_FP4_PACK16) {
+          int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
+          uint64_t packed8x4 =
+              (uint64_t(out_val_8x4.hi) << 32) | uint64_t(out_val_8x4.lo);
+          uint64_t packed128x4 =
+              (uint64_t(out_val_128x4.hi) << 32) | uint64_t(out_val_128x4.lo);
+          reinterpret_cast<uint64_t*>(out8x4)[outOffset >> 1] = packed8x4;
+          reinterpret_cast<uint64_t*>(out128x4)[outOffset >> 1] = packed128x4;
+        } else {
+          out8x4[inOffset] = out_val_8x4;
+          out128x4[inOffset] = out_val_128x4;
+        }
       }
     }
   }
