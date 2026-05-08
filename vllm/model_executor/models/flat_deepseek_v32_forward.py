@@ -639,6 +639,7 @@ def transformer_layer(
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             BLOCK_N=topk_indices.shape[1],
             return_valid_counts=True,
+            valid_count_lens=attn_metadata.seq_lens,
         )
         if impl._workspace_buffer is None:
             if _fi_sparse_workspace is None:

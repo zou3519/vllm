@@ -86,6 +86,7 @@ def _convert_req_index_to_global_index_kernel(
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     valid_count_ptr,  # int32 [num_tokens] - output valid count per row
+    valid_count_lens_ptr,  # int32 [num_requests] or nullptr
     prefill_request_id_ptr,  # int32 [num_tokens], -1 for decode, >=0 for prefill
     workspace_starts_ptr,  # int32 [num_prefill_reqs+1] or nullptr
     # shapes (compile-time where possible)
@@ -95,6 +96,8 @@ def _convert_req_index_to_global_index_kernel(
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
     SINGLE_TILE: tl.constexpr,  # whether the row has one column tile
+    USE_VALID_COUNT_LENS: tl.constexpr,
+    MAX_VALID_COUNT: tl.constexpr,
     # strides (in elements)
     bt_stride0,
     bt_stride1,
@@ -150,11 +153,19 @@ def _convert_req_index_to_global_index_kernel(
 
     # Count valid indices in this tile and atomically add to row total
     if COUNT_VALID:
-        tile_valid_count = tl.sum((~is_invalid_tok).to(tl.int32))
-        if SINGLE_TILE:
-            tl.store(valid_count_ptr + token_id, tile_valid_count)
+        if USE_VALID_COUNT_LENS:
+            if tile_id == 0:
+                seq_len = tl.load(valid_count_lens_ptr + req)
+                tl.store(
+                    valid_count_ptr + token_id,
+                    tl.minimum(seq_len, MAX_VALID_COUNT),
+                )
         else:
-            tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
+            tile_valid_count = tl.sum((~is_invalid_tok).to(tl.int32))
+            if SINGLE_TILE:
+                tl.store(valid_count_ptr + token_id, tile_valid_count)
+            else:
+                tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
 
 
 def triton_convert_req_index_to_global_index(
@@ -168,6 +179,7 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    valid_count_lens: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -204,6 +216,8 @@ def triton_convert_req_index_to_global_index(
         assert prefill_workspace_starts is not None
         assert prefill_workspace_request_ids.dtype == torch.int32
         assert prefill_workspace_starts.dtype == torch.int32
+    if valid_count_lens is not None:
+        assert valid_count_lens.dtype == torch.int32
 
     num_tokens = req_id.shape[0]
     max_num_blocks_per_req = block_table.shape[1]
@@ -219,7 +233,7 @@ def triton_convert_req_index_to_global_index(
     # zeroed buffer; the BS=1 decode specialization uses one tile and stores.
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        if tiles_per_row == 1:
+        if valid_count_lens is not None or tiles_per_row == 1:
             valid_counts = torch.empty(
                 num_tokens, dtype=torch.int32, device=token_indices.device
             )
@@ -249,6 +263,7 @@ def triton_convert_req_index_to_global_index(
         token_indices_c,
         out,
         valid_counts,
+        valid_count_lens,
         prefill_workspace_request_ids,
         prefill_workspace_starts,
         # shapes / constexprs
@@ -258,6 +273,8 @@ def triton_convert_req_index_to_global_index(
         HAS_PREFILL_WORKSPACE,
         return_valid_counts,
         tiles_per_row == 1,
+        valid_count_lens is not None,
+        NUM_TOPK_TOKENS,
         # strides
         bt_stride0,
         bt_stride1,
