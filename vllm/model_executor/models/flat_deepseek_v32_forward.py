@@ -636,106 +636,108 @@ def transformer_layer(
 
     output_shape = (hidden_states.shape[0], wrapper.num_heads * wrapper.v_head_dim)
     attn_output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-    assert attn_metadata is not None
-    num_actual_toks = attn_metadata.num_actual_tokens
-    q = q[:num_actual_toks]
-    attn_output_actual = attn_output[:num_actual_toks]
+    if attn_metadata is None:
+        attn_output.fill_(0)
+    else:
+        num_actual_toks = attn_metadata.num_actual_tokens
+        q = q[:num_actual_toks]
+        attn_output_actual = attn_output[:num_actual_toks]
 
-    # MLA decode q nope projection, concat, and FP8 quantization.
-    assert mla.q_pad_num_heads is None
-    _, _, lora_rank = mla.W_UK_T.shape
-    mqa_q = torch.empty(
-        (
-            q.shape[0],
-            q.shape[1],
-            lora_rank + wrapper.qk_rope_head_dim,
-        ),
-        device=q.device,
-        dtype=torch.float8_e4m3fn,
-    )
-    _mla_decode_q_project_concat_quant_fp8_kernel[
-        (
-            q.shape[0],
-            q.shape[1],
-            (mqa_q.shape[2] + 31) // 32,
+        # MLA decode q nope projection, concat, and FP8 quantization.
+        assert mla.q_pad_num_heads is None
+        _, _, lora_rank = mla.W_UK_T.shape
+        mqa_q = torch.empty(
+            (
+                q.shape[0],
+                q.shape[1],
+                lora_rank + wrapper.qk_rope_head_dim,
+            ),
+            device=q.device,
+            dtype=torch.float8_e4m3fn,
         )
-    ](
-        q,
-        mla.W_UK_T,
-        mla._q_scale,
-        mqa_q,
-        q.shape[1],
-        wrapper.qk_nope_head_dim,
-        wrapper.qk_rope_head_dim,
-        lora_rank,
-        q.shape[2],
-        mqa_q.shape[2],
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        mla.W_UK_T.stride(0),
-        mla.W_UK_T.stride(1),
-        mla.W_UK_T.stride(2),
-        BLOCK_N=32,
-        BLOCK_K=128,
-    )
-
-    # FlashInfer sparse MLA decode.
-    impl = mla.impl
-    num_actual_toks = mqa_q.shape[0]
-    assert impl.topk_indices_buffer is not None
-    topk_indices = impl.topk_indices_buffer[:num_actual_toks]
-    req_id = attn_metadata.req_id_per_token[:num_actual_toks]
-    block_table = attn_metadata.block_table
-    block_size = attn_metadata.block_size
-    topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
-        req_id,
-        block_table,
-        topk_indices,
-        BLOCK_SIZE=block_size,
-        NUM_TOPK_TOKENS=topk_indices.shape[1],
-        BLOCK_N=topk_indices.shape[1],
-        return_valid_counts=True,
-    )
-    if impl._workspace_buffer is None:
-        if _fi_sparse_workspace is None:
-            _fi_sparse_workspace = torch.zeros(
-                _FI_SPARSE_WORKSPACE_BUFFER_SIZE,
-                dtype=torch.uint8,
-                device=mqa_q.device,
+        _mla_decode_q_project_concat_quant_fp8_kernel[
+            (
+                q.shape[0],
+                q.shape[1],
+                (mqa_q.shape[2] + 31) // 32,
             )
-        impl._workspace_buffer = _fi_sparse_workspace
-    if impl.bmm1_scale is None:
-        impl.bmm1_scale = impl.scale
-        impl.bmm1_scale *= mla._q_scale_float * mla._k_scale_float
-    if impl.bmm2_scale is None:
-        impl.bmm2_scale = 1.0
-        impl.bmm2_scale *= mla._k_scale_float
+        ](
+            q,
+            mla.W_UK_T,
+            mla._q_scale,
+            mqa_q,
+            q.shape[1],
+            wrapper.qk_nope_head_dim,
+            wrapper.qk_rope_head_dim,
+            lora_rank,
+            q.shape[2],
+            mqa_q.shape[2],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            mla.W_UK_T.stride(0),
+            mla.W_UK_T.stride(1),
+            mla.W_UK_T.stride(2),
+            BLOCK_N=32,
+            BLOCK_K=128,
+        )
 
-    from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+        # FlashInfer sparse MLA decode.
+        impl = mla.impl
+        num_actual_toks = mqa_q.shape[0]
+        assert impl.topk_indices_buffer is not None
+        topk_indices = impl.topk_indices_buffer[:num_actual_toks]
+        req_id = attn_metadata.req_id_per_token[:num_actual_toks]
+        block_table = attn_metadata.block_table
+        block_size = attn_metadata.block_size
+        topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
+            req_id,
+            block_table,
+            topk_indices,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            BLOCK_N=topk_indices.shape[1],
+            return_valid_counts=True,
+        )
+        if impl._workspace_buffer is None:
+            if _fi_sparse_workspace is None:
+                _fi_sparse_workspace = torch.zeros(
+                    _FI_SPARSE_WORKSPACE_BUFFER_SIZE,
+                    dtype=torch.uint8,
+                    device=mqa_q.device,
+                )
+            impl._workspace_buffer = _fi_sparse_workspace
+        if impl.bmm1_scale is None:
+            impl.bmm1_scale = impl.scale
+            impl.bmm1_scale *= mla._q_scale_float * mla._k_scale_float
+        if impl.bmm2_scale is None:
+            impl.bmm2_scale = 1.0
+            impl.bmm2_scale *= mla._k_scale_float
 
-    kv_cache_fp8 = mla.kv_cache.view(torch.float8_e4m3fn)
-    sparse_out = trtllm_batch_decode_with_kv_cache_mla(
-        query=mqa_q.unsqueeze(1),
-        kv_cache=kv_cache_fp8.unsqueeze(1),
-        workspace_buffer=impl._workspace_buffer,
-        qk_nope_head_dim=impl.qk_nope_head_dim,
-        kv_lora_rank=impl.kv_lora_rank,
-        qk_rope_head_dim=impl.qk_rope_head_dim,
-        block_tables=topk_indices_physical.unsqueeze(1),
-        seq_lens=seq_lens,
-        max_seq_len=attn_metadata.topk_tokens,
-        bmm1_scale=impl.bmm1_scale,
-        bmm2_scale=impl.bmm2_scale,
-        sparse_mla_top_k=attn_metadata.topk_tokens,
-    )
-    sparse_out = sparse_out.view(-1, sparse_out.shape[-2], sparse_out.shape[-1])
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
-    # MLA v-up projection.
-    x = sparse_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
-    out_view = attn_output_actual.view(-1, mla.num_heads, mla.v_head_dim)
-    out_t = out_view.transpose(0, 1)
-    torch.bmm(x, mla.W_UV, out=out_t)
+        kv_cache_fp8 = mla.kv_cache.view(torch.float8_e4m3fn)
+        sparse_out = trtllm_batch_decode_with_kv_cache_mla(
+            query=mqa_q.unsqueeze(1),
+            kv_cache=kv_cache_fp8.unsqueeze(1),
+            workspace_buffer=impl._workspace_buffer,
+            qk_nope_head_dim=impl.qk_nope_head_dim,
+            kv_lora_rank=impl.kv_lora_rank,
+            qk_rope_head_dim=impl.qk_rope_head_dim,
+            block_tables=topk_indices_physical.unsqueeze(1),
+            seq_lens=seq_lens,
+            max_seq_len=attn_metadata.topk_tokens,
+            bmm1_scale=impl.bmm1_scale,
+            bmm2_scale=impl.bmm2_scale,
+            sparse_mla_top_k=attn_metadata.topk_tokens,
+        )
+        sparse_out = sparse_out.view(-1, sparse_out.shape[-2], sparse_out.shape[-1])
+
+        # MLA v-up projection.
+        x = sparse_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
+        out_view = attn_output_actual.view(-1, mla.num_heads, mla.v_head_dim)
+        out_t = out_view.transpose(0, 1)
+        torch.bmm(x, mla.W_UV, out=out_t)
 
     # MLA o projection.
     o_proj = wrapper.o_proj
