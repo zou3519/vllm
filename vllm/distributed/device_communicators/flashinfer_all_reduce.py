@@ -100,7 +100,11 @@ def _resolve_fi_ar_backend() -> str:
         # trtllm backend does not support multi-node allreduce
         backend = "mnnvl"
     else:
-        backend = "mnnvl"
+        # Currently defaulting to trtllm backend for single-node
+        # setup since mnnvl has issues with cudagraph:
+        # https://github.com/vllm-project/vllm/issues/35772
+        # Should switch back to auto when the issue is resolved.
+        backend = "trtllm"
 
     logger.info_once(f"Auto-selected flashinfer allreduce backend: {backend}")
     return backend
