@@ -840,6 +840,7 @@ def transformer_layer(
         moe = layer.mlp
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        import flashinfer
 
         # Optional shared experts.
         shared_output = None
@@ -854,19 +855,33 @@ def transformer_layer(
                     *hidden_states.shape[:-1],
                     gate_up_proj.output_size_per_partition,
                 ]
-                x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                    hidden_states,
-                    gate_up_proj.input_global_scale_inv,
-                    is_sf_swizzled_layout=True,
-                    backend=gate_up_proj.quant_method.backend.value,
-                )
-                if gate_up_proj.weights_padding_cols > 0:
-                    x_fp4 = F.pad(
-                        x_fp4, (0, gate_up_proj.weights_padding_cols)
-                    ).contiguous()
                 backend_name = gate_up_proj.quant_method.backend.value[
                     len("flashinfer-") :
                 ]
+                if (
+                    backend_name == "trtllm"
+                    and gate_up_proj.weights_padding_cols == 0
+                ):
+                    x_fp4, x_blockscale = flashinfer.fp4_quantize(
+                        hidden_states,
+                        gate_up_proj.input_global_scale_inv,
+                        sf_vec_size=16,
+                        sf_use_ue8m0=False,
+                        is_sf_swizzled_layout=True,
+                        is_sf_8x4_layout=hidden_states.shape[0] <= 32,
+                        enable_pdl=False,
+                    )
+                else:
+                    x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                        hidden_states,
+                        gate_up_proj.input_global_scale_inv,
+                        is_sf_swizzled_layout=True,
+                        backend=gate_up_proj.quant_method.backend.value,
+                    )
+                    if gate_up_proj.weights_padding_cols > 0:
+                        x_fp4 = F.pad(
+                            x_fp4, (0, gate_up_proj.weights_padding_cols)
+                        ).contiguous()
                 gate_up = torch.ops.vllm.flashinfer_mm_fp4(
                     x_fp4,
                     gate_up_proj.weight.t(),
@@ -1030,7 +1045,6 @@ def transformer_layer(
         assert quant_config.use_nvfp4_w4a4
         assert quant_config.quant_dtype == "nvfp4"
         assert quant_config.block_shape is None
-        import flashinfer
 
         if quant_config.is_nvfp4_scale_swizzled:
             a1q, a1q_scale = ops.scaled_fp4_quant(
