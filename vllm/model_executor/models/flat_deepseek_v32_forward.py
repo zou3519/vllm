@@ -21,7 +21,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
-    _index_qk_rope_quant_cache_kernel,
+    _index_qk_rope_quant_cache_head_block_kernel,
     _index_q_rope_quant_weights_kernel,
     _mla_qkv_a_rmsnorm_kernel,
     _mla_decode_q_project_concat_quant_fp8_kernel,
@@ -510,8 +510,8 @@ def transformer_layer(
             has_prefill = index_metadata.num_prefills > 0
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
-            _index_qk_rope_quant_cache_kernel[
-                (index_q.shape[0], index_q.shape[1] + 1)
+            _index_qk_rope_quant_cache_head_block_kernel[
+                (index_q.shape[0], (index_q.shape[1] + 3) // 4 + 1)
             ](
                 index_q,
                 index_k,
@@ -529,6 +529,7 @@ def transformer_layer(
                 index_q.shape[1],
                 indexer.head_dim,
                 indexer.rope_dim,
+                (index_q.shape[1] + 3) // 4,
                 index_q.stride(0),
                 index_q.stride(1),
                 index_q.stride(2),
@@ -545,6 +546,7 @@ def transformer_layer(
                 indexer.k_cache.kv_cache.shape[2],
                 EPS=indexer.k_norm.eps,
                 FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
+                BLOCK_H=4,
                 BLOCK_N=128,
                 num_warps=8,
             )

@@ -388,6 +388,201 @@ def _index_qk_rope_quant_cache_kernel(
 
 
 @triton.jit
+def _index_qk_rope_quant_cache_head_block_kernel(
+    index_q_ptr,  # [num_tokens, n_heads, head_dim]
+    index_k_ptr,  # [num_k_tokens, head_dim]
+    positions_ptr,  # [num_tokens]
+    cos_sin_cache_ptr,  # [max_position, rope_dim]
+    index_weights_ptr,  # [num_tokens, n_heads]
+    q_fp8_ptr,  # [num_tokens, n_heads, head_dim]
+    scaled_weights_ptr,  # [num_tokens, n_heads]
+    norm_weight_ptr,  # [head_dim]
+    norm_bias_ptr,  # [head_dim]
+    slot_mapping_ptr,  # [num_k_tokens]
+    kv_cache_fp8_ptr,  # flat fp8 view of [num_blocks, block_size, cache_stride]
+    kv_cache_f32_ptr,  # flat float32 view of same storage for scale writes
+    num_k_tokens,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    num_q_blocks: tl.constexpr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_stride2,
+    index_k_stride0,
+    index_k_stride1,
+    weights_stride0,
+    weights_stride1,
+    q_fp8_stride0,
+    q_fp8_stride1,
+    q_fp8_stride2,
+    scaled_weights_stride0,
+    scaled_weights_stride1,
+    cache_block_size: tl.constexpr,
+    cache_stride: tl.constexpr,
+    EPS: tl.constexpr,
+    FACTOR: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = tl.arange(0, BLOCK_N)
+    col_mask = cols < head_dim
+
+    half_rope = rope_dim // 2
+    pos = tl.load(positions_ptr + token)
+    rope_pair = tl.where(cols < half_rope, cols, cols - half_rope)
+    rope_mask = cols < rope_dim
+    cos = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + rope_pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + half_rope + rope_pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if block < num_q_blocks:
+        head_offsets = tl.arange(0, BLOCK_H)
+        heads = block * BLOCK_H + head_offsets
+        q_cols = cols[None, :]
+        q_heads = heads[:, None]
+        q_col_mask = q_cols < head_dim
+        q_head_mask = q_heads < n_heads
+        q_mask = q_col_mask & q_head_mask
+        q_rope_pair = tl.where(q_cols < half_rope, q_cols, q_cols - half_rope)
+        q_rope_mask = (q_cols < rope_dim) & q_head_mask
+        q_cos = cos[None, :]
+        q_sin = sin[None, :]
+        q_vals = tl.load(
+            index_q_ptr
+            + token * index_q_stride0
+            + q_heads * index_q_stride1
+            + q_cols * index_q_stride2,
+            mask=q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_x_vals = tl.load(
+            index_q_ptr
+            + token * index_q_stride0
+            + q_heads * index_q_stride1
+            + q_rope_pair * index_q_stride2,
+            mask=q_rope_mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_y_vals = tl.load(
+            index_q_ptr
+            + token * index_q_stride0
+            + q_heads * index_q_stride1
+            + (q_rope_pair + half_rope) * index_q_stride2,
+            mask=q_rope_mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_x_rot = q_x_vals * q_cos - q_y_vals * q_sin
+        q_y_rot = q_y_vals * q_cos + q_x_vals * q_sin
+        q_vals = tl.where(q_cols < half_rope, q_x_rot, q_vals)
+        q_vals = tl.where((q_cols >= half_rope) & (q_cols < rope_dim), q_y_rot, q_vals)
+
+        q_absmax = tl.max(tl.abs(tl.where(q_mask, q_vals, 0.0)), axis=1)
+        q_scale = q_absmax / 448.0
+        q_scale = tl.exp2(
+            tl.ceil(tl.log2(tl.maximum(tl.abs(q_scale), 1.0e-10)))
+        )
+        q_out_vals = q_vals / q_scale[:, None]
+        q_out_vals = tl.minimum(tl.maximum(q_out_vals, -448.0), 448.0)
+        tl.store(
+            q_fp8_ptr
+            + token * q_fp8_stride0
+            + q_heads * q_fp8_stride1
+            + q_cols * q_fp8_stride2,
+            q_out_vals,
+            mask=q_mask,
+        )
+        q_weight = tl.load(
+            index_weights_ptr + token * weights_stride0 + heads * weights_stride1,
+            mask=heads < n_heads,
+            other=0.0,
+        ).to(tl.float32)
+        tl.store(
+            scaled_weights_ptr
+            + token * scaled_weights_stride0
+            + heads * scaled_weights_stride1,
+            q_weight * q_scale * FACTOR,
+            mask=heads < n_heads,
+        )
+    else:
+        valid_token = token < num_k_tokens
+        k_x = tl.load(
+            index_k_ptr + token * index_k_stride0 + cols * index_k_stride1,
+            mask=col_mask & valid_token,
+            other=0.0,
+        ).to(tl.float32)
+        k_mean = tl.sum(tl.where(col_mask, k_x, 0.0), axis=0) / head_dim
+        k_centered = tl.where(col_mask, k_x - k_mean, 0.0)
+        k_var = tl.sum(k_centered * k_centered, axis=0) / head_dim
+        k_inv_std = tl.rsqrt(k_var + EPS)
+        k_norm_weight = tl.load(
+            norm_weight_ptr + cols, mask=col_mask, other=0.0
+        ).to(tl.float32)
+        k_bias = tl.load(norm_bias_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+        k_vals = k_centered * k_inv_std * k_norm_weight + k_bias
+
+        k_x_pair = tl.load(
+            index_k_ptr + token * index_k_stride0 + rope_pair * index_k_stride1,
+            mask=rope_mask & valid_token,
+            other=0.0,
+        ).to(tl.float32)
+        k_y_pair = tl.load(
+            index_k_ptr
+            + token * index_k_stride0
+            + (rope_pair + half_rope) * index_k_stride1,
+            mask=rope_mask & valid_token,
+            other=0.0,
+        ).to(tl.float32)
+        k_x_weight = tl.load(
+            norm_weight_ptr + rope_pair, mask=rope_mask, other=0.0
+        ).to(tl.float32)
+        k_y_weight = tl.load(
+            norm_weight_ptr + rope_pair + half_rope,
+            mask=rope_mask,
+            other=0.0,
+        ).to(tl.float32)
+        k_x_bias = tl.load(norm_bias_ptr + rope_pair, mask=rope_mask, other=0.0).to(
+            tl.float32
+        )
+        k_y_bias = tl.load(
+            norm_bias_ptr + rope_pair + half_rope,
+            mask=rope_mask,
+            other=0.0,
+        ).to(tl.float32)
+        k_x_norm = (k_x_pair - k_mean) * k_inv_std * k_x_weight + k_x_bias
+        k_y_norm = (k_y_pair - k_mean) * k_inv_std * k_y_weight + k_y_bias
+        k_x_rot = k_x_norm * cos - k_y_norm * sin
+        k_y_rot = k_y_norm * cos + k_x_norm * sin
+        k_vals = tl.where(cols < half_rope, k_x_rot, k_vals)
+        k_vals = tl.where((cols >= half_rope) & (cols < rope_dim), k_y_rot, k_vals)
+
+        k_absmax = tl.max(tl.abs(tl.where(col_mask, k_vals, 0.0)), axis=0)
+        k_scale = tl.maximum(k_absmax, 1.0e-4) / 448.0
+        k_scale = tl.exp2(tl.ceil(tl.log2(k_scale)))
+        k_out_vals = k_vals / k_scale
+        k_out_vals = tl.minimum(tl.maximum(k_out_vals, -448.0), 448.0)
+
+        slot = tl.load(slot_mapping_ptr + token, mask=valid_token, other=-1)
+        valid = slot >= 0
+        block_idx = slot // cache_block_size
+        block_offset = slot - block_idx * cache_block_size
+        base = block_idx * cache_block_size * cache_stride
+        data_offset = base + block_offset * head_dim + cols
+        tl.store(kv_cache_fp8_ptr + data_offset, k_out_vals, mask=col_mask & valid)
+        scale_byte_offset = base + cache_block_size * head_dim + block_offset * 4
+        tl.store(kv_cache_f32_ptr + scale_byte_offset // 4, k_scale, mask=valid)
+
+
+@triton.jit
 def _mla_qkv_a_rmsnorm_kernel(
     qkv_ptr,  # [num_tokens, q_rank + kv_rank + rope_dim]
     q_weight_ptr,  # [q_rank]
