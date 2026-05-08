@@ -84,7 +84,6 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
     routing_method_type: int,
     tune_max_num_tokens: int,
 ) -> torch.Tensor:
-    output = torch.empty_like(output_like)
     return trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=None,
@@ -114,7 +113,7 @@ def _flashinfer_trtllm_fp4_block_scale_moe(
         do_finalize=True,
         enable_pdl=True,
         tune_max_num_tokens=tune_max_num_tokens,
-        output=output,
+        output=None,
     )[0]
 
 
