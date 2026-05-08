@@ -611,6 +611,185 @@ def _mla_decode_q_project_concat_quant_fp8_kernel(
 
 
 @triton.jit
+def _mla_decode_q_project_rope_concat_quant_fp8_kernel(
+    q_ptr,  # [batch, heads, nope_dim + rope_dim]
+    w_ptr,  # [heads, nope_dim, lora_rank]
+    positions_ptr,  # [batch]
+    cos_sin_cache_ptr,  # [max_position, rope_dim]
+    scale_ptr,  # scalar
+    out_ptr,  # [batch, heads, lora_rank + rope_dim]
+    heads: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    lora_rank: tl.constexpr,
+    q_dim: tl.constexpr,
+    out_dim: tl.constexpr,
+    q_stride0,
+    q_stride1,
+    q_stride2,
+    w_stride0,
+    w_stride1,
+    w_stride2,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    head = tl.program_id(1)
+    block = tl.program_id(2)
+    offs_n = block * BLOCK_N + tl.arange(0, BLOCK_N)
+    scale = tl.load(scale_ptr).to(tl.float32)
+
+    if block * BLOCK_N < lora_rank:
+        offs_k = tl.arange(0, BLOCK_K)
+        q_vals = tl.load(
+            q_ptr + batch * q_stride0 + head * q_stride1 + offs_k * q_stride2,
+            mask=offs_k < nope_dim,
+            other=0.0,
+        )
+        w_vals = tl.load(
+            w_ptr
+            + head * w_stride0
+            + offs_k[:, None] * w_stride1
+            + offs_n[None, :] * w_stride2,
+            mask=(offs_k[:, None] < nope_dim) & (offs_n[None, :] < lora_rank),
+            other=0.0,
+        )
+        vals = tl.reshape(tl.dot(q_vals[None, :], w_vals), [BLOCK_N]).to(
+            tl.float32
+        )
+        vals = vals / scale
+        vals = tl.minimum(tl.maximum(vals, -448.0), 448.0)
+        tl.store(
+            out_ptr
+            + batch * heads * out_dim
+            + head * out_dim
+            + offs_n,
+            vals,
+            mask=offs_n < lora_rank,
+        )
+    else:
+        rope_feature = offs_n - lora_rank
+        pair = rope_feature // 2
+        x_feature = pair * 2
+        y_feature = x_feature + 1
+        pos = tl.load(positions_ptr + batch)
+        cos = tl.load(
+            cos_sin_cache_ptr + pos * rope_dim + pair,
+            mask=rope_feature < rope_dim,
+            other=0.0,
+        ).to(tl.float32)
+        sin = tl.load(
+            cos_sin_cache_ptr + pos * rope_dim + rope_dim // 2 + pair,
+            mask=rope_feature < rope_dim,
+            other=0.0,
+        ).to(tl.float32)
+        x_vals = tl.load(
+            q_ptr
+            + batch * q_stride0
+            + head * q_stride1
+            + (nope_dim + x_feature) * q_stride2,
+            mask=rope_feature < rope_dim,
+            other=0.0,
+        ).to(tl.float32)
+        y_vals = tl.load(
+            q_ptr
+            + batch * q_stride0
+            + head * q_stride1
+            + (nope_dim + y_feature) * q_stride2,
+            mask=rope_feature < rope_dim,
+            other=0.0,
+        ).to(tl.float32)
+        vals = tl.where(
+            (rope_feature % 2) == 0,
+            x_vals * cos - y_vals * sin,
+            y_vals * cos + x_vals * sin,
+        )
+        vals = vals / scale
+        vals = tl.minimum(tl.maximum(vals, -448.0), 448.0)
+        tl.store(
+            out_ptr
+            + batch * heads * out_dim
+            + head * out_dim
+            + offs_n,
+            vals,
+            mask=rope_feature < rope_dim,
+        )
+
+
+@triton.jit
+def _mla_k_rope_cache_fp8_kernel(
+    k_pe_ptr,  # [num_tokens, rope_dim]
+    kv_c_ptr,  # [num_tokens, kv_lora_rank]
+    positions_ptr,  # [num_tokens]
+    cos_sin_cache_ptr,  # [max_position, rope_dim]
+    slot_mapping_ptr,  # [num_tokens]
+    kv_cache_fp8_ptr,  # flat fp8 view of [num_blocks, block_size, cache_stride]
+    scale_ptr,  # scalar
+    num_tokens,
+    rope_dim: tl.constexpr,
+    kv_lora_rank: tl.constexpr,
+    k_pe_stride0,
+    k_pe_stride1,
+    kv_c_stride0,
+    kv_c_stride1,
+    cache_block_size: tl.constexpr,
+    cache_stride: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_N)
+    total_dim = kv_lora_rank + rope_dim
+    mask = offsets < total_dim
+    slot = tl.load(slot_mapping_ptr + token, mask=token < num_tokens, other=-1)
+    valid = slot >= 0
+    block_idx = slot // cache_block_size
+    block_offset = slot - block_idx * cache_block_size
+    cache_offset = block_idx * cache_block_size * cache_stride + block_offset * cache_stride
+    scale = tl.load(scale_ptr).to(tl.float32)
+
+    is_kv = offsets < kv_lora_rank
+    kv_vals = tl.load(
+        kv_c_ptr + token * kv_c_stride0 + offsets * kv_c_stride1,
+        mask=mask & is_kv & valid,
+        other=0.0,
+    ).to(tl.float32)
+
+    rope_feature = offsets - kv_lora_rank
+    pair = rope_feature // 2
+    x_feature = pair * 2
+    y_feature = x_feature + 1
+    pos = tl.load(positions_ptr + token)
+    cos = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + pair,
+        mask=mask & ~is_kv,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + rope_dim // 2 + pair,
+        mask=mask & ~is_kv,
+        other=0.0,
+    ).to(tl.float32)
+    x_vals = tl.load(
+        k_pe_ptr + token * k_pe_stride0 + x_feature * k_pe_stride1,
+        mask=mask & ~is_kv,
+        other=0.0,
+    ).to(tl.float32)
+    y_vals = tl.load(
+        k_pe_ptr + token * k_pe_stride0 + y_feature * k_pe_stride1,
+        mask=mask & ~is_kv,
+        other=0.0,
+    ).to(tl.float32)
+    rope_vals = tl.where(
+        (rope_feature % 2) == 0,
+        x_vals * cos - y_vals * sin,
+        y_vals * cos + x_vals * sin,
+    )
+    vals = tl.where(is_kv, kv_vals, rope_vals) / scale
+    vals = tl.minimum(tl.maximum(vals, -448.0), 448.0)
+    tl.store(kv_cache_fp8_ptr + cache_offset + offsets, vals, mask=mask & valid)
+
+
+@triton.jit
 def _indexer_layer_norm_kernel(
     input_ptr,  # [num_tokens, head_dim]
     weight_ptr,  # [head_dim]
