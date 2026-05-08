@@ -588,17 +588,17 @@ def transformer_layer(
 
         heads, batch, _ = mqa_q_nope.shape
         _, _, lora_rank = mla.W_UK_T.shape
-        decode_q_dim = lora_rank + wrapper.qk_rope_head_dim
         if mla.q_pad_num_heads is not None:
-            decode_q0 = mqa_q_nope.new_empty(
-                (batch, mla.q_pad_num_heads, decode_q_dim)
+            mqa_ql_nope = mqa_q_nope.new_empty(
+                (mla.q_pad_num_heads, batch, lora_rank)
             )
-            decode_q0.resize_((batch, heads, decode_q_dim))
+            mqa_ql_nope.resize_((heads, batch, lora_rank))
         else:
-            decode_q0 = mqa_q_nope.new_empty((batch, heads, decode_q_dim))
-        mqa_ql_nope = decode_q0[..., :lora_rank].transpose(0, 1)
+            mqa_ql_nope = mqa_q_nope.new_empty((heads, batch, lora_rank))
         torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
-        decode_q0[..., lora_rank:].copy_(mqa_q_pe)
+        mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+
+        decode_q0 = torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1)
         decode_q_flat = decode_q0.reshape(decode_q0.shape[0], -1)
         mqa_q, _ = ops.scaled_fp8_quant(
             decode_q_flat,
