@@ -858,7 +858,6 @@ def transformer_layer(
                 and hasattr(shared_gate_up_proj, "input_global_scale_inv")
                 and shared_gate_up_proj.quant_method.backend.value
                 == "flashinfer-trtllm"
-                and shared_gate_up_proj.weights_padding_cols == 0
                 and quant_config.is_nvfp4_scale_swizzled
                 and hidden_states.shape[0] <= 32
             ):
@@ -873,6 +872,36 @@ def transformer_layer(
                     input_sf,
                 )
                 routed_a1q_scale = routed_a1q_scale.view(torch.float8_e4m3fn)
+            elif (
+                hasattr(shared_gate_up_proj, "weight_global_scale")
+                and hasattr(shared_gate_up_proj, "input_global_scale_inv")
+                and quant_config.is_nvfp4_scale_swizzled
+            ):
+                reuse_routed_quant = getattr(
+                    shared_gate_up_proj,
+                    "_flat_reuse_routed_quant",
+                    None,
+                )
+                if reuse_routed_quant is None:
+                    reuse_routed_quant = bool(
+                        torch.equal(
+                            shared_gate_up_proj.input_global_scale_inv,
+                            input_sf,
+                        )
+                    )
+                    shared_gate_up_proj._flat_reuse_routed_quant = reuse_routed_quant
+                if reuse_routed_quant:
+                    (
+                        shared_gate_up_x_fp4,
+                        shared_gate_up_x_blockscale,
+                    ) = ops.scaled_fp4_quant(
+                        hidden_states,
+                        input_sf,
+                        is_sf_swizzled_layout=True,
+                        backend=shared_gate_up_proj.quant_method.backend.value,
+                    )
+                    routed_a1q = shared_gate_up_x_fp4
+                    routed_a1q_scale = shared_gate_up_x_blockscale
 
         # Optional shared experts.
         shared_output = None
