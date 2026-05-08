@@ -9,6 +9,111 @@ from vllm.triton_utils import tl, triton
 
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
+def _index_k_norm_rope_cache_kernel(
+    index_k_ptr,  # [num_tokens, head_dim]
+    positions_ptr,  # [num_tokens]
+    cos_sin_cache_ptr,  # [max_position, rope_dim]
+    norm_weight_ptr,  # [head_dim]
+    norm_bias_ptr,  # [head_dim]
+    slot_mapping_ptr,  # [num_tokens]
+    kv_cache_fp8_ptr,  # flat fp8 view of [num_blocks, block_size, cache_stride]
+    kv_cache_f32_ptr,  # flat float32 view of same storage for scale writes
+    num_tokens: tl.constexpr,
+    head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    input_stride0,
+    input_stride1,
+    cache_block_size: tl.constexpr,
+    cache_stride: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < head_dim
+
+    x = tl.load(
+        index_k_ptr + token * input_stride0 + cols * input_stride1,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    mean = tl.sum(tl.where(mask, x, 0.0), axis=0) / head_dim
+    centered = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / head_dim
+    inv_std = tl.rsqrt(var + EPS)
+    weight = tl.load(norm_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(norm_bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    vals = centered * inv_std * weight + bias
+
+    half_rope = rope_dim // 2
+    pos = tl.load(positions_ptr + token)
+    rope_pair = tl.where(cols < half_rope, cols, cols - half_rope)
+    rope_mask = cols < rope_dim
+    cos = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + rope_pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rope_dim + half_rope + rope_pair,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_pair = tl.load(
+        index_k_ptr + token * input_stride0 + rope_pair * input_stride1,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    y_pair = tl.load(
+        index_k_ptr
+        + token * input_stride0
+        + (rope_pair + half_rope) * input_stride1,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    mean_pair = mean
+    inv_pair = inv_std
+    x_weight = tl.load(norm_weight_ptr + rope_pair, mask=rope_mask, other=0.0).to(
+        tl.float32
+    )
+    y_weight = tl.load(
+        norm_weight_ptr + rope_pair + half_rope,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_bias = tl.load(norm_bias_ptr + rope_pair, mask=rope_mask, other=0.0).to(
+        tl.float32
+    )
+    y_bias = tl.load(
+        norm_bias_ptr + rope_pair + half_rope,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_norm = (x_pair - mean_pair) * inv_pair * x_weight + x_bias
+    y_norm = (y_pair - mean_pair) * inv_pair * y_weight + y_bias
+    x_rot = x_norm * cos - y_norm * sin
+    y_rot = y_norm * cos + x_norm * sin
+    vals = tl.where(cols < half_rope, x_rot, vals)
+    vals = tl.where((cols >= half_rope) & (cols < rope_dim), y_rot, vals)
+
+    absmax = tl.max(tl.abs(tl.where(mask, vals, 0.0)), axis=0)
+    scale = tl.maximum(absmax, 1.0e-4) / 448.0
+    scale = tl.exp2(tl.ceil(tl.log2(scale)))
+    q_vals = vals / scale
+    q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
+
+    slot = tl.load(slot_mapping_ptr + token)
+    valid = slot >= 0
+    block_idx = slot // cache_block_size
+    block_offset = slot - block_idx * cache_block_size
+    base = block_idx * cache_block_size * cache_stride
+    data_offset = base + block_offset * head_dim + cols
+    tl.store(kv_cache_fp8_ptr + data_offset, q_vals, mask=mask & valid)
+    scale_byte_offset = base + cache_block_size * head_dim + block_offset * 4
+    tl.store(kv_cache_f32_ptr + scale_byte_offset // 4, scale, mask=valid)
+
+
+@triton.jit
 def _index_q_rope_quant_weights_kernel(
     index_q_ptr,  # [num_tokens, n_heads, head_dim]
     positions_ptr,  # [num_tokens]

@@ -21,8 +21,8 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _index_k_norm_rope_cache_kernel,
     _index_q_rope_quant_weights_kernel,
-    _indexer_layer_norm_kernel,
     _mla_decode_q_concat_kernel,
     triton_convert_req_index_to_global_index,
 )
@@ -344,44 +344,14 @@ def transformer_layer(
             bias = weights_proj.bias if not weights_proj.skip_bias_add else None
             index_weights = F.linear(hidden_states, weights_proj.weight, bias)
 
-        # Sparse indexer K LayerNorm and RoPE.
-        assert indexer.k_norm.dim <= 256
-        index_k_normed = torch.empty(
-            index_k.shape,
-            dtype=index_k.dtype,
-            device=index_k.device,
-        )
-        _indexer_layer_norm_kernel[(index_k.shape[0],)](
-            index_k,
-            indexer.k_norm.weight,
-            indexer.k_norm.bias,
-            index_k_normed,
-            indexer.k_norm.dim,
-            index_k.stride(0),
-            index_k.stride(1),
-            index_k_normed.stride(0),
-            index_k_normed.stride(1),
-            EPS=indexer.k_norm.eps,
-            BLOCK_N=256,
-        )
-        index_k = index_k_normed
-        k_pe_index = index_k[..., : indexer.rope_dim]
+        # Sparse indexer q RoPE/quant path shares the indexer RoPE table.
         rotary = wrapper.indexer_rope_emb
-        k_pe_index = k_pe_index.unsqueeze(1)
         cos_sin_cache = rotary.cos_sin_cache
         if (
             cos_sin_cache.device != index_q.device
             or cos_sin_cache.dtype != index_q.dtype
         ):
             cos_sin_cache = cos_sin_cache.to(index_q.device, dtype=index_q.dtype)
-        ops.rotary_embedding(
-            positions.flatten(),
-            k_pe_index,
-            None,
-            indexer.rope_dim,
-            cos_sin_cache,
-            True,
-        )
 
         # Sparse indexer fused q RoPE, fp8 quantization, and weight scaling.
         q_fp8 = torch.empty(
@@ -441,7 +411,7 @@ def transformer_layer(
                 max_logits_elems, dtype=torch.uint8, device=hidden_states.device
             )
         else:
-            # Sparse indexer: fp8 K quantization and KV-cache write.
+            # Sparse indexer: fused K LayerNorm, RoPE, fp8 quantization, and cache write.
             index_metadata = attn_metadata[indexer.k_cache.prefix]
             assert isinstance(index_metadata, DeepseekV32IndexerMetadata)
             slot_mapping = index_metadata.slot_mapping
@@ -449,14 +419,26 @@ def transformer_layer(
             has_prefill = index_metadata.num_prefills > 0
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
-            ops.indexer_k_quant_and_cache(
+            assert indexer.head_dim <= 128
+            _index_k_norm_rope_cache_kernel[(index_k.shape[0],)](
                 index_k,
-                indexer.k_cache.kv_cache,
+                positions.flatten(),
+                cos_sin_cache,
+                indexer.k_norm.weight,
+                indexer.k_norm.bias,
                 slot_mapping,
-                indexer.quant_block_size,
-                indexer.scale_fmt,
+                indexer.k_cache.kv_cache.view(torch.float8_e4m3fn),
+                indexer.k_cache.kv_cache.view(torch.float32),
+                index_k.shape[0],
+                indexer.head_dim,
+                indexer.rope_dim,
+                index_k.stride(0),
+                index_k.stride(1),
+                indexer.k_cache.kv_cache.shape[1],
+                indexer.k_cache.kv_cache.shape[2],
+                EPS=indexer.k_norm.eps,
+                BLOCK_N=128,
             )
-
             topk_indices_buffer = indexer.topk_indices_buffer
 
             # Sparse indexer: prefill MQA logits and per-row top-k.
