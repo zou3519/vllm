@@ -1097,6 +1097,7 @@ def transformer_layer(
             routed_scaling_factor=moe.experts.routed_scaling_factor,
             routing_method_type=fused_experts.routing_method_type,
             do_finalize=True,
+            enable_pdl=False,
             activation_type=activation_type,
         )[0]
 
