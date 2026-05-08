@@ -1046,6 +1046,7 @@ def transformer_layer(
                 sf_use_ue8m0=False,
                 is_sf_swizzled_layout=False,
                 is_sf_8x4_layout=False,
+                enable_pdl=False,
             )
         assert fused_experts.routing_method_type == RoutingMethodType.DeepSeekV3
         router_logits = router_logits.to(torch.float32)
