@@ -622,7 +622,7 @@ def transformer_layer(
                 mqa_ql_nope.shape[2] + mqa_q_pe.shape[2],
             )
         )
-        _mla_decode_q_concat_kernel[((decode_q0.numel() + 1023) // 1024,)](
+        _mla_decode_q_concat_kernel[((decode_q0.numel() + 255) // 256,)](
             mqa_ql_nope,
             mqa_q_pe,
             decode_q0,
@@ -637,7 +637,7 @@ def transformer_layer(
             mqa_q_pe.stride(0),
             mqa_q_pe.stride(1),
             mqa_q_pe.stride(2),
-            BLOCK_N=1024,
+            BLOCK_N=256,
         )
         decode_q_flat = decode_q0.reshape(decode_q0.shape[0], -1)
         mqa_q, _ = ops.scaled_fp8_quant(
