@@ -192,6 +192,7 @@ def transformer_layer(
         kv_c_normed.stride(1),
         EPS=wrapper.q_a_layernorm.variance_epsilon,
         BLOCK_N=2048,
+        num_warps=8,
     )
 
     # q_b projection, optionally horizontally fused with sparse indexer q.
