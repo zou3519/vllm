@@ -23,6 +23,7 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
+    SINGLE_TILE: tl.constexpr,  # whether the row has one column tile
     # strides (in elements)
     bt_stride0,
     bt_stride1,
@@ -79,7 +80,10 @@ def _convert_req_index_to_global_index_kernel(
     # Count valid indices in this tile and atomically add to row total
     if COUNT_VALID:
         tile_valid_count = tl.sum((~is_invalid_tok).to(tl.int32))
-        tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
+        if SINGLE_TILE:
+            tl.store(valid_count_ptr + token_id, tile_valid_count)
+        else:
+            tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
 
 
 def triton_convert_req_index_to_global_index(
@@ -140,12 +144,18 @@ def triton_convert_req_index_to_global_index(
     token_indices_c = token_indices.contiguous()
     out = torch.empty_like(token_indices_c)
 
-    # Allocate valid count buffer if needed (must be zero-initialized for atomics)
+    # Allocate valid count buffer if needed. Multiple tiles need atomics and a
+    # zeroed buffer; the BS=1 decode specialization uses one tile and stores.
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
-        )
+        if tiles_per_row == 1:
+            valid_counts = torch.empty(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            valid_counts = torch.zeros(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
 
     # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()
@@ -176,6 +186,7 @@ def triton_convert_req_index_to_global_index(
         BLOCK_N,
         HAS_PREFILL_WORKSPACE,
         return_valid_counts,
+        tiles_per_row == 1,
         # strides
         bt_stride0,
         bt_stride1,

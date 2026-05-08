@@ -621,6 +621,7 @@ def transformer_layer(
             topk_indices,
             BLOCK_SIZE=block_size,
             NUM_TOPK_TOKENS=topk_indices.shape[1],
+            BLOCK_N=topk_indices.shape[1],
             return_valid_counts=True,
         )
         if impl._workspace_buffer is None:
