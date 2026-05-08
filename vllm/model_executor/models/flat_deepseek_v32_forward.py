@@ -756,12 +756,9 @@ def transformer_layer(
                 ]
                 torch.distributed.all_gather(gathered_gate_up, gate_up)
                 gate_up = torch.cat(gathered_gate_up, dim=-1)
-            shared_output = torch.empty(
-                (*gate_up.shape[:-1], gate_up.shape[-1] // 2),
-                dtype=gate_up.dtype,
-                device=gate_up.device,
-            )
-            torch.ops._C.silu_and_mul(shared_output, gate_up)
+            shared_output = F.silu(gate_up[..., : gate_up.shape[-1] // 2]) * gate_up[
+                ..., gate_up.shape[-1] // 2 :
+            ]
             down_proj = shared_mlp.down_proj
             input_parallel = shared_output
             if not down_proj.input_is_parallel:
@@ -955,12 +952,9 @@ def transformer_layer(
             ]
             torch.distributed.all_gather(gathered_gate_up, gate_up)
             gate_up = torch.cat(gathered_gate_up, dim=-1)
-        hidden_states = torch.empty(
-            (*gate_up.shape[:-1], gate_up.shape[-1] // 2),
-            dtype=gate_up.dtype,
-            device=gate_up.device,
-        )
-        torch.ops._C.silu_and_mul(hidden_states, gate_up)
+        hidden_states = F.silu(gate_up[..., : gate_up.shape[-1] // 2]) * gate_up[
+            ..., gate_up.shape[-1] // 2 :
+        ]
         down_proj = mlp.down_proj
         input_parallel = hidden_states
         if not down_proj.input_is_parallel:
