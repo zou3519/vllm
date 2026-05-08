@@ -1129,17 +1129,15 @@ def transformer_layer(
                 fused_experts.ep_rank * fused_experts.local_num_experts
             ),
             local_num_experts=fused_experts.local_num_experts,
-            routed_scaling_factor=moe.experts.routed_scaling_factor,
+            routed_scaling_factor=moe.routed_scaling_factor,
             routing_method_type=fused_experts.routing_method_type,
             do_finalize=True,
             activation_type=activation_type,
         )[0]
 
         if shared_output is not None:
-            shared_output.add_(final_hidden_states, alpha=moe.routed_scaling_factor)
+            shared_output.add_(final_hidden_states)
             final_hidden_states = shared_output
-        else:
-            final_hidden_states *= moe.routed_scaling_factor
 
         hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
     else:
