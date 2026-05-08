@@ -39,6 +39,15 @@ struct FastTopKParams {
   int64_t input_stride;                    // Stride between rows
 };
 
+struct FastTopKPhysicalParams {
+  FastTopKParams topk;
+  const int32_t* __restrict__ block_table;  // [batch, max_blocks]
+  int32_t* __restrict__ valid_counts;       // [batch]
+  int64_t block_table_stride0;
+  int64_t block_table_stride1;
+  int32_t block_size;
+};
+
 __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
@@ -289,6 +298,38 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_kernel(
   }
 }
 
+__global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
+    const FastTopKPhysicalParams params) {
+  const auto& [input, row_starts, indices, lengths, input_stride] = params.topk;
+  const uint64_t batch_idx = blockIdx.x;
+  const int logits_offset = row_starts == nullptr ? 0 : row_starts[batch_idx];
+  const int seq_len = lengths[batch_idx];
+  int* output_indices = indices + batch_idx * TopK;
+  const float* logits = input + batch_idx * input_stride;
+
+  if (seq_len <= TopK) {
+    naive_topk_cuda(logits, output_indices, seq_len);
+  } else {
+    fast_topk_cuda_tl(logits, output_indices, logits_offset, seq_len);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    params.valid_counts[batch_idx] = min(seq_len, TopK);
+  }
+  for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
+    int logical_idx = output_indices[i];
+    if (logical_idx >= 0) {
+      const int block_id = logical_idx / params.block_size;
+      const int block_offset = logical_idx - block_id * params.block_size;
+      const int physical_block =
+          params.block_table[batch_idx * params.block_table_stride0 +
+                             block_id * params.block_table_stride1];
+      output_indices[i] = physical_block * params.block_size + block_offset;
+    }
+  }
+}
+
 FastTopKParams get_params(
     const at::Tensor& score, const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt,
@@ -370,4 +411,50 @@ void large_context_topk(
   const cudaError_t result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess,
               "large_context_topk kernel failed: ", cudaGetErrorString(result));
+}
+
+void large_context_topk_physical(
+    const torch::Tensor& logits, torch::Tensor& indices,
+    const torch::Tensor& seq_lens, const torch::Tensor& block_table,
+    torch::Tensor& valid_counts, int64_t block_size,
+    std::optional<torch::Tensor> row_starts = std::nullopt) {
+  TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
+  TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
+  TORCH_CHECK(seq_lens.is_cuda(), "seq_lens must be a CUDA tensor");
+  TORCH_CHECK(block_table.is_cuda(), "block_table must be a CUDA tensor");
+  TORCH_CHECK(valid_counts.is_cuda(), "valid_counts must be a CUDA tensor");
+  TORCH_CHECK(block_table.dim() == 2, "block_table must be 2D");
+  TORCH_CHECK(block_table.scalar_type() == torch::kInt32,
+              "block_table must be int32");
+  TORCH_CHECK(valid_counts.dim() == 1 && valid_counts.is_contiguous() &&
+                  valid_counts.size(0) == logits.size(0),
+              "valid_counts must be contiguous [batch]");
+  TORCH_CHECK(valid_counts.scalar_type() == torch::kInt32,
+              "valid_counts must be int32");
+  if (row_starts.has_value()) {
+    TORCH_CHECK(row_starts->is_cuda(), "row_starts must be a CUDA tensor");
+  }
+
+  const auto topk_params =
+      vllm::get_params(logits, seq_lens, row_starts, indices);
+  const vllm::FastTopKPhysicalParams params{
+      .topk = topk_params,
+      .block_table = block_table.data_ptr<int32_t>(),
+      .valid_counts = valid_counts.data_ptr<int32_t>(),
+      .block_table_stride0 = block_table.stride(0),
+      .block_table_stride1 = block_table.stride(1),
+      .block_size = static_cast<int32_t>(block_size),
+  };
+  const int64_t batch_size = logits.size(0);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<uint32_t>(batch_size));
+  const dim3 block(vllm::kThreadsPerBlock);
+
+  vllm::setup_kernel_smem_once<vllm::topk_physical_kernel, vllm::kSmem>();
+  vllm::topk_physical_kernel<<<grid, block, vllm::kSmem, stream>>>(params);
+
+  const cudaError_t result = cudaGetLastError();
+  TORCH_CHECK(result == cudaSuccess, "large_context_topk_physical kernel failed: ",
+              cudaGetErrorString(result));
 }

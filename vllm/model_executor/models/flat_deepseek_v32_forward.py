@@ -271,6 +271,8 @@ def transformer_layer(
     mla_cos_sin_cache = cos_sin_cache
     mla = wrapper.mla_attn
     layer_slot_mapping = None
+    topk_indices_physical = None
+    sparse_seq_lens = None
     if mla.kv_cache.numel() != 0:
         slot_mapping = forward_context.slot_mapping
         assert isinstance(slot_mapping, dict)
@@ -646,9 +648,17 @@ def transformer_layer(
                 if decode_metadata.use_large_context_topk:
                     assert next_n == 1
                     lengths = decode_metadata.seq_lens
-                    torch.ops._C.large_context_topk(
-                        logits, topk_indices, lengths, None
+                    sparse_seq_lens = torch.empty_like(lengths)
+                    torch.ops._C.large_context_topk_physical(
+                        logits,
+                        topk_indices,
+                        lengths,
+                        decode_metadata.block_table,
+                        sparse_seq_lens,
+                        decode_metadata.block_size,
+                        None,
                     )
+                    topk_indices_physical = topk_indices
                 else:
                     torch.ops._C.top_k_per_row_decode(
                         logits,
@@ -720,18 +730,23 @@ def transformer_layer(
         num_actual_toks = mqa_q.shape[0]
         assert impl.topk_indices_buffer is not None
         topk_indices = impl.topk_indices_buffer[:num_actual_toks]
-        req_id = attn_metadata.req_id_per_token[:num_actual_toks]
-        block_table = attn_metadata.block_table
-        block_size = attn_metadata.block_size
-        topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
-            req_id,
-            block_table,
-            topk_indices,
-            BLOCK_SIZE=block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            BLOCK_N=topk_indices.shape[1],
-            return_valid_counts=True,
-        )
+        if topk_indices_physical is None:
+            req_id = attn_metadata.req_id_per_token[:num_actual_toks]
+            block_table = attn_metadata.block_table
+            block_size = attn_metadata.block_size
+            (
+                topk_indices_physical,
+                sparse_seq_lens,
+            ) = triton_convert_req_index_to_global_index(
+                req_id,
+                block_table,
+                topk_indices,
+                BLOCK_SIZE=block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                BLOCK_N=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
+        assert sparse_seq_lens is not None
         if impl._workspace_buffer is None:
             if _fi_sparse_workspace is None:
                 _fi_sparse_workspace = torch.zeros(
@@ -758,7 +773,7 @@ def transformer_layer(
             kv_lora_rank=impl.kv_lora_rank,
             qk_rope_head_dim=impl.qk_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=seq_lens,
+            seq_lens=sparse_seq_lens,
             max_seq_len=attn_metadata.topk_tokens,
             bmm1_scale=impl.bmm1_scale,
             bmm2_scale=impl.bmm2_scale,

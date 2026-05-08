@@ -190,6 +190,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "row_starts_opt) -> ()");
   ops.impl("large_context_topk", torch::kCUDA, &large_context_topk);
 
+  ops.def(
+      "large_context_topk_physical(Tensor score, Tensor! indices, "
+      "Tensor lengths, Tensor block_table, Tensor! valid_counts, "
+      "int block_size, Tensor? row_starts_opt) -> ()");
+  ops.impl("large_context_topk_physical", torch::kCUDA,
+           &large_context_topk_physical);
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(

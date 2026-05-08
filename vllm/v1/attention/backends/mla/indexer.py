@@ -141,6 +141,7 @@ class DeepseekV32IndexerPrefillMetadata:
 @dataclass
 class DeepSeekV32IndexerDecodeMetadata:
     block_table: torch.Tensor
+    block_size: int
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
     requires_padding: bool
@@ -518,6 +519,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
+                block_size=self.kv_cache_spec.block_size,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=False,

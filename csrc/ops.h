@@ -118,6 +118,12 @@ void large_context_topk(const torch::Tensor& score, torch::Tensor& indices,
                         const torch::Tensor& lengths,
                         std::optional<torch::Tensor> row_starts_opt);
 
+void large_context_topk_physical(
+    const torch::Tensor& score, torch::Tensor& indices,
+    const torch::Tensor& lengths, const torch::Tensor& block_table,
+    torch::Tensor& valid_counts, int64_t block_size,
+    std::optional<torch::Tensor> row_starts_opt);
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
