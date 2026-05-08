@@ -670,7 +670,7 @@ def transformer_layer(
                 (
                     q.shape[0],
                     q.shape[1],
-                    (mqa_q.shape[2] + 31) // 32,
+                    (mqa_q.shape[2] + 15) // 16,
                 )
             ](
                 q,
@@ -689,7 +689,7 @@ def transformer_layer(
                 mla.W_UK_T.stride(0),
                 mla.W_UK_T.stride(1),
                 mla.W_UK_T.stride(2),
-                BLOCK_N=32,
+                BLOCK_N=16,
                 BLOCK_K=128,
             )
         else:
