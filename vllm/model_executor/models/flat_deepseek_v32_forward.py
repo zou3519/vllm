@@ -795,37 +795,38 @@ def transformer_layer(
                 ]
                 torch.distributed.all_gather(gathered_gate_up, gate_up)
                 gate_up = torch.cat(gathered_gate_up, dim=-1)
-            shared_output = F.silu(gate_up[..., : gate_up.shape[-1] // 2]) * gate_up[
-                ..., gate_up.shape[-1] // 2 :
-            ]
             down_proj = shared_mlp.down_proj
-            input_parallel = shared_output
-            if not down_proj.input_is_parallel:
-                input_parallel = torch.chunk(
-                    shared_output, down_proj.tp_size, dim=-1
-                )[down_proj.tp_rank].contiguous()
             bias = (
                 None
                 if (down_proj.tp_rank > 0 or down_proj.skip_bias_add)
                 else down_proj.bias
             )
-            if hasattr(down_proj, "weight_global_scale") and hasattr(
-                down_proj, "input_global_scale_inv"
+            if (
+                down_proj.input_is_parallel
+                and hasattr(down_proj, "weight_global_scale")
+                and hasattr(down_proj, "input_global_scale_inv")
             ):
-                shared_shape = [
-                    *input_parallel.shape[:-1],
-                    down_proj.output_size_per_partition,
-                ]
-                x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                    input_parallel,
-                    down_proj.input_global_scale_inv,
-                    is_sf_swizzled_layout=True,
-                    backend=down_proj.quant_method.backend.value,
+                act_dim = gate_up.shape[-1] // 2
+                gate_up_2d = gate_up.reshape(-1, gate_up.shape[-1])
+                x_fp4 = torch.empty(
+                    (gate_up_2d.shape[0], act_dim // 2),
+                    dtype=torch.uint8,
+                    device=gate_up.device,
                 )
-                if down_proj.weights_padding_cols > 0:
-                    x_fp4 = F.pad(
-                        x_fp4, (0, down_proj.weights_padding_cols)
-                    ).contiguous()
+                x_blockscale = torch.zeros(
+                    (
+                        ((gate_up_2d.shape[0] + 127) // 128) * 128,
+                        ((act_dim // 16 + 3) // 4),
+                    ),
+                    dtype=torch.int32,
+                    device=gate_up.device,
+                )
+                torch.ops._C.silu_and_mul_nvfp4_quant(
+                    x_fp4,
+                    x_blockscale,
+                    gate_up_2d,
+                    down_proj.input_global_scale_inv,
+                )
                 backend_name = down_proj.quant_method.backend.value[
                     len("flashinfer-") :
                 ]
@@ -835,7 +836,7 @@ def transformer_layer(
                     x_blockscale.view(torch.uint8),
                     down_proj.weight_scale.view(torch.uint8).t(),
                     down_proj.alpha,
-                    input_parallel.dtype,
+                    gate_up.dtype,
                     backend_name == "trtllm" and x_fp4.shape[0] <= 32,
                     backend_name,
                 )
@@ -843,11 +844,59 @@ def transformer_layer(
                     shared_output = shared_output[
                         ..., : down_proj.output_size_per_partition
                     ].contiguous()
-                shared_output = shared_output.view(*shared_shape)
+                shared_output = shared_output.view(
+                    *gate_up.shape[:-1], down_proj.output_size_per_partition
+                )
                 if bias is not None:
                     shared_output = shared_output + bias
             else:
-                shared_output = F.linear(input_parallel, down_proj.weight, bias)
+                shared_output = F.silu(
+                    gate_up[..., : gate_up.shape[-1] // 2]
+                ) * gate_up[..., gate_up.shape[-1] // 2 :]
+                input_parallel = shared_output
+                if not down_proj.input_is_parallel:
+                    input_parallel = torch.chunk(
+                        shared_output, down_proj.tp_size, dim=-1
+                    )[down_proj.tp_rank].contiguous()
+                if hasattr(down_proj, "weight_global_scale") and hasattr(
+                down_proj, "input_global_scale_inv"
+                ):
+                    shared_shape = [
+                        *input_parallel.shape[:-1],
+                        down_proj.output_size_per_partition,
+                    ]
+                    x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                        input_parallel,
+                        down_proj.input_global_scale_inv,
+                        is_sf_swizzled_layout=True,
+                        backend=down_proj.quant_method.backend.value,
+                    )
+                    if down_proj.weights_padding_cols > 0:
+                        x_fp4 = F.pad(
+                            x_fp4, (0, down_proj.weights_padding_cols)
+                        ).contiguous()
+                    backend_name = down_proj.quant_method.backend.value[
+                        len("flashinfer-") :
+                    ]
+                    shared_output = torch.ops.vllm.flashinfer_mm_fp4(
+                        x_fp4,
+                        down_proj.weight.t(),
+                        x_blockscale.view(torch.uint8),
+                        down_proj.weight_scale.view(torch.uint8).t(),
+                        down_proj.alpha,
+                        input_parallel.dtype,
+                        backend_name == "trtllm" and x_fp4.shape[0] <= 32,
+                        backend_name,
+                    )
+                    if shared_output.shape[-1] != down_proj.output_size_per_partition:
+                        shared_output = shared_output[
+                            ..., : down_proj.output_size_per_partition
+                        ].contiguous()
+                    shared_output = shared_output.view(*shared_shape)
+                    if bias is not None:
+                        shared_output = shared_output + bias
+                else:
+                    shared_output = F.linear(input_parallel, down_proj.weight, bias)
             if down_proj.reduce_results and down_proj.tp_size > 1:
                 shared_output = torch.ops.vllm.all_reduce(
                     shared_output, group_name=tp_group_name
