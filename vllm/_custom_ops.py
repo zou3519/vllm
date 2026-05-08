@@ -104,6 +104,32 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "scaled_fp4_quant"):
         return None
 
 
+if hasattr(torch.ops, "_C") and hasattr(
+    torch.ops._C, "scaled_fp4_quant_dual_8x4_128x4"
+):
+
+    @register_fake("_C::scaled_fp4_quant_dual_8x4_128x4")
+    def _scaled_fp4_quant_dual_8x4_128x4_fake(
+        input: torch.Tensor,
+        input_scale_8x4: torch.Tensor,
+        input_scale_128x4: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = input.shape[-1]
+        m = input.numel() // n
+        output_8x4 = torch.empty((m, n // 2), device=input.device, dtype=torch.uint8)
+        scale_n = n // 16
+        rounded_scale_n = cdiv(scale_n, 4) * 4
+        output_scale_8x4 = torch.empty(
+            (cdiv(m, 8) * 8, rounded_scale_n),
+            device=input.device,
+            dtype=torch.uint8,
+        )
+        output_128x4, output_scale_128x4 = create_fp4_output_tensors(
+            m, n, input.device, True
+        )
+        return output_8x4, output_scale_8x4, output_128x4, output_scale_128x4
+
+
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,

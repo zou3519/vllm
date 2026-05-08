@@ -109,6 +109,13 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> scaled_fp4_quant_func(
     torch::stable::Tensor const& input,
     torch::stable::Tensor const& input_scale, bool is_sf_swizzled_layout);
 
+std::tuple<torch::stable::Tensor, torch::stable::Tensor, torch::stable::Tensor,
+           torch::stable::Tensor>
+scaled_fp4_quant_dual_8x4_128x4_func(
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& input_scale_8x4,
+    torch::stable::Tensor const& input_scale_128x4);
+
 void scaled_fp4_quant_out(torch::stable::Tensor const& input,
                           torch::stable::Tensor const& input_scale,
                           bool is_sf_swizzled_layout,

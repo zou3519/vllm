@@ -171,6 +171,84 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
   }
 }
 
+template <class Type, bool UE8M0_SF = false>
+__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+    cvt_fp16_to_fp4_dual_8x4_128x4(
+        int32_t numRows, int32_t numCols, int32_t num_padded_cols,
+        Type const* __restrict__ in,
+        float const* __restrict__ SFScale8x4,
+        float const* __restrict__ SFScale128x4,
+        uint32_t* __restrict__ out8x4, uint32_t* __restrict__ SFout8x4,
+        uint32_t* __restrict__ out128x4, uint32_t* __restrict__ SFout128x4) {
+  using PackedVec = vllm::PackedVec<Type, CVT_FP4_PACK16>;
+
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+
+  int32_t const numKTiles = (numCols + 63) / 64;
+  int32_t const sf_m_8x4 = vllm::round_up<int32_t>(numRows, 8);
+  int32_t const sf_m_128x4 = vllm::round_up<int32_t>(numRows, 128);
+  int32_t const colIdx = blockDim.x * blockIdx.y + threadIdx.x;
+  int elem_idx = colIdx * CVT_FP4_ELTS_PER_THREAD;
+  float const global_scale_8x4 = (SFScale8x4 == nullptr) ? 1.0f : SFScale8x4[0];
+  float const global_scale_128x4 =
+      (SFScale128x4 == nullptr) ? 1.0f : SFScale128x4[0];
+
+  for (int rowIdx = blockIdx.x; rowIdx < sf_m_128x4; rowIdx += gridDim.x) {
+    if (colIdx < num_padded_cols) {
+      PackedVec in_vec;
+      int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+
+      bool valid = (rowIdx < numRows) && (elem_idx < numCols);
+      if constexpr (CVT_FP4_PACK16) {
+        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
+                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
+                         valid);
+      } else {
+        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec),
+                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 4],
+                         valid);
+      }
+
+      uint8_t* sf_out_8x4 = nullptr;
+      if (rowIdx < sf_m_8x4) {
+        sf_out_8x4 =
+            cvt_quant_to_fp4_get_sf_out_offset_8x4<uint32_t,
+                                                   CVT_FP4_NUM_THREADS_PER_SF>(
+                rowIdx, colIdx, numKTiles, SFout8x4);
+      }
+      auto out_val_8x4 =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+              in_vec, global_scale_8x4, sf_out_8x4);
+
+      auto sf_out_128x4 =
+          cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                             CVT_FP4_NUM_THREADS_PER_SF>(
+              rowIdx, colIdx, numKTiles, SFout128x4);
+      auto out_val_128x4 =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+              in_vec, global_scale_128x4, sf_out_128x4);
+
+      if (valid) {
+        if constexpr (CVT_FP4_PACK16) {
+          int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
+          uint64_t packed8x4 =
+              (uint64_t(out_val_8x4.hi) << 32) | uint64_t(out_val_8x4.lo);
+          uint64_t packed128x4 =
+              (uint64_t(out_val_128x4.hi) << 32) | uint64_t(out_val_128x4.lo);
+          reinterpret_cast<uint64_t*>(out8x4)[outOffset >> 1] = packed8x4;
+          reinterpret_cast<uint64_t*>(out128x4)[outOffset >> 1] = packed128x4;
+        } else {
+          out8x4[inOffset] = out_val_8x4;
+          out128x4[inOffset] = out_val_128x4;
+        }
+      }
+    }
+  }
+}
+
 }  // namespace vllm
 
 void scaled_fp4_quant_sm1xxa(torch::stable::Tensor const& output,
@@ -242,4 +320,59 @@ void scaled_fp4_quant_sm1xxa(torch::stable::Tensor const& output,
                   reinterpret_cast<uint32_t*>(sf_out));
         });
   }
+}
+
+void scaled_fp4_quant_dual_8x4_128x4_sm1xxa(
+    torch::stable::Tensor const& output8x4,
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& output_sf8x4,
+    torch::stable::Tensor const& input_sf8x4,
+    torch::stable::Tensor const& output128x4,
+    torch::stable::Tensor const& output_sf128x4,
+    torch::stable::Tensor const& input_sf128x4) {
+  int32_t m = input.size(0);
+  int32_t n = input.size(1);
+
+  STD_TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
+  STD_TORCH_CHECK(
+      input.scalar_type() == torch::headeronly::ScalarType::Half ||
+          input.scalar_type() == torch::headeronly::ScalarType::BFloat16,
+      "Unsupported input data type for quantize_to_fp4.");
+
+  int multiProcessorCount =
+      get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
+
+  auto input_sf8x4_ptr = static_cast<float const*>(input_sf8x4.data_ptr());
+  auto input_sf128x4_ptr = static_cast<float const*>(input_sf128x4.data_ptr());
+  auto sf8x4_out = static_cast<uint32_t*>(output_sf8x4.data_ptr());
+  auto sf128x4_out = static_cast<uint32_t*>(output_sf128x4.data_ptr());
+  auto output8x4_ptr = static_cast<uint32_t*>(output8x4.data_ptr());
+  auto output128x4_ptr = static_cast<uint32_t*>(output128x4.data_ptr());
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      input.get_device_index());
+  auto stream = get_current_cuda_stream(input.get_device_index());
+
+  int sf_n_unpadded = int(n / CVT_FP4_SF_VEC_SIZE);
+  dim3 block(std::min(int(n / ELTS_PER_THREAD), 512));
+  int const numBlocksPerSM =
+      vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
+  int sf_n_int = int(vllm::round_up(sf_n_unpadded, 4) / 4);
+  int32_t num_padded_cols =
+      sf_n_int * 4 * CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+  int grid_y = vllm::div_round_up(num_padded_cols, static_cast<int>(block.x));
+  int grid_x =
+      std::min(vllm::computeEffectiveRows(m),
+               std::max(1, (multiProcessorCount * numBlocksPerSM) / grid_y));
+  dim3 grid(grid_x, grid_y);
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      input.scalar_type(), "nvfp4_quant_dual_8x4_128x4_kernel", [&] {
+        using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
+        auto input_ptr = static_cast<cuda_type const*>(input.data_ptr());
+        vllm::cvt_fp16_to_fp4_dual_8x4_128x4<cuda_type, false>
+            <<<grid, block, 0, stream>>>(
+                m, n, num_padded_cols, input_ptr, input_sf8x4_ptr,
+                input_sf128x4_ptr, output8x4_ptr, sf8x4_out, output128x4_ptr,
+                sf128x4_out);
+      });
 }
