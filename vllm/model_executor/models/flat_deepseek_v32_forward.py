@@ -390,13 +390,9 @@ def transformer_layer(
             False,
         )
         q_fp8 = q_fp8.view(-1, indexer.n_head, indexer.head_dim)
-        q_scale = q_scale.view(-1, indexer.n_head, 1)
-        index_weights = (
-            index_weights.unsqueeze(-1)
-            * q_scale
-            * indexer.softmax_scale
-            * indexer.n_head**-0.5
-        ).squeeze(-1)
+        q_scale = q_scale.view(-1, indexer.n_head)
+        index_weights = torch.mul(index_weights, q_scale)
+        index_weights.mul_(indexer.softmax_scale * indexer.n_head**-0.5)
 
         # Sparse indexer: profile allocation path.
         attn_metadata = forward_context.attn_metadata
