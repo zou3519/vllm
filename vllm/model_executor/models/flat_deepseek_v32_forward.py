@@ -1024,7 +1024,7 @@ def transformer_layer(
 
         # Router.
         gate = moe.gate
-        if gate.allow_dsv3_router_gemm and hidden_states.shape[0] <= 16:
+        if False and gate.allow_dsv3_router_gemm and hidden_states.shape[0] <= 16:
             router_logits = ops.dsv3_router_gemm(
                 hidden_states=hidden_states,
                 router_weight=gate.weight,
