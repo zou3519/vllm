@@ -206,17 +206,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("mla_qkv_a_rmsnorm_k_rope_cache_fp8", torch::kCUDA,
            &mla_qkv_a_rmsnorm_k_rope_cache_fp8);
 
-  ops.def(
-      "indexer_qk_rope_quant_cache(Tensor index_q, Tensor index_k, "
-      "Tensor positions, Tensor cos_sin_cache, Tensor index_weights, "
-      "Tensor! q_fp8, Tensor! scaled_weights, Tensor norm_weight, "
-      "Tensor norm_bias, Tensor slot_mapping, Tensor! kv_cache_fp8, "
-      "Tensor! kv_cache_f32, int num_k_tokens, int n_heads, int head_dim, "
-      "int rope_dim, int cache_block_size, int cache_stride, float eps, "
-      "float factor) -> ()");
-  ops.impl("indexer_qk_rope_quant_cache", torch::kCUDA,
-           &indexer_qk_rope_quant_cache);
-
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(

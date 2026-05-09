@@ -133,16 +133,6 @@ void mla_qkv_a_rmsnorm_k_rope_cache_fp8(
     int64_t rope_dim, int64_t cache_block_size, int64_t cache_stride,
     double eps);
 
-void indexer_qk_rope_quant_cache(
-    const torch::Tensor& index_q, const torch::Tensor& index_k,
-    const torch::Tensor& positions, const torch::Tensor& cos_sin_cache,
-    const torch::Tensor& index_weights, torch::Tensor& q_fp8,
-    torch::Tensor& scaled_weights, const torch::Tensor& norm_weight,
-    const torch::Tensor& norm_bias, const torch::Tensor& slot_mapping,
-    torch::Tensor& kv_cache_fp8, torch::Tensor& kv_cache_f32,
-    int64_t num_k_tokens, int64_t n_heads, int64_t head_dim, int64_t rope_dim,
-    int64_t cache_block_size, int64_t cache_stride, double eps, double factor);
-
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);
