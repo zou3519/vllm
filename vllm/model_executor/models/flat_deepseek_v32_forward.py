@@ -47,6 +47,8 @@ def transformer_layer(
 ):
     global _fi_sparse_workspace
 
+    positions_flat = positions.flatten()
+
     # Input RMSNorm and residual.
     if residual is None:
         residual = hidden_states.clone()
@@ -202,7 +204,7 @@ def transformer_layer(
             wrapper.q_a_layernorm.weight.data,
             wrapper.kv_a_layernorm.weight.data,
             q_c,
-            positions.flatten(),
+            positions_flat,
             fused_mla_cos_sin_cache,
             layer_slot_mapping.flatten(),
             mla.kv_cache.view(torch.float8_e4m3fn),
@@ -318,7 +320,7 @@ def transformer_layer(
     if mla.kv_cache.numel() == 0:
         k_pe = k_pe.unsqueeze(1)
         ops.rotary_embedding(
-            positions.flatten(),
+            positions_flat,
             q_rot,
             k_pe,
             wrapper.qk_rope_head_dim,
@@ -493,7 +495,7 @@ def transformer_layer(
                 (index_q.shape[0], index_q.shape[1])
             ](
                 index_q,
-                positions.flatten(),
+                positions_flat,
                 cos_sin_cache,
                 index_weights,
                 q_fp8,
@@ -543,7 +545,7 @@ def transformer_layer(
             ](
                 index_q,
                 index_k,
-                positions.flatten(),
+                positions_flat,
                 cos_sin_cache,
                 index_weights,
                 q_fp8,
@@ -719,7 +721,7 @@ def transformer_layer(
         ](
             q,
             mla.W_UK_T,
-            positions.flatten(),
+            positions_flat,
             mla_cos_sin_cache,
             mla._q_scale,
             mqa_q,
