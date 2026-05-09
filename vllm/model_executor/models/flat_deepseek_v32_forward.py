@@ -219,7 +219,7 @@ def transformer_layer(
             mla.kv_cache.shape[2],
             EPS=wrapper.q_a_layernorm.variance_epsilon,
             BLOCK_N=2048,
-            num_warps=8,
+            num_warps=4,
         )
     else:
         kv_c_normed = torch.empty(
