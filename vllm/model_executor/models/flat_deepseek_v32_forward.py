@@ -538,9 +538,7 @@ def transformer_layer(
             has_prefill = index_metadata.num_prefills > 0
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
-            _index_qk_rope_quant_cache_kernel[
-                (index_q.shape[0], index_q.shape[1] + 1)
-            ](
+            torch.ops._C.indexer_qk_rope_quant_cache(
                 index_q,
                 index_k,
                 positions.flatten(),
@@ -557,24 +555,10 @@ def transformer_layer(
                 index_q.shape[1],
                 indexer.head_dim,
                 indexer.rope_dim,
-                index_q.stride(0),
-                index_q.stride(1),
-                index_q.stride(2),
-                index_k.stride(0),
-                index_k.stride(1),
-                index_weights.stride(0),
-                index_weights.stride(1),
-                q_fp8.stride(0),
-                q_fp8.stride(1),
-                q_fp8.stride(2),
-                scaled_index_weights.stride(0),
-                scaled_index_weights.stride(1),
                 indexer.k_cache.kv_cache.shape[1],
                 indexer.k_cache.kv_cache.shape[2],
-                EPS=indexer.k_norm.eps,
-                FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
-                BLOCK_N=128,
-                num_warps=8,
+                indexer.k_norm.eps,
+                indexer.softmax_scale * indexer.n_head**-0.5,
             )
             index_weights = scaled_index_weights
             topk_indices_buffer = indexer.topk_indices_buffer
