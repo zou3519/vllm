@@ -1,7 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda_bf16.h>
 
 #include <cmath>
 
@@ -208,55 +207,6 @@ void silu_and_mul(torch::Tensor& out,    // [..., d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
                                 true);
-}
-
-namespace vllm {
-
-__global__ void bf16_scaled_add_kernel(__nv_bfloat16* __restrict__ input,
-                                       const __nv_bfloat16* __restrict__ other,
-                                       float alpha, int64_t n_pairs) {
-  auto* input2 = reinterpret_cast<__nv_bfloat162*>(input);
-  const auto* other2 = reinterpret_cast<const __nv_bfloat162*>(other);
-  const __nv_bfloat162 alpha2 = __float2bfloat162_rn(alpha);
-  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_pairs;
-       idx += int64_t(blockDim.x) * gridDim.x) {
-    input2[idx] = __hadd2(input2[idx], __hmul2(other2[idx], alpha2));
-  }
-}
-
-}  // namespace vllm
-
-void bf16_scaled_add_(torch::Tensor& input, torch::Tensor const& other,
-                      double alpha) {
-  TORCH_CHECK(input.is_cuda(), "input must be CUDA");
-  TORCH_CHECK(other.is_cuda(), "other must be CUDA");
-  TORCH_CHECK(input.scalar_type() == at::ScalarType::BFloat16,
-              "input must be bfloat16");
-  TORCH_CHECK(other.scalar_type() == at::ScalarType::BFloat16,
-              "other must be bfloat16");
-  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-  TORCH_CHECK(other.is_contiguous(), "other must be contiguous");
-  TORCH_CHECK(input.numel() == other.numel(),
-              "input and other must have the same number of elements");
-  TORCH_CHECK((input.numel() & 1) == 0,
-              "input element count must be even for bf16 pair add");
-
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const int64_t n_pairs = input.numel() / 2;
-  if (n_pairs == 0) {
-    return;
-  }
-  const int block = 256;
-  const int grid =
-      static_cast<int>(std::min<int64_t>((n_pairs + block - 1) / block, 256));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  vllm::bf16_scaled_add_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(other.data_ptr()),
-      static_cast<float>(alpha), n_pairs);
-  const cudaError_t result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "bf16_scaled_add_ kernel failed: ",
-              cudaGetErrorString(result));
 }
 
 void mul_and_silu(torch::Tensor& out,    // [..., d]
