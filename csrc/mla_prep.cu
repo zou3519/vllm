@@ -6,7 +6,7 @@
 
 namespace vllm {
 
-constexpr int kMlaPrepThreads = 256;
+constexpr int kMlaPrepThreads = 1024;
 
 __device__ __forceinline__ float load_bf16(const __nv_bfloat16* ptr,
                                            int64_t offset) {
@@ -31,31 +31,35 @@ __global__ __launch_bounds__(kMlaPrepThreads) void mla_prep_kernel(
     int64_t q_out_stride1, int64_t cache_block_size, int64_t cache_stride,
     int32_t q_rank, int32_t kv_rank, int32_t rope_dim, float eps) {
   const int token = blockIdx.x;
+  const int part = blockIdx.y;
   const int tid = threadIdx.x;
   __shared__ float smem[kMlaPrepThreads];
 
-  float sum = 0.0f;
-  for (int col = tid; col < q_rank; col += blockDim.x) {
-    const float x = load_bf16(qkv, token * qkv_stride0 + col * qkv_stride1);
-    sum += x * x;
-  }
-  smem[tid] = sum;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      smem[tid] += smem[tid + stride];
+  if (part == 0) {
+    float sum = 0.0f;
+    for (int col = tid; col < q_rank; col += blockDim.x) {
+      const float x = load_bf16(qkv, token * qkv_stride0 + col * qkv_stride1);
+      sum += x * x;
     }
+    smem[tid] = sum;
     __syncthreads();
-  }
-  const float q_inv_rms = rsqrtf(smem[0] / static_cast<float>(q_rank) + eps);
-  for (int col = tid; col < q_rank; col += blockDim.x) {
-    const float x = load_bf16(qkv, token * qkv_stride0 + col * qkv_stride1);
-    const float w = __bfloat162float(q_weight[col]);
-    q_out[token * q_out_stride0 + col * q_out_stride1] =
-        __float2bfloat16(x * q_inv_rms * w);
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        smem[tid] += smem[tid + stride];
+      }
+      __syncthreads();
+    }
+    const float q_inv_rms = rsqrtf(smem[0] / static_cast<float>(q_rank) + eps);
+    for (int col = tid; col < q_rank; col += blockDim.x) {
+      const float x = load_bf16(qkv, token * qkv_stride0 + col * qkv_stride1);
+      const float w = __bfloat162float(q_weight[col]);
+      q_out[token * q_out_stride0 + col * q_out_stride1] =
+          __float2bfloat16(x * q_inv_rms * w);
+    }
+    return;
   }
 
-  sum = 0.0f;
+  float sum = 0.0f;
   for (int col = tid; col < kv_rank; col += blockDim.x) {
     const float x =
         load_bf16(qkv, token * qkv_stride0 + (q_rank + col) * qkv_stride1);
@@ -137,7 +141,7 @@ void mla_qkv_a_rmsnorm_k_rope_cache_fp8(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(qkv));
   const int64_t num_tokens = qkv.size(0);
-  const dim3 grid(static_cast<uint32_t>(num_tokens));
+  const dim3 grid(static_cast<uint32_t>(num_tokens), 2);
   const dim3 block(vllm::kMlaPrepThreads);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
