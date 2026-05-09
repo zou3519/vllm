@@ -7,7 +7,6 @@ from itertools import islice
 import torch
 import deep_gemm
 import torch.nn.functional as F
-from torch.utils.cpp_extension import load_inline
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -35,87 +34,6 @@ _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _fi_sparse_workspace: torch.Tensor | None = None
 _FI_AR_RESIDUAL_RMS_NORM_PATTERN = 1
 _FI_AR_MAX_TOKEN_NUM = 4681
-
-
-_FLAT_MLA_V_UP_EXT = load_inline(
-    name="flat_deepseek_v32_mla_v_up_ext",
-    cpp_sources=r"""
-#include <torch/extension.h>
-
-void flat_mla_v_up_cuda(torch::Tensor sparse_out, torch::Tensor w_uv,
-                        torch::Tensor out);
-
-TORCH_LIBRARY(vllm_flat_deepseek, m) {
-  m.def("mla_v_up(Tensor sparse_out, Tensor w_uv, Tensor(a!) out) -> ()");
-}
-
-TORCH_LIBRARY_IMPL(vllm_flat_deepseek, CUDA, m) {
-  m.impl("mla_v_up", &flat_mla_v_up_cuda);
-}
-""",
-    cuda_sources=r"""
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <torch/extension.h>
-
-__global__ void flat_mla_v_up_kernel(const __nv_bfloat16* __restrict__ x,
-                                     const __nv_bfloat16* __restrict__ w,
-                                     __nv_bfloat16* __restrict__ out,
-                                     int tokens, int heads) {
-  int token = blockIdx.x;
-  int head = blockIdx.y;
-  int v = threadIdx.x;
-  constexpr int K = 512;
-  constexpr int V = 128;
-  if (token >= tokens || head >= heads || v >= V) {
-    return;
-  }
-
-  const __nv_bfloat16* x_row = x + (token * heads + head) * K;
-  const __nv_bfloat16* w_row = w + head * K * V + v;
-  float acc = 0.0f;
-#pragma unroll 4
-  for (int k = 0; k < K; ++k) {
-    acc += __bfloat162float(x_row[k]) * __bfloat162float(w_row[k * V]);
-  }
-  out[(token * heads + head) * V + v] = __float2bfloat16(acc);
-}
-
-void flat_mla_v_up_cuda(torch::Tensor sparse_out, torch::Tensor w_uv,
-                        torch::Tensor out) {
-  TORCH_CHECK(sparse_out.is_cuda() && w_uv.is_cuda() && out.is_cuda(),
-              "mla_v_up tensors must be CUDA tensors");
-  TORCH_CHECK(sparse_out.scalar_type() == torch::kBFloat16 &&
-                  w_uv.scalar_type() == torch::kBFloat16 &&
-                  out.scalar_type() == torch::kBFloat16,
-              "mla_v_up only supports BF16 tensors");
-  TORCH_CHECK(sparse_out.dim() == 3 && w_uv.dim() == 3 && out.dim() == 3,
-              "mla_v_up expects [tokens, heads, dim] tensors");
-  TORCH_CHECK(sparse_out.size(1) == w_uv.size(0) &&
-                  sparse_out.size(1) == out.size(1),
-              "mla_v_up head dimension mismatch");
-  TORCH_CHECK(sparse_out.size(2) == 512 && w_uv.size(1) == 512 &&
-                  w_uv.size(2) == 128 && out.size(2) == 128,
-              "mla_v_up expects K=512 and V=128");
-  TORCH_CHECK(sparse_out.is_contiguous() && w_uv.is_contiguous() &&
-                  out.is_contiguous(),
-              "mla_v_up expects contiguous tensors");
-
-  int tokens = static_cast<int>(sparse_out.size(0));
-  int heads = static_cast<int>(sparse_out.size(1));
-  dim3 grid(tokens, heads);
-  dim3 block(128);
-  auto stream = at::cuda::getCurrentCUDAStream(sparse_out.get_device());
-  flat_mla_v_up_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(sparse_out.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(w_uv.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tokens, heads);
-}
-    """,
-    with_cuda=True,
-    is_python_module=False,
-    verbose=False,
-)
 
 
 def transformer_layer(
@@ -864,9 +782,10 @@ def transformer_layer(
         sparse_out = sparse_out.view(-1, sparse_out.shape[-2], sparse_out.shape[-1])
 
         # MLA v-up projection.
-        sparse_out = sparse_out.view(-1, mla.num_heads, mla.kv_lora_rank)
+        x = sparse_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
         out_view = attn_output_actual.view(-1, mla.num_heads, mla.v_head_dim)
-        torch.ops.vllm_flat_deepseek.mla_v_up(sparse_out, mla.W_UV, out_view)
+        out_t = out_view.transpose(0, 1)
+        torch.bmm(x, mla.W_UV, out=out_t)
 
     # MLA o projection.
     o_proj = wrapper.o_proj
