@@ -33,7 +33,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _fi_sparse_workspace: torch.Tensor | None = None
 _FI_AR_RESIDUAL_RMS_NORM_PATTERN = 1
-_FI_AR_RESIDUAL_RMS_NORM_FP4_QUANT_PATTERN = 3
 _FI_AR_MAX_TOKEN_NUM = 4681
 
 
@@ -843,75 +842,24 @@ def transformer_layer(
             hidden_states = hidden_states + bias
     else:
         hidden_states = F.linear(input_parallel, o_proj.weight, bias)
-    post_attn_a1q = None
-    post_attn_a1q_scale = None
-
     # Post-attention TP all-reduce fused with residual add and RMSNorm.
     norm = layer.post_attention_layernorm
-    post_attn_moe = layer.mlp if isinstance(layer.mlp, DeepseekV2MoE) else None
-    post_attn_moe_quant_config = None
-    if post_attn_moe is not None:
-        post_attn_moe_quant_method = post_attn_moe.experts.quant_method
-        post_attn_moe_kernel = post_attn_moe_quant_method.moe_kernel
-        if post_attn_moe_kernel is not None and post_attn_moe_kernel.is_monolithic:
-            post_attn_fused_experts = post_attn_moe_kernel.fused_experts
-            if isinstance(post_attn_fused_experts, TrtLlmNvFp4ExpertsMonolithic):
-                post_attn_moe_quant_config = post_attn_fused_experts.quant_config
     if (
         o_proj.reduce_results
         and o_proj.tp_size > 1
         and hidden_states.shape[0] <= _FI_AR_MAX_TOKEN_NUM
     ):
-        if (
-            post_attn_moe_quant_config is not None
-            and post_attn_moe_quant_config.use_nvfp4_w4a4
-            and post_attn_moe_quant_config.quant_dtype == "nvfp4"
-            and post_attn_moe_quant_config.block_shape is None
-            and post_attn_moe_quant_config.is_nvfp4_scale_swizzled
-        ):
-            post_attn_a1q = torch.empty(
-                (hidden_states.shape[0], hidden_states.shape[1] // 2),
-                dtype=torch.uint8,
-                device=hidden_states.device,
-            )
-            post_attn_a1q_scale = torch.empty(
-                (
-                    ((hidden_states.shape[0] + 127) // 128) * 128,
-                    ((hidden_states.shape[1] // 16 + 3) // 4),
-                ),
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
-            post_attn_norm_out = torch.empty_like(hidden_states)
-            torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
-                hidden_states,
-                residual,
-                norm.weight.data,
-                norm.variance_epsilon,
-                o_proj.tp_size,
-                True,
-                False,
-                _FI_AR_MAX_TOKEN_NUM,
-                _FI_AR_RESIDUAL_RMS_NORM_FP4_QUANT_PATTERN,
-                post_attn_norm_out,
-                post_attn_a1q,
-                post_attn_a1q_scale,
-                post_attn_moe_quant_config.a1_gscale,
-            )
-            residual = hidden_states
-            hidden_states = post_attn_norm_out
-        else:
-            torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
-                hidden_states,
-                residual,
-                norm.weight.data,
-                norm.variance_epsilon,
-                o_proj.tp_size,
-                True,
-                False,
-                _FI_AR_MAX_TOKEN_NUM,
-                _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
-            )
+        torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm(
+            hidden_states,
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+            o_proj.tp_size,
+            True,
+            False,
+            _FI_AR_MAX_TOKEN_NUM,
+            _FI_AR_RESIDUAL_RMS_NORM_PATTERN,
+        )
     else:
         if o_proj.reduce_results and o_proj.tp_size > 1:
             hidden_states = torch.ops.vllm.all_reduce(
@@ -1121,10 +1069,7 @@ def transformer_layer(
         assert quant_config.block_shape is None
         import flashinfer
 
-        if post_attn_a1q is not None:
-            a1q = post_attn_a1q
-            a1q_scale = post_attn_a1q_scale
-        elif quant_config.is_nvfp4_scale_swizzled:
+        if quant_config.is_nvfp4_scale_swizzled:
             a1q, a1q_scale = ops.scaled_fp4_quant(
                 hidden_states,
                 input_sf,
