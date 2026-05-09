@@ -4,8 +4,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include "ops.h"
-
 namespace vllm {
 
 constexpr int kMlaPrepThreads = 1024;
