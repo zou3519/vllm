@@ -294,6 +294,7 @@ set(VLLM_EXT_SRC
   "csrc/layernorm_quant_kernels.cu"
   "csrc/sampler.cu"
   "csrc/topk.cu"
+  "csrc/mla_prep.cu"
   "csrc/cuda_view.cu"
   "csrc/quantization/gptq/q_gemm.cu"
   "csrc/quantization/w8a8/int8/scaled_quant.cu"
