@@ -84,8 +84,8 @@ __global__ __launch_bounds__(kIndexerPrepThreads) void indexer_prep_kernel(
     const __nv_bfloat16* __restrict__ index_weights,
     __nv_fp8_e4m3* __restrict__ q_fp8,
     float* __restrict__ scaled_weights,
-    const float* __restrict__ norm_weight,
-    const float* __restrict__ norm_bias,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const __nv_bfloat16* __restrict__ norm_bias,
     const int64_t* __restrict__ slot_mapping,
     __nv_fp8_e4m3* __restrict__ kv_cache_fp8,
     float* __restrict__ kv_cache_f32,
@@ -156,8 +156,8 @@ __global__ __launch_bounds__(kIndexerPrepThreads) void indexer_prep_kernel(
 
   float val = 0.0f;
   if (tid < head_dim && valid_token) {
-      const float weight = norm_weight[tid];
-      const float bias = norm_bias[tid];
+    const float weight = load_bf16(norm_weight, tid);
+    const float bias = load_bf16(norm_bias, tid);
     val = centered * inv_std * weight + bias;
     if (tid < rope_dim) {
       const int pair = tid < half_rope ? tid : tid - half_rope;
@@ -169,10 +169,10 @@ __global__ __launch_bounds__(kIndexerPrepThreads) void indexer_prep_kernel(
       const float raw_y = load_bf16(index_k, token * index_k_stride0 +
                                                  (pair + half_rope) *
                                                      index_k_stride1);
-      const float wx = norm_weight[pair];
-      const float wy = norm_weight[pair + half_rope];
-      const float bx = norm_bias[pair];
-      const float by = norm_bias[pair + half_rope];
+      const float wx = load_bf16(norm_weight, pair);
+      const float wy = load_bf16(norm_weight, pair + half_rope);
+      const float bx = load_bf16(norm_bias, pair);
+      const float by = load_bf16(norm_bias, pair + half_rope);
       const float nx = (raw_x - mean) * inv_std * wx + bx;
       const float ny = (raw_y - mean) * inv_std * wy + by;
       val = tid < half_rope ? nx * cos - ny * sin : ny * cos + nx * sin;
@@ -224,10 +224,10 @@ void indexer_qk_rope_quant_cache(
               "index_k must be bfloat16");
   TORCH_CHECK(index_weights.scalar_type() == at::ScalarType::BFloat16,
               "index_weights must be bfloat16");
-  TORCH_CHECK(norm_weight.scalar_type() == at::ScalarType::Float,
-              "norm_weight must be float32");
-  TORCH_CHECK(norm_bias.scalar_type() == at::ScalarType::Float,
-              "norm_bias must be float32");
+  TORCH_CHECK(norm_weight.scalar_type() == at::ScalarType::BFloat16,
+              "norm_weight must be bfloat16");
+  TORCH_CHECK(norm_bias.scalar_type() == at::ScalarType::BFloat16,
+              "norm_bias must be bfloat16");
   TORCH_CHECK(q_fp8.scalar_type() == at::ScalarType::Float8_e4m3fn,
               "q_fp8 must be float8_e4m3fn");
   TORCH_CHECK(kv_cache_fp8.scalar_type() == at::ScalarType::Float8_e4m3fn,
@@ -254,8 +254,8 @@ void indexer_qk_rope_quant_cache(
       reinterpret_cast<const __nv_bfloat16*>(index_weights.data_ptr()),
       reinterpret_cast<__nv_fp8_e4m3*>(q_fp8.data_ptr()),
       scaled_weights.data_ptr<float>(),
-      norm_weight.data_ptr<float>(),
-      norm_bias.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(norm_bias.data_ptr()),
       slot_mapping.data_ptr<int64_t>(),
       reinterpret_cast<__nv_fp8_e4m3*>(kv_cache_fp8.data_ptr()),
       kv_cache_f32.data_ptr<float>(), num_k_tokens, index_q.stride(0),
