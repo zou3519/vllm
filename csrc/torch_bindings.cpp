@@ -106,6 +106,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
+  ops.def("bf16_scaled_add_(Tensor! input, Tensor other, float alpha) -> ()");
+  ops.impl("bf16_scaled_add_", torch::kCUDA, &bf16_scaled_add_);
+
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);

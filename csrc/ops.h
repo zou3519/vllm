@@ -172,6 +172,9 @@ void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
+void bf16_scaled_add_(torch::Tensor& input, torch::Tensor const& other,
+                      double alpha);
+
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
                         torch::Tensor& scale);
 

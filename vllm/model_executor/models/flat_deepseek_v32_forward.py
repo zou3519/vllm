@@ -1138,7 +1138,11 @@ def transformer_layer(
         )[0]
 
         if shared_output is not None:
-            shared_output.add_(final_hidden_states, alpha=moe.routed_scaling_factor)
+            torch.ops._C.bf16_scaled_add_(
+                shared_output,
+                final_hidden_states,
+                moe.routed_scaling_factor,
+            )
             final_hidden_states = shared_output
         else:
             final_hidden_states *= moe.routed_scaling_factor
