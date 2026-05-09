@@ -18,7 +18,7 @@
 namespace vllm {
 
 constexpr int TopK = 2048;              // DeepSeek V3 sparse attention top-k
-constexpr int kThreadsPerBlock = 1024;  // Threads per block
+constexpr int kThreadsPerBlock = 512;   // Threads per block
 
 // Shared memory budget
 #if defined(USE_ROCM)
