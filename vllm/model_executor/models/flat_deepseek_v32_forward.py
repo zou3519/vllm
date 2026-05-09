@@ -800,49 +800,15 @@ def transformer_layer(
         o_proj, "input_global_scale_inv"
     ):
         o_shape = [*input_parallel.shape[:-1], o_proj.output_size_per_partition]
-        backend_name = o_proj.quant_method.backend.value[len("flashinfer-") :]
-        if backend_name == "trtllm" and input_parallel.shape[0] <= 32:
-            x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                input_parallel,
-                o_proj.input_global_scale_inv,
-                is_sf_swizzled_layout=True,
-                backend=o_proj.quant_method.backend.value,
-            )
-        else:
-            input_parallel_2d = input_parallel.reshape(-1, input_parallel.shape[-1])
-            m = input_parallel_2d.shape[0]
-            n = input_parallel_2d.shape[1]
-            fp4_shape = (m, n // 2)
-            scale_shape = (
-                ((m + 127) // 128) * 128,
-                (((n // 16) + 3) // 4),
-            )
-            cached_quant = getattr(o_proj, "_flat_o_fp4_quant_buffers", None)
-            if (
-                cached_quant is None
-                or cached_quant[0].shape != fp4_shape
-                or cached_quant[1].shape != scale_shape
-                or cached_quant[0].device != input_parallel.device
-            ):
-                cached_quant = (
-                    torch.empty(
-                        fp4_shape, dtype=torch.uint8, device=input_parallel.device
-                    ),
-                    torch.empty(
-                        scale_shape, dtype=torch.int32, device=input_parallel.device
-                    ),
-                )
-                o_proj._flat_o_fp4_quant_buffers = cached_quant
-            x_fp4, x_blockscale = cached_quant
-            torch.ops._C.scaled_fp4_quant.out(
-                input_parallel_2d,
-                o_proj.input_global_scale_inv,
-                True,
-                output=x_fp4,
-                output_scale=x_blockscale,
-            )
+        x_fp4, x_blockscale = ops.scaled_fp4_quant(
+            input_parallel,
+            o_proj.input_global_scale_inv,
+            is_sf_swizzled_layout=True,
+            backend=o_proj.quant_method.backend.value,
+        )
         if o_proj.weights_padding_cols > 0:
             x_fp4 = F.pad(x_fp4, (0, o_proj.weights_padding_cols)).contiguous()
+        backend_name = o_proj.quant_method.backend.value[len("flashinfer-") :]
         hidden_states = torch.ops.vllm.flashinfer_mm_fp4(
             x_fp4,
             o_proj.weight.t(),
