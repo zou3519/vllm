@@ -18,6 +18,33 @@ __device__ __forceinline__ __nv_fp8_e4m3 float_to_fp8(float x) {
   return __nv_fp8_e4m3(x);
 }
 
+__device__ __forceinline__ float block_reduce_sum(float sum, float* smem) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xffffffff, sum, offset);
+  }
+  if (lane == 0) {
+    smem[warp] = sum;
+  }
+  __syncthreads();
+
+  const int num_warps = (blockDim.x + 31) >> 5;
+  sum = threadIdx.x < num_warps ? smem[lane] : 0.0f;
+  if (warp == 0) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+  }
+  if (threadIdx.x == 0) {
+    smem[0] = sum;
+  }
+  __syncthreads();
+  return smem[0];
+}
+
 __global__ __launch_bounds__(kMlaPrepThreads) void mla_prep_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const __nv_bfloat16* __restrict__ q_weight,
@@ -33,7 +60,7 @@ __global__ __launch_bounds__(kMlaPrepThreads) void mla_prep_kernel(
   const int token = blockIdx.x;
   const int part = blockIdx.y;
   const int tid = threadIdx.x;
-  __shared__ float smem[kMlaPrepThreads];
+  __shared__ float smem[32];
 
   if (part == 0) {
     float sum = 0.0f;
@@ -41,15 +68,8 @@ __global__ __launch_bounds__(kMlaPrepThreads) void mla_prep_kernel(
       const float x = load_bf16(qkv, token * qkv_stride0 + col * qkv_stride1);
       sum += x * x;
     }
-    smem[tid] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        smem[tid] += smem[tid + stride];
-      }
-      __syncthreads();
-    }
-    const float q_inv_rms = rsqrtf(smem[0] / static_cast<float>(q_rank) + eps);
+    const float q_inv_rms =
+        rsqrtf(block_reduce_sum(sum, smem) / static_cast<float>(q_rank) + eps);
     for (int col = tid; col < q_rank; col += blockDim.x) {
       const float x = load_bf16(qkv, token * qkv_stride0 + col * qkv_stride1);
       const float w = __bfloat162float(q_weight[col]);
@@ -65,15 +85,8 @@ __global__ __launch_bounds__(kMlaPrepThreads) void mla_prep_kernel(
         load_bf16(qkv, token * qkv_stride0 + (q_rank + col) * qkv_stride1);
     sum += x * x;
   }
-  smem[tid] = sum;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      smem[tid] += smem[tid + stride];
-    }
-    __syncthreads();
-  }
-  const float kv_inv_rms = rsqrtf(smem[0] / static_cast<float>(kv_rank) + eps);
+  const float kv_inv_rms =
+      rsqrtf(block_reduce_sum(sum, smem) / static_cast<float>(kv_rank) + eps);
   const int64_t slot = slot_mapping[token];
   if (slot < 0) {
     return;
