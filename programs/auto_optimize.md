@@ -77,13 +77,17 @@ systemd-run --user --collect --unit=vllm-auto-<hash> \
   --setenv=HOME="$HOME" \
   --setenv=USER="$USER" \
   --setenv=PATH="$PATH" \
+  --setenv=PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
   --setenv=VLLM_USE_FLASHINFER_MOE_FP4=1 \
   /usr/bin/bash -lc 'exec vllm serve ... > /tmp/vllm-auto-<hash>.log 2>&1'
 ```
 Pass every required environment variable explicitly, including `PATH` so JIT
-tools such as `ninja` are visible. In offline runs, pass the local checkpoint
-snapshot path and `--served-model-name <original-model-name>`, plus the required
-offline/cache env vars. Verify placement with
+tools such as `ninja` are visible. Put the repo root first in `PYTHONPATH`
+when using a console entry point such as `.venv/bin/vllm`; otherwise the server
+can silently import an older installed package instead of the source tree being
+edited. In offline runs, pass the local checkpoint snapshot path and
+`--served-model-name <original-model-name>`, plus the required offline/cache
+env vars. Verify placement with
 `systemctl --user status vllm-auto-<hash>.service`; the cgroup should be under
 `user@<uid>.service/app.slice/`, not the agent sandbox slice. Stop it with
 `systemctl --user stop vllm-auto-<hash>.service`.

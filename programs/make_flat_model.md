@@ -154,9 +154,11 @@ LOOP FOREVER until the flat model produces correct output:
    If the agent is getting killed by OOM attribution while the vLLM server is
    alive, start vLLM with `systemd-run --user --collect --unit=<name>` as a
    transient user service and pass required env vars explicitly, especially
-   `PATH`, `HOME`, backend selector env vars, and offline/cache env vars. Check
-   `systemctl --user status <name>.service` and confirm the server cgroup is
-   under `user@<uid>.service/app.slice/`, then stop it with
+   `PATH`, `HOME`, backend selector env vars, and offline/cache env vars. When
+   running from a console entry point, put the repo root first in `PYTHONPATH`
+   so the server imports the edited flat-model source instead of an older
+   installed package. Check `systemctl --user status <name>.service` and
+   confirm the server cgroup is under `user@<uid>.service/app.slice/`, then stop it with
    `systemctl --user stop <name>.service`.
 
 2. **Test correctness** — send these prompts and check the answers:
