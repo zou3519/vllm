@@ -24,7 +24,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     _index_qk_rope_quant_cache_kernel,
     _index_q_rope_quant_weights_kernel,
     _mla_decode_q_project_rope_concat_quant_fp8_kernel,
-    _mla_qkv_a_rmsnorm_k_rope_cache_fp8_kernel,
     _mla_qkv_a_rmsnorm_kernel,
     triton_convert_req_index_to_global_index,
 )
@@ -197,7 +196,7 @@ def transformer_layer(
                 )
                 rotary._flat_cos_sin_cache = cached_cos_sin
             fused_mla_cos_sin_cache = cached_cos_sin
-        _mla_qkv_a_rmsnorm_k_rope_cache_fp8_kernel[(qkv_lora.shape[0], 2)](
+        torch.ops._C.mla_qkv_a_rmsnorm_k_rope_cache_fp8(
             qkv_lora,
             wrapper.q_a_layernorm.weight.data,
             wrapper.kv_a_layernorm.weight.data,
@@ -207,19 +206,12 @@ def transformer_layer(
             layer_slot_mapping.flatten(),
             mla.kv_cache.view(torch.float8_e4m3fn),
             mla._k_scale,
-            qkv_lora.shape[0],
             wrapper.q_lora_rank,
             wrapper.kv_lora_rank,
             wrapper.qk_rope_head_dim,
-            qkv_lora.stride(0),
-            qkv_lora.stride(1),
-            q_c.stride(0),
-            q_c.stride(1),
             mla.kv_cache.shape[1],
             mla.kv_cache.shape[2],
-            EPS=wrapper.q_a_layernorm.variance_epsilon,
-            BLOCK_N=2048,
-            num_warps=4,
+            wrapper.q_a_layernorm.variance_epsilon,
         )
     else:
         kv_c_normed = torch.empty(
