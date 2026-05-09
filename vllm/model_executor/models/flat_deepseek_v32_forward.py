@@ -575,6 +575,7 @@ def transformer_layer(
                 FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
                 BLOCK_N=128,
                 num_warps=4,
+                num_stages=1,
             )
             index_weights = scaled_index_weights
             topk_indices_buffer = indexer.topk_indices_buffer
