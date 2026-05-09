@@ -6,7 +6,7 @@
 
 namespace vllm {
 
-constexpr int kMlaPrepThreads = 1024;
+constexpr int kMlaPrepThreads = 512;
 
 __device__ __forceinline__ float load_bf16(const __nv_bfloat16* ptr,
                                            int64_t offset) {
