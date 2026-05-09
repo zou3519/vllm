@@ -33,7 +33,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 _FI_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _fi_sparse_workspace: torch.Tensor | None = None
 _FI_AR_RESIDUAL_RMS_NORM_PATTERN = 1
-_FI_AR_MAX_TOKEN_NUM = 4681
+_FI_AR_MAX_TOKEN_NUM = 0
 
 
 def transformer_layer(
