@@ -98,7 +98,6 @@ def _index_k_norm_rope_cache_kernel(
 
     absmax = tl.max(tl.abs(tl.where(mask, vals, 0.0)), axis=0)
     scale = tl.maximum(absmax, 1.0e-4) / 448.0
-    scale = tl.exp2(tl.ceil(tl.log2(scale)))
     q_vals = vals / scale
     q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
 
@@ -187,8 +186,7 @@ def _index_q_rope_quant_weights_kernel(
     vals = tl.where((cols >= half_rope) & (cols < rope_dim), y_rot, vals)
 
     absmax = tl.max(tl.abs(tl.where(mask, vals, 0.0)), axis=0)
-    scale = absmax / 448.0
-    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1.0e-10))))
+    scale = tl.maximum(absmax, 1.0e-4) / 448.0
     q_vals = vals / scale
     q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
     tl.store(
@@ -297,8 +295,7 @@ def _index_qk_rope_quant_cache_kernel(
         vals = tl.where((cols >= half_rope) & (cols < rope_dim), y_rot, vals)
 
         absmax = tl.max(tl.abs(tl.where(mask, vals, 0.0)), axis=0)
-        scale = absmax / 448.0
-        scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.abs(scale), 1.0e-10))))
+        scale = tl.maximum(absmax, 1.0e-4) / 448.0
         q_vals = vals / scale
         q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
         tl.store(
@@ -372,7 +369,6 @@ def _index_qk_rope_quant_cache_kernel(
 
         absmax = tl.max(tl.abs(tl.where(mask, vals, 0.0)), axis=0)
         scale = tl.maximum(absmax, 1.0e-4) / 448.0
-        scale = tl.exp2(tl.ceil(tl.log2(scale)))
         q_vals = vals / scale
         q_vals = tl.minimum(tl.maximum(q_vals, -448.0), 448.0)
 
