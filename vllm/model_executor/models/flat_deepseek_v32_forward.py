@@ -61,10 +61,7 @@ TORCH_LIBRARY_IMPL(vllm_flat_deepseek, CUDA, m) {
 __global__ void flat_mla_v_up_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ w,
                                      __nv_bfloat16* __restrict__ out,
-                                     int tokens, int heads,
-                                     int64_t xs0, int64_t xs1, int64_t xs2,
-                                     int64_t ws0, int64_t ws1, int64_t ws2,
-                                     int64_t os0, int64_t os1, int64_t os2) {
+                                     int tokens, int heads) {
   int token = blockIdx.x;
   int head = blockIdx.y;
   int v = threadIdx.x;
@@ -74,15 +71,14 @@ __global__ void flat_mla_v_up_kernel(const __nv_bfloat16* __restrict__ x,
     return;
   }
 
-  const __nv_bfloat16* x_row = x + token * xs0 + head * xs1;
-  const __nv_bfloat16* w_row = w + head * ws0 + v * ws2;
+  const __nv_bfloat16* x_row = x + (token * heads + head) * K;
+  const __nv_bfloat16* w_row = w + head * K * V + v;
   float acc = 0.0f;
 #pragma unroll 4
   for (int k = 0; k < K; ++k) {
-    acc += __bfloat162float(x_row[k * xs2]) *
-           __bfloat162float(w_row[k * ws1]);
+    acc += __bfloat162float(x_row[k]) * __bfloat162float(w_row[k * V]);
   }
-  out[token * os0 + head * os1 + v * os2] = __float2bfloat16(acc);
+  out[(token * heads + head) * V + v] = __float2bfloat16(acc);
 }
 
 void flat_mla_v_up_cuda(torch::Tensor sparse_out, torch::Tensor w_uv,
@@ -101,6 +97,10 @@ void flat_mla_v_up_cuda(torch::Tensor sparse_out, torch::Tensor w_uv,
   TORCH_CHECK(sparse_out.size(2) == 512 && w_uv.size(1) == 512 &&
                   w_uv.size(2) == 128 && out.size(2) == 128,
               "mla_v_up expects K=512 and V=128");
+  TORCH_CHECK(sparse_out.is_contiguous() && w_uv.is_contiguous() &&
+                  out.is_contiguous(),
+              "mla_v_up expects contiguous tensors");
+
   int tokens = static_cast<int>(sparse_out.size(0));
   int heads = static_cast<int>(sparse_out.size(1));
   dim3 grid(tokens, heads);
@@ -109,10 +109,7 @@ void flat_mla_v_up_cuda(torch::Tensor sparse_out, torch::Tensor w_uv,
   flat_mla_v_up_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(sparse_out.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(w_uv.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tokens, heads,
-      sparse_out.stride(0), sparse_out.stride(1), sparse_out.stride(2),
-      w_uv.stride(0), w_uv.stride(1), w_uv.stride(2),
-      out.stride(0), out.stride(1), out.stride(2));
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tokens, heads);
 }
     """,
     with_cuda=True,
