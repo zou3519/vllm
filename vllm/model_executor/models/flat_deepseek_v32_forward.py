@@ -601,6 +601,7 @@ def transformer_layer(
                     indexer.k_cache.kv_cache.shape[2],
                     EPS=indexer.k_norm.eps,
                     BLOCK_N=128,
+                    num_warps=2,
                 )
             else:
                 _index_qk_rope_quant_cache_kernel[
