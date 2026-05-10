@@ -51,7 +51,7 @@ __device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec,
 
 template <typename T, int kBlockSize, int VPT, int kNumTokens, int kNumExperts,
           int kHiddenDim>
-__global__ __launch_bounds__(128, 1) void router_gemm_kernel_bf16_output(
+__global__ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel_bf16_output(
     __nv_bfloat16* out, T const* mat_a, T const* mat_b) {
   // Each block handles one expert column
   int const n_idx = blockIdx.x;
@@ -174,7 +174,7 @@ template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeRouterGemmBf16Output(__nv_bfloat16* output, T const* mat_a,
                                 T const* mat_b, cudaStream_t stream) {
   constexpr int VPT = 16 / sizeof(T);
-  constexpr int kBlockSize = 128;
+  constexpr int kBlockSize = 224;
   cudaLaunchConfig_t config;
   config.gridDim = kNumExperts;
   config.blockDim = kBlockSize;
