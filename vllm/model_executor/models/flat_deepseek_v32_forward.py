@@ -1086,6 +1086,7 @@ def transformer_layer(
                 enable_pdl=False,
             )
         assert fused_experts.routing_method_type == RoutingMethodType.DeepSeekV3
+        router_logits = router_logits.to(torch.float32)
         e_score_correction_bias = moe.experts.e_score_correction_bias
         if e_score_correction_bias is not None:
             cached_bias = getattr(moe.experts, "_flat_e_score_bias_bf16", None)
