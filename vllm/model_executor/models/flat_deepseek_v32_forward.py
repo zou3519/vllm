@@ -473,23 +473,22 @@ def transformer_layer(
                 rotary._flat_cos_sin_cache = cached_cos_sin
             cos_sin_cache = cached_cos_sin
 
-        # Sparse indexer q/k prep outputs.
-        q_fp8 = torch.empty(
-            index_q.shape,
-            device=index_q.device,
-            dtype=torch.float8_e4m3fn,
-        )
-        scaled_index_weights = torch.empty(
-            index_weights.shape,
-            device=index_weights.device,
-            dtype=torch.float32,
-        )
         assert indexer.head_dim <= 128
 
         # Sparse indexer: profile allocation path.
         attn_metadata = forward_context.attn_metadata
         fp8_dtype = torch.float8_e4m3fn
         if not isinstance(attn_metadata, dict):
+            q_fp8 = torch.empty(
+                index_q.shape,
+                device=index_q.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            scaled_index_weights = torch.empty(
+                index_weights.shape,
+                device=index_weights.device,
+                dtype=torch.float32,
+            )
             _index_q_rope_quant_weights_kernel[
                 (index_q.shape[0], index_q.shape[1])
             ](
@@ -567,6 +566,16 @@ def transformer_layer(
                     BLOCK_N=128,
                 )
             else:
+                q_fp8 = torch.empty(
+                    index_q.shape,
+                    device=index_q.device,
+                    dtype=torch.float8_e4m3fn,
+                )
+                scaled_index_weights = torch.empty(
+                    index_weights.shape,
+                    device=index_weights.device,
+                    dtype=torch.float32,
+                )
                 _index_qk_rope_quant_cache_kernel[
                     (index_q.shape[0], index_q.shape[1] + 1)
                 ](
@@ -667,12 +676,8 @@ def transformer_layer(
                 assert decode_metadata is not None
                 decode_lens = decode_metadata.decode_lens
                 assert not decode_metadata.requires_padding
-                padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-                    decode_lens.shape[0], -1, *q_fp8.shape[1:]
-                )
-
-                batch_size = padded_q_fp8_decode_tokens.shape[0]
-                next_n = padded_q_fp8_decode_tokens.shape[1]
+                batch_size = decode_lens.shape[0]
+                next_n = num_decode_tokens // batch_size
                 num_padded_tokens = batch_size * next_n
                 topk_indices = topk_indices_buffer[
                     :num_padded_tokens, : indexer.topk_tokens
@@ -704,6 +709,9 @@ def transformer_layer(
                         decode_metadata.short_topk_indices_physical = topk_indices
                         decode_metadata.short_sparse_seq_lens = sparse_seq_lens
                 else:
+                    padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+                        batch_size, next_n, *q_fp8.shape[1:]
+                    )
                     logits = deep_gemm.fp8_paged_mqa_logits(
                         padded_q_fp8_decode_tokens,
                         indexer.k_cache.kv_cache.unsqueeze(-2),
