@@ -243,9 +243,25 @@ def transformer_layer(
     q_b_proj = wrapper.q_b_proj
     wq_b = indexer.wq_b if indexer is not None else None
     index_q = None
+    short_decode_topk = False
+    if indexer is not None:
+        attn_metadata_for_indexer = forward_context.attn_metadata
+        if isinstance(attn_metadata_for_indexer, dict):
+            index_metadata_for_short = attn_metadata_for_indexer[
+                indexer.k_cache.prefix
+            ]
+            assert isinstance(index_metadata_for_short, DeepseekV32IndexerMetadata)
+            decode_metadata_for_short = index_metadata_for_short.decode
+            short_decode_topk = (
+                index_metadata_for_short.num_decodes > 0
+                and index_metadata_for_short.num_prefills == 0
+                and decode_metadata_for_short is not None
+                and decode_metadata_for_short.max_seq_len <= indexer.topk_tokens
+            )
     bias = q_b_proj.bias if not q_b_proj.skip_bias_add else None
     if (
         wq_b is not None
+        and not short_decode_topk
         and not hasattr(q_b_proj, "weight_global_scale")
         and not hasattr(wq_b, "weight_global_scale")
         and bias is None
@@ -329,40 +345,43 @@ def transformer_layer(
 
     # Sparse indexer q projection.
     if indexer is not None:
-        bias = wq_b.bias if not wq_b.skip_bias_add else None
-        if index_q is not None:
-            pass
-        elif hasattr(wq_b, "weight_global_scale") and hasattr(
-            wq_b, "input_global_scale_inv"
-        ):
-            index_q_shape = [*q_c.shape[:-1], wq_b.output_size_per_partition]
-            x_fp4, x_blockscale = ops.scaled_fp4_quant(
-                q_c,
-                wq_b.input_global_scale_inv,
-                is_sf_swizzled_layout=True,
-                backend=wq_b.quant_method.backend.value,
-            )
-            if wq_b.weights_padding_cols > 0:
-                x_fp4 = F.pad(x_fp4, (0, wq_b.weights_padding_cols)).contiguous()
-            backend_name = wq_b.quant_method.backend.value[len("flashinfer-") :]
-            index_q = torch.ops.vllm.flashinfer_mm_fp4(
-                x_fp4,
-                wq_b.weight.t(),
-                x_blockscale.view(torch.uint8),
-                wq_b.weight_scale.view(torch.uint8).t(),
-                wq_b.alpha,
-                q_c.dtype,
-                backend_name == "trtllm" and x_fp4.shape[0] <= 32,
-                backend_name,
-            )
-            if index_q.shape[-1] != wq_b.output_size_per_partition:
-                index_q = index_q[..., : wq_b.output_size_per_partition].contiguous()
-            index_q = index_q.view(*index_q_shape)
-            if bias is not None:
-                index_q = index_q + bias
-        else:
-            index_q = F.linear(q_c, wq_b.weight, bias)
-        index_q = index_q.view(-1, indexer.n_head, indexer.head_dim)
+        if not short_decode_topk:
+            bias = wq_b.bias if not wq_b.skip_bias_add else None
+            if index_q is not None:
+                pass
+            elif hasattr(wq_b, "weight_global_scale") and hasattr(
+                wq_b, "input_global_scale_inv"
+            ):
+                index_q_shape = [*q_c.shape[:-1], wq_b.output_size_per_partition]
+                x_fp4, x_blockscale = ops.scaled_fp4_quant(
+                    q_c,
+                    wq_b.input_global_scale_inv,
+                    is_sf_swizzled_layout=True,
+                    backend=wq_b.quant_method.backend.value,
+                )
+                if wq_b.weights_padding_cols > 0:
+                    x_fp4 = F.pad(x_fp4, (0, wq_b.weights_padding_cols)).contiguous()
+                backend_name = wq_b.quant_method.backend.value[len("flashinfer-") :]
+                index_q = torch.ops.vllm.flashinfer_mm_fp4(
+                    x_fp4,
+                    wq_b.weight.t(),
+                    x_blockscale.view(torch.uint8),
+                    wq_b.weight_scale.view(torch.uint8).t(),
+                    wq_b.alpha,
+                    q_c.dtype,
+                    backend_name == "trtllm" and x_fp4.shape[0] <= 32,
+                    backend_name,
+                )
+                if index_q.shape[-1] != wq_b.output_size_per_partition:
+                    index_q = index_q[
+                        ..., : wq_b.output_size_per_partition
+                    ].contiguous()
+                index_q = index_q.view(*index_q_shape)
+                if bias is not None:
+                    index_q = index_q + bias
+            else:
+                index_q = F.linear(q_c, wq_b.weight, bias)
+            index_q = index_q.view(-1, indexer.n_head, indexer.head_dim)
 
         # Sparse indexer fused wk + weights projection.
         if indexer.is_fp4_ckpt:
@@ -459,31 +478,36 @@ def transformer_layer(
         # Sparse indexer q RoPE/quant path shares the indexer RoPE table.
         rotary = wrapper.indexer_rope_emb
         cos_sin_cache = rotary.cos_sin_cache
+        indexer_rope_ref = index_k if index_q is None else index_q
         if (
-            cos_sin_cache.device != index_q.device
-            or cos_sin_cache.dtype != index_q.dtype
+            cos_sin_cache.device != indexer_rope_ref.device
+            or cos_sin_cache.dtype != indexer_rope_ref.dtype
         ):
             cached_cos_sin = getattr(rotary, "_flat_cos_sin_cache", None)
             if (
                 cached_cos_sin is None
-                or cached_cos_sin.device != index_q.device
-                or cached_cos_sin.dtype != index_q.dtype
+                or cached_cos_sin.device != indexer_rope_ref.device
+                or cached_cos_sin.dtype != indexer_rope_ref.dtype
             ):
-                cached_cos_sin = cos_sin_cache.to(index_q.device, dtype=index_q.dtype)
+                cached_cos_sin = cos_sin_cache.to(
+                    indexer_rope_ref.device, dtype=indexer_rope_ref.dtype
+                )
                 rotary._flat_cos_sin_cache = cached_cos_sin
             cos_sin_cache = cached_cos_sin
 
-        # Sparse indexer q/k prep outputs.
-        q_fp8 = torch.empty(
-            index_q.shape,
-            device=index_q.device,
-            dtype=torch.float8_e4m3fn,
-        )
-        scaled_index_weights = torch.empty(
-            index_weights.shape,
-            device=index_weights.device,
-            dtype=torch.float32,
-        )
+        if not short_decode_topk:
+            # Sparse indexer q/k prep outputs.
+            assert index_q is not None
+            q_fp8 = torch.empty(
+                index_q.shape,
+                device=index_q.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            scaled_index_weights = torch.empty(
+                index_weights.shape,
+                device=index_weights.device,
+                dtype=torch.float32,
+            )
         assert indexer.head_dim <= 128
 
         # Sparse indexer: profile allocation path.
@@ -667,12 +691,8 @@ def transformer_layer(
                 assert decode_metadata is not None
                 decode_lens = decode_metadata.decode_lens
                 assert not decode_metadata.requires_padding
-                padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-                    decode_lens.shape[0], -1, *q_fp8.shape[1:]
-                )
-
-                batch_size = padded_q_fp8_decode_tokens.shape[0]
-                next_n = padded_q_fp8_decode_tokens.shape[1]
+                batch_size = decode_lens.shape[0]
+                next_n = num_decode_tokens // batch_size
                 num_padded_tokens = batch_size * next_n
                 topk_indices = topk_indices_buffer[
                     :num_padded_tokens, : indexer.topk_tokens
@@ -704,6 +724,9 @@ def transformer_layer(
                         decode_metadata.short_topk_indices_physical = topk_indices
                         decode_metadata.short_sparse_seq_lens = sparse_seq_lens
                 else:
+                    padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+                        batch_size, next_n, *q_fp8.shape[1:]
+                    )
                     logits = deep_gemm.fp8_paged_mqa_logits(
                         padded_q_fp8_decode_tokens,
                         indexer.k_cache.kv_cache.unsqueeze(-2),
