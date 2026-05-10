@@ -124,12 +124,6 @@ void large_context_topk_physical(
     torch::Tensor& valid_counts, int64_t block_size,
     std::optional<torch::Tensor> row_starts_opt);
 
-void short_context_topk_physical(torch::Tensor& indices,
-                                 const torch::Tensor& seq_lens,
-                                 const torch::Tensor& block_table,
-                                 torch::Tensor& valid_counts,
-                                 int64_t block_size);
-
 void mla_qkv_a_rmsnorm_k_rope_cache_fp8(
     const torch::Tensor& qkv, const torch::Tensor& q_weight,
     const torch::Tensor& kv_weight, torch::Tensor& q_out,

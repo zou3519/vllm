@@ -48,16 +48,6 @@ struct FastTopKPhysicalParams {
   int32_t block_size;
 };
 
-struct ShortTopKPhysicalParams {
-  int32_t* __restrict__ indices;             // [batch, TopK]
-  int32_t* __restrict__ lengths;             // [batch]
-  const int32_t* __restrict__ block_table;   // [batch, max_blocks]
-  int32_t* __restrict__ valid_counts;        // [batch]
-  int64_t block_table_stride0;
-  int64_t block_table_stride1;
-  int32_t block_size;
-};
-
 __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
@@ -355,29 +345,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   }
 }
 
-__global__ __launch_bounds__(kThreadsPerBlock) void short_topk_physical_kernel(
-    const ShortTopKPhysicalParams params) {
-  const uint64_t batch_idx = blockIdx.x;
-  const int seq_len = params.lengths[batch_idx];
-  int32_t* output_indices = params.indices + batch_idx * TopK;
-
-  for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
-    if (i < seq_len) {
-      const int block_id = i / params.block_size;
-      const int block_offset = i - block_id * params.block_size;
-      const int physical_block =
-          params.block_table[batch_idx * params.block_table_stride0 +
-                             block_id * params.block_table_stride1];
-      output_indices[i] = physical_block * params.block_size + block_offset;
-    } else {
-      output_indices[i] = -1;
-    }
-  }
-  if (threadIdx.x == 0) {
-    params.valid_counts[batch_idx] = seq_len;
-  }
-}
-
 FastTopKParams get_params(
     const at::Tensor& score, const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt,
@@ -504,49 +471,5 @@ void large_context_topk_physical(
 
   const cudaError_t result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "large_context_topk_physical kernel failed: ",
-              cudaGetErrorString(result));
-}
-
-void short_context_topk_physical(torch::Tensor& indices,
-                                 const torch::Tensor& seq_lens,
-                                 const torch::Tensor& block_table,
-                                 torch::Tensor& valid_counts,
-                                 int64_t block_size) {
-  TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
-  TORCH_CHECK(seq_lens.is_cuda(), "seq_lens must be a CUDA tensor");
-  TORCH_CHECK(block_table.is_cuda(), "block_table must be a CUDA tensor");
-  TORCH_CHECK(valid_counts.is_cuda(), "valid_counts must be a CUDA tensor");
-  TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous() &&
-                  indices.size(1) == vllm::TopK,
-              "indices must be contiguous [batch, TopK]");
-  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
-                  seq_lens.size(0) == indices.size(0),
-              "seq_lens must be contiguous [batch]");
-  TORCH_CHECK(block_table.dim() == 2, "block_table must be 2D");
-  TORCH_CHECK(block_table.scalar_type() == torch::kInt32,
-              "block_table must be int32");
-  TORCH_CHECK(valid_counts.dim() == 1 && valid_counts.is_contiguous() &&
-                  valid_counts.size(0) == indices.size(0),
-              "valid_counts must be contiguous [batch]");
-  TORCH_CHECK(valid_counts.scalar_type() == torch::kInt32,
-              "valid_counts must be int32");
-
-  const vllm::ShortTopKPhysicalParams params{
-      .indices = indices.data_ptr<int32_t>(),
-      .lengths = seq_lens.data_ptr<int32_t>(),
-      .block_table = block_table.data_ptr<int32_t>(),
-      .valid_counts = valid_counts.data_ptr<int32_t>(),
-      .block_table_stride0 = block_table.stride(0),
-      .block_table_stride1 = block_table.stride(1),
-      .block_size = static_cast<int32_t>(block_size),
-  };
-
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid(static_cast<uint32_t>(indices.size(0)));
-  const dim3 block(vllm::kThreadsPerBlock);
-  vllm::short_topk_physical_kernel<<<grid, block, 0, stream>>>(params);
-
-  const cudaError_t result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "short_context_topk_physical kernel failed: ",
               cudaGetErrorString(result));
 }

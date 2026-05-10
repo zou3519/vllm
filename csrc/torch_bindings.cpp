@@ -198,12 +198,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &large_context_topk_physical);
 
   ops.def(
-      "short_context_topk_physical(Tensor! indices, Tensor lengths, "
-      "Tensor block_table, Tensor! valid_counts, int block_size) -> ()");
-  ops.impl("short_context_topk_physical", torch::kCUDA,
-           &short_context_topk_physical);
-
-  ops.def(
       "mla_qkv_a_rmsnorm_k_rope_cache_fp8(Tensor qkv, Tensor q_weight, "
       "Tensor kv_weight, Tensor! q_out, Tensor positions, Tensor cos_sin_cache, "
       "Tensor slot_mapping, Tensor! kv_cache, Tensor scale, int q_rank, "
