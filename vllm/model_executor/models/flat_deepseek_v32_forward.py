@@ -94,6 +94,21 @@ def transformer_layer(
         if indexer is not None and indexer.is_fp4_ckpt
         else None
     )
+    short_decode_topk = False
+    if indexer is not None:
+        attn_metadata_for_indexer = forward_context.attn_metadata
+        if isinstance(attn_metadata_for_indexer, dict):
+            index_metadata_for_short = attn_metadata_for_indexer[
+                indexer.k_cache.prefix
+            ]
+            assert isinstance(index_metadata_for_short, DeepseekV32IndexerMetadata)
+            decode_metadata_for_short = index_metadata_for_short.decode
+            short_decode_topk = (
+                index_metadata_for_short.num_decodes > 0
+                and index_metadata_for_short.num_prefills == 0
+                and decode_metadata_for_short is not None
+                and decode_metadata_for_short.max_seq_len <= indexer.topk_tokens
+            )
     kw = None
     if (
         wk_weights_proj_for_qkv is not None
@@ -105,13 +120,25 @@ def transformer_layer(
             or wk_weights_proj_for_qkv.skip_bias_add
         )
     ):
-        combined_weight = getattr(wrapper, "_flat_qkv_kw_weight", None)
-        if combined_weight is None:
-            combined_weight = torch.cat(
-                (fused_qkv_a_proj.weight, wk_weights_proj_for_qkv.weight),
-                dim=0,
-            )
-            wrapper._flat_qkv_kw_weight = combined_weight
+        if short_decode_topk:
+            combined_weight = getattr(wrapper, "_flat_qkv_wk_weight", None)
+            if combined_weight is None:
+                combined_weight = torch.cat(
+                    (
+                        fused_qkv_a_proj.weight,
+                        wk_weights_proj_for_qkv.weight[: indexer.head_dim],
+                    ),
+                    dim=0,
+                )
+                wrapper._flat_qkv_wk_weight = combined_weight
+        else:
+            combined_weight = getattr(wrapper, "_flat_qkv_kw_weight", None)
+            if combined_weight is None:
+                combined_weight = torch.cat(
+                    (fused_qkv_a_proj.weight, wk_weights_proj_for_qkv.weight),
+                    dim=0,
+                )
+                wrapper._flat_qkv_kw_weight = combined_weight
         qkv_kw = F.linear(hidden_states, combined_weight, None)
         qkv_lora = qkv_kw[..., : fused_qkv_a_proj.output_size_per_partition]
         kw = qkv_kw[..., fused_qkv_a_proj.output_size_per_partition :]
@@ -243,21 +270,6 @@ def transformer_layer(
     q_b_proj = wrapper.q_b_proj
     wq_b = indexer.wq_b if indexer is not None else None
     index_q = None
-    short_decode_topk = False
-    if indexer is not None:
-        attn_metadata_for_indexer = forward_context.attn_metadata
-        if isinstance(attn_metadata_for_indexer, dict):
-            index_metadata_for_short = attn_metadata_for_indexer[
-                indexer.k_cache.prefix
-            ]
-            assert isinstance(index_metadata_for_short, DeepseekV32IndexerMetadata)
-            decode_metadata_for_short = index_metadata_for_short.decode
-            short_decode_topk = (
-                index_metadata_for_short.num_decodes > 0
-                and index_metadata_for_short.num_prefills == 0
-                and decode_metadata_for_short is not None
-                and decode_metadata_for_short.max_seq_len <= indexer.topk_tokens
-            )
     bias = q_b_proj.bias if not q_b_proj.skip_bias_add else None
     if (
         wq_b is not None
