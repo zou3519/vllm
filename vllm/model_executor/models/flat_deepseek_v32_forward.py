@@ -661,18 +661,31 @@ def transformer_layer(
                 ]
                 if decode_metadata.use_large_context_topk:
                     assert next_n == 1
-                    lengths = decode_metadata.seq_lens
-                    sparse_seq_lens = torch.empty_like(lengths)
-                    torch.ops._C.large_context_topk_physical(
-                        logits,
-                        topk_indices,
-                        lengths,
-                        decode_metadata.block_table,
-                        sparse_seq_lens,
-                        decode_metadata.block_size,
-                        None,
-                    )
-                    topk_indices_physical = topk_indices
+                    if (
+                        decode_metadata.max_seq_len <= indexer.topk_tokens
+                        and decode_metadata.short_topk_ready
+                    ):
+                        topk_indices_physical = (
+                            decode_metadata.short_topk_indices_physical
+                        )
+                        sparse_seq_lens = decode_metadata.short_sparse_seq_lens
+                    else:
+                        lengths = decode_metadata.seq_lens
+                        sparse_seq_lens = torch.empty_like(lengths)
+                        torch.ops._C.large_context_topk_physical(
+                            logits,
+                            topk_indices,
+                            lengths,
+                            decode_metadata.block_table,
+                            sparse_seq_lens,
+                            decode_metadata.block_size,
+                            None,
+                        )
+                        topk_indices_physical = topk_indices
+                        if decode_metadata.max_seq_len <= indexer.topk_tokens:
+                            decode_metadata.short_topk_ready = True
+                            decode_metadata.short_topk_indices_physical = topk_indices
+                            decode_metadata.short_sparse_seq_lens = sparse_seq_lens
                 else:
                     torch.ops._C.top_k_per_row_decode(
                         logits,
