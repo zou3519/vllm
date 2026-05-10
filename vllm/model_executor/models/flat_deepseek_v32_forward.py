@@ -1135,6 +1135,7 @@ def transformer_layer(
             routing_method_type=fused_experts.routing_method_type,
             do_finalize=True,
             activation_type=activation_type,
+            tune_max_num_tokens=1,
         )[0]
 
         if shared_output is not None:
