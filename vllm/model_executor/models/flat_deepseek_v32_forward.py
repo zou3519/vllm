@@ -112,7 +112,6 @@ def transformer_layer(
     kw = None
     if (
         wk_weights_proj_for_qkv is not None
-        and not short_decode_topk
         and not hasattr(fused_qkv_a_proj, "weight_global_scale")
         and not hasattr(wk_weights_proj_for_qkv, "weight_global_scale")
         and (fused_qkv_a_proj.bias is None or fused_qkv_a_proj.skip_bias_add)
@@ -121,13 +120,25 @@ def transformer_layer(
             or wk_weights_proj_for_qkv.skip_bias_add
         )
     ):
-        combined_weight = getattr(wrapper, "_flat_qkv_kw_weight", None)
-        if combined_weight is None:
-            combined_weight = torch.cat(
-                (fused_qkv_a_proj.weight, wk_weights_proj_for_qkv.weight),
-                dim=0,
-            )
-            wrapper._flat_qkv_kw_weight = combined_weight
+        if short_decode_topk:
+            combined_weight = getattr(wrapper, "_flat_qkv_wk_weight", None)
+            if combined_weight is None:
+                combined_weight = torch.cat(
+                    (
+                        fused_qkv_a_proj.weight,
+                        wk_weights_proj_for_qkv.weight[: indexer.head_dim],
+                    ),
+                    dim=0,
+                )
+                wrapper._flat_qkv_wk_weight = combined_weight
+        else:
+            combined_weight = getattr(wrapper, "_flat_qkv_kw_weight", None)
+            if combined_weight is None:
+                combined_weight = torch.cat(
+                    (fused_qkv_a_proj.weight, wk_weights_proj_for_qkv.weight),
+                    dim=0,
+                )
+                wrapper._flat_qkv_kw_weight = combined_weight
         qkv_kw = F.linear(hidden_states, combined_weight, None)
         qkv_lora = qkv_kw[..., : fused_qkv_a_proj.output_size_per_partition]
         kw = qkv_kw[..., fused_qkv_a_proj.output_size_per_partition :]
@@ -394,17 +405,6 @@ def transformer_layer(
             )
             if kw is not None:
                 pass
-            elif (
-                short_decode_topk
-                and not hasattr(wk_weights_proj, "weight_global_scale")
-                and bias is None
-            ):
-                index_k = F.linear(
-                    hidden_states,
-                    wk_weights_proj.weight[: indexer.head_dim],
-                    None,
-                )
-                index_weights = index_k[:, :0]
             elif hasattr(wk_weights_proj, "weight_global_scale") and hasattr(
                 wk_weights_proj, "input_global_scale_inv"
             ):
@@ -444,9 +444,8 @@ def transformer_layer(
                     kw = kw + bias
             else:
                 kw = F.linear(hidden_states, wk_weights_proj.weight, bias)
-            if kw is not None:
-                index_k = kw[:, : indexer.head_dim]
-                index_weights = kw[:, indexer.head_dim :]
+            index_k = kw[:, : indexer.head_dim]
+            index_weights = kw[:, indexer.head_dim :]
         else:
             wk = indexer.wk
             bias = wk.bias if not wk.skip_bias_add else None
