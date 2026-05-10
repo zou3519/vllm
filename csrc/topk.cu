@@ -19,6 +19,7 @@ namespace vllm {
 
 constexpr int TopK = 2048;              // DeepSeek V3 sparse attention top-k
 constexpr int kThreadsPerBlock = 1024;  // Threads per block
+constexpr int kShortTopKThreadsPerBlock = 256;
 
 // Shared memory budget
 #if defined(USE_ROCM)
@@ -355,13 +356,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   }
 }
 
-__global__ __launch_bounds__(kThreadsPerBlock) void short_topk_physical_kernel(
+__global__ __launch_bounds__(kShortTopKThreadsPerBlock) void short_topk_physical_kernel(
     const ShortTopKPhysicalParams params) {
   const uint64_t batch_idx = blockIdx.x;
   const int seq_len = params.lengths[batch_idx];
   int32_t* output_indices = params.indices + batch_idx * TopK;
 
-  for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
+  for (int i = threadIdx.x; i < TopK; i += kShortTopKThreadsPerBlock) {
     if (i < seq_len) {
       const int block_id = i / params.block_size;
       const int block_offset = i - block_id * params.block_size;
@@ -451,7 +452,7 @@ void large_context_topk(
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(static_cast<uint32_t>(batch_size));
-  const dim3 block(vllm::kThreadsPerBlock);
+  const dim3 block(vllm::kShortTopKThreadsPerBlock);
 
   vllm::setup_kernel_smem_once<vllm::topk_kernel, vllm::kSmem>();
   vllm::topk_kernel<<<grid, block, vllm::kSmem, stream>>>(params);
