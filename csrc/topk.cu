@@ -310,10 +310,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   if (seq_len <= TopK) {
     for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
       if (i < seq_len) {
-        const bool block_size_64 = params.block_size == 64;
-        const int block_id = block_size_64 ? (i >> 6) : (i / params.block_size);
-        const int block_offset =
-            block_size_64 ? (i & 63) : (i - block_id * params.block_size);
+        const int block_id = i / params.block_size;
+        const int block_offset = i - block_id * params.block_size;
         const int physical_block =
             params.block_table[batch_idx * params.block_table_stride0 +
                                block_id * params.block_table_stride1];
@@ -337,12 +335,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
     const int logical_idx = output_indices[i];
     if (logical_idx >= 0) {
-      const bool block_size_64 = params.block_size == 64;
-      const int block_id =
-          block_size_64 ? (logical_idx >> 6) : (logical_idx / params.block_size);
-      const int block_offset = block_size_64
-                                   ? (logical_idx & 63)
-                                   : (logical_idx - block_id * params.block_size);
+      const int block_id = logical_idx / params.block_size;
+      const int block_offset = logical_idx - block_id * params.block_size;
       const int physical_block =
           params.block_table[batch_idx * params.block_table_stride0 +
                              block_id * params.block_table_stride1];
