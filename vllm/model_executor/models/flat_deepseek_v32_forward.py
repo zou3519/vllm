@@ -737,7 +737,6 @@ def transformer_layer(
             mla.W_UK_T.stride(2),
             BLOCK_N=32,
             BLOCK_K=128,
-            num_warps=8,
         )
 
         # FlashInfer sparse MLA decode.
