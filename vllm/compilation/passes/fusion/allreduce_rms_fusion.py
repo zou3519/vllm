@@ -90,7 +90,7 @@ _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
     },
     103: {
         2: 32,  # 32MB
-        4: 4,  # 4MB
+        4: 0,  # disable one-shot for TP4
         8: 2,  # 2MB
     },
 }
