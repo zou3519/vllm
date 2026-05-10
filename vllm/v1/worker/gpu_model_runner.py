@@ -3309,29 +3309,12 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
-        sample_hidden_states: torch.Tensor | None = None,
-        grammar_output: "GrammarOutput | None" = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
-        if (
-            logits is None
-            and spec_decode_metadata is None
-            and grammar_output is None
-            and sample_hidden_states is not None
-            and self._can_use_flat_local_argmax_sampling(sampling_metadata)
-        ):
-            sampled = self.model.logits_processor.get_top_tokens(
-                self.model.lm_head, sample_hidden_states
-            )
-            return SamplerOutput(
-                sampled_token_ids=sampled.to(torch.int32).unsqueeze(-1),
-                logprobs_tensors=None,
-            )
-        assert logits is not None
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
@@ -3351,22 +3334,6 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
-
-    def _can_use_flat_local_argmax_sampling(
-        self, sampling_metadata: SamplingMetadata
-    ) -> bool:
-        if self.model.__class__.__name__ != "FlatDeepseekV32ForCausalLM":
-            return False
-        if not (
-            sampling_metadata.all_greedy
-            and sampling_metadata.max_num_logprobs is None
-            and sampling_metadata.logprob_token_ids is None
-            and sampling_metadata.no_penalties
-            and sampling_metadata.allowed_token_ids_mask is None
-            and not sampling_metadata.bad_words_token_ids
-        ):
-            return False
-        return not any(sampling_metadata.logitsprocs.all)
 
     def _bookkeeping_sync(
         self,
@@ -4089,13 +4056,7 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = (
-                    None
-                    if self._can_use_flat_local_argmax_sampling(
-                        self.input_batch.sampling_metadata
-                    )
-                    else self.model.compute_logits(sample_hidden_states)
-                )
+                logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4187,16 +4148,12 @@ class GPUModelRunner(
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
-            if logits is None:
-                logits = self.model.compute_logits(sample_hidden_states)
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(
-                logits, spec_decode_metadata, sample_hidden_states, grammar_output
-            )
+            sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
