@@ -308,17 +308,32 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   const float* logits = input + batch_idx * input_stride;
 
   if (seq_len <= TopK) {
-    naive_topk_cuda(logits, output_indices, seq_len);
-  } else {
-    fast_topk_cuda_tl(logits, output_indices, logits_offset, seq_len);
+    for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
+      if (i < seq_len) {
+        const int block_id = i / params.block_size;
+        const int block_offset = i - block_id * params.block_size;
+        const int physical_block =
+            params.block_table[batch_idx * params.block_table_stride0 +
+                               block_id * params.block_table_stride1];
+        output_indices[i] = physical_block * params.block_size + block_offset;
+      } else {
+        output_indices[i] = -1;
+      }
+    }
+    if (threadIdx.x == 0) {
+      params.valid_counts[batch_idx] = seq_len;
+    }
+    return;
   }
+
+  fast_topk_cuda_tl(logits, output_indices, logits_offset, seq_len);
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    params.valid_counts[batch_idx] = min(seq_len, TopK);
+    params.valid_counts[batch_idx] = TopK;
   }
   for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
-    int logical_idx = output_indices[i];
+    const int logical_idx = output_indices[i];
     if (logical_idx >= 0) {
       const int block_id = logical_idx / params.block_size;
       const int block_offset = logical_idx - block_id * params.block_size;
