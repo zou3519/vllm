@@ -308,17 +308,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_physical_kernel(
   const float* logits = input + batch_idx * input_stride;
 
   if (seq_len <= TopK) {
-    for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
-      if (i < seq_len) {
-        const int block_id = i / params.block_size;
-        const int block_offset = i - block_id * params.block_size;
-        const int physical_block =
-            params.block_table[batch_idx * params.block_table_stride0 +
-                               block_id * params.block_table_stride1];
-        output_indices[i] = physical_block * params.block_size + block_offset;
-      } else {
-        output_indices[i] = -1;
-      }
+    for (int i = threadIdx.x; i < seq_len; i += kThreadsPerBlock) {
+      const int block_id = i / params.block_size;
+      const int block_offset = i - block_id * params.block_size;
+      const int physical_block =
+          params.block_table[batch_idx * params.block_table_stride0 +
+                             block_id * params.block_table_stride1];
+      output_indices[i] = physical_block * params.block_size + block_offset;
     }
     if (threadIdx.x == 0) {
       params.valid_counts[batch_idx] = seq_len;
