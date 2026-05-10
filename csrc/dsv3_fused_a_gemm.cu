@@ -656,8 +656,10 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   constexpr int tile_m = 16;
   constexpr int tile_n = kTileN;                        // 8 or 16
   constexpr int tile_k = 512;
-  constexpr int max_stage_cnt =
+  constexpr int max_stage_cnt_raw =
       1024 * 192 / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
+  constexpr int max_stage_cnt =
+      max_stage_cnt_raw > 4 ? 4 : max_stage_cnt_raw;
   constexpr int k_iter_cnt = gemm_k / tile_k;
   constexpr int stage_cnt =
       k_iter_cnt > max_stage_cnt ? max_stage_cnt : k_iter_cnt;
