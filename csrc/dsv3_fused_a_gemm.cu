@@ -716,6 +716,14 @@ template void invokeFusedAGemm<__nv_bfloat16, 7168, 2240, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
     cudaStream_t);
 
+template void invokeFusedAGemm<__nv_bfloat16, 1536, 6144, 8>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
+    cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 1536, 6144, 16>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens,
+    cudaStream_t);
+
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
                        torch::Tensor const& mat_b) {
   TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && output.dim() == 2);
@@ -723,12 +731,13 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
   int const hd_in = mat_a.size(1);
   int const hd_out = mat_b.size(1);
 
-  constexpr int kHdIn = 7168;
+  bool const is_qkv_a =
+      hd_in == 7168 && (hd_out == 2112 || hd_out == 2176 || hd_out == 2240);
+  bool const is_q_b = hd_in == 1536 && hd_out == 6144;
   TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
               "required 1 <= mat_a.shape[0] <= 16")
-  TORCH_CHECK(hd_in == kHdIn, "required mat_a.shape[1] == 7168")
-  TORCH_CHECK(hd_out == 2112 || hd_out == 2176 || hd_out == 2240,
-              "required mat_b.shape[1] == 2112, 2176, or 2240")
+  TORCH_CHECK(is_qkv_a || is_q_b,
+              "required mat_a/mat_b shapes 7168->2112/2176/2240 or 1536->6144")
   TORCH_CHECK(output.size(0) == num_tokens,
               "required output.shape[0] == mat_a.shape[0]")
   TORCH_CHECK(output.size(1) == hd_out,
@@ -749,13 +758,13 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
   if (hd_out == 2112) {
     if (num_tokens <= 8) {
-      invokeFusedAGemm<__nv_bfloat16, kHdIn, 2112, 8>(
+      invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
           reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
           stream);
     } else {
-      invokeFusedAGemm<__nv_bfloat16, kHdIn, 2112, 16>(
+      invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
           reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
@@ -763,13 +772,27 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
     }
   } else if (hd_out == 2176) {
     if (num_tokens <= 8) {
-      invokeFusedAGemm<__nv_bfloat16, kHdIn, 2176, 8>(
+      invokeFusedAGemm<__nv_bfloat16, 7168, 2176, 8>(
           reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
           stream);
     } else {
-      invokeFusedAGemm<__nv_bfloat16, kHdIn, 2176, 16>(
+      invokeFusedAGemm<__nv_bfloat16, 7168, 2176, 16>(
+          reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
+          stream);
+    }
+  } else if (hd_out == 2240) {
+    if (num_tokens <= 8) {
+      invokeFusedAGemm<__nv_bfloat16, 7168, 2240, 8>(
+          reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
+          stream);
+    } else {
+      invokeFusedAGemm<__nv_bfloat16, 7168, 2240, 16>(
           reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
@@ -777,13 +800,13 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
     }
   } else {
     if (num_tokens <= 8) {
-      invokeFusedAGemm<__nv_bfloat16, kHdIn, 2240, 8>(
+      invokeFusedAGemm<__nv_bfloat16, 1536, 6144, 8>(
           reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,
           stream);
     } else {
-      invokeFusedAGemm<__nv_bfloat16, kHdIn, 2240, 16>(
+      invokeFusedAGemm<__nv_bfloat16, 1536, 6144, 16>(
           reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens,

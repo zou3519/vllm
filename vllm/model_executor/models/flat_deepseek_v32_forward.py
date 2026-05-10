@@ -323,7 +323,15 @@ def transformer_layer(
         if bias is not None:
             q = q + bias
     else:
-        q = F.linear(q_c, q_b_proj.weight, bias)
+        if (
+            bias is None
+            and q_c.shape[-1] == 1536
+            and q_b_proj.weight.shape[0] == 6144
+            and q_b_proj.weight.shape[1] == 1536
+        ):
+            q = torch.ops.vllm.min_latency_fused_qkv_a_proj(q_c, q_b_proj.weight)
+        else:
+            q = F.linear(q_c, q_b_proj.weight, bias)
     if q_b_proj.gather_output and q_b_proj.tp_size > 1:
         gathered_q = [torch.empty_like(q) for _ in range(q_b_proj.tp_size)]
         torch.distributed.all_gather(gathered_q, q)
