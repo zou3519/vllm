@@ -139,7 +139,15 @@ def transformer_layer(
                     dim=0,
                 )
                 wrapper._flat_qkv_kw_weight = combined_weight
-        qkv_kw = F.linear(hidden_states, combined_weight, None)
+        if (
+            short_decode_topk
+            and getattr(fused_qkv_a_proj, "_use_min_latency_gemm", False)
+        ):
+            qkv_kw = torch.ops.vllm.min_latency_fused_qkv_a_proj(
+                hidden_states, combined_weight
+            )
+        else:
+            qkv_kw = F.linear(hidden_states, combined_weight, None)
         qkv_lora = qkv_kw[..., : fused_qkv_a_proj.output_size_per_partition]
         kw = qkv_kw[..., fused_qkv_a_proj.output_size_per_partition :]
     elif getattr(fused_qkv_a_proj, "_use_min_latency_gemm", False):
