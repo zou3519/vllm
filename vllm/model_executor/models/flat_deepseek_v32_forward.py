@@ -716,20 +716,13 @@ def transformer_layer(
                         )
                         sparse_seq_lens = decode_metadata.short_sparse_seq_lens
                     else:
-                        logits = torch.empty(
-                            (num_padded_tokens, 1),
-                            dtype=torch.float32,
-                            device=hidden_states.device,
-                        )
                         sparse_seq_lens = torch.empty_like(decode_metadata.seq_lens)
-                        torch.ops._C.large_context_topk_physical(
-                            logits,
+                        torch.ops._C.short_context_topk_physical(
                             topk_indices,
                             decode_metadata.seq_lens,
                             decode_metadata.block_table,
                             sparse_seq_lens,
                             decode_metadata.block_size,
-                            None,
                         )
                         topk_indices_physical = topk_indices
                         decode_metadata.short_topk_ready = True
