@@ -21,6 +21,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _index_k_norm_rope_cache_kernel,
     _index_qk_rope_quant_cache_kernel,
     _index_q_rope_quant_weights_kernel,
     _mla_decode_q_project_rope_concat_quant_fp8_kernel,
@@ -538,46 +539,74 @@ def transformer_layer(
             has_prefill = index_metadata.num_prefills > 0
             num_decode_tokens = index_metadata.num_decode_tokens
             index_k = index_k[: slot_mapping.shape[0]]
-            _index_qk_rope_quant_cache_kernel[
-                (index_q.shape[0], index_q.shape[1] + 1)
-            ](
-                index_q,
-                index_k,
-                positions.flatten(),
-                cos_sin_cache,
-                index_weights,
-                q_fp8,
-                scaled_index_weights,
-                indexer.k_norm.weight,
-                indexer.k_norm.bias,
-                slot_mapping,
-                indexer.k_cache.kv_cache.view(torch.float8_e4m3fn),
-                indexer.k_cache.kv_cache.view(torch.float32),
-                index_k.shape[0],
-                index_q.shape[1],
-                indexer.head_dim,
-                indexer.rope_dim,
-                index_q.stride(0),
-                index_q.stride(1),
-                index_q.stride(2),
-                index_k.stride(0),
-                index_k.stride(1),
-                index_weights.stride(0),
-                index_weights.stride(1),
-                q_fp8.stride(0),
-                q_fp8.stride(1),
-                q_fp8.stride(2),
-                scaled_index_weights.stride(0),
-                scaled_index_weights.stride(1),
-                indexer.k_cache.kv_cache.shape[1],
-                indexer.k_cache.kv_cache.shape[2],
-                EPS=indexer.k_norm.eps,
-                FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
-                BLOCK_N=128,
-                num_warps=4,
-            )
-            index_weights = scaled_index_weights
             topk_indices_buffer = indexer.topk_indices_buffer
+            decode_metadata = index_metadata.decode
+            short_decode_topk = (
+                has_decode
+                and not has_prefill
+                and decode_metadata is not None
+                and decode_metadata.max_seq_len <= indexer.topk_tokens
+            )
+            if short_decode_topk:
+                _index_k_norm_rope_cache_kernel[(index_k.shape[0],)](
+                    index_k,
+                    positions.flatten(),
+                    cos_sin_cache,
+                    indexer.k_norm.weight,
+                    indexer.k_norm.bias,
+                    slot_mapping,
+                    indexer.k_cache.kv_cache.view(torch.float8_e4m3fn),
+                    indexer.k_cache.kv_cache.view(torch.float32),
+                    index_k.shape[0],
+                    indexer.head_dim,
+                    indexer.rope_dim,
+                    index_k.stride(0),
+                    index_k.stride(1),
+                    indexer.k_cache.kv_cache.shape[1],
+                    indexer.k_cache.kv_cache.shape[2],
+                    EPS=indexer.k_norm.eps,
+                    BLOCK_N=128,
+                )
+            else:
+                _index_qk_rope_quant_cache_kernel[
+                    (index_q.shape[0], index_q.shape[1] + 1)
+                ](
+                    index_q,
+                    index_k,
+                    positions.flatten(),
+                    cos_sin_cache,
+                    index_weights,
+                    q_fp8,
+                    scaled_index_weights,
+                    indexer.k_norm.weight,
+                    indexer.k_norm.bias,
+                    slot_mapping,
+                    indexer.k_cache.kv_cache.view(torch.float8_e4m3fn),
+                    indexer.k_cache.kv_cache.view(torch.float32),
+                    index_k.shape[0],
+                    index_q.shape[1],
+                    indexer.head_dim,
+                    indexer.rope_dim,
+                    index_q.stride(0),
+                    index_q.stride(1),
+                    index_q.stride(2),
+                    index_k.stride(0),
+                    index_k.stride(1),
+                    index_weights.stride(0),
+                    index_weights.stride(1),
+                    q_fp8.stride(0),
+                    q_fp8.stride(1),
+                    q_fp8.stride(2),
+                    scaled_index_weights.stride(0),
+                    scaled_index_weights.stride(1),
+                    indexer.k_cache.kv_cache.shape[1],
+                    indexer.k_cache.kv_cache.shape[2],
+                    EPS=indexer.k_norm.eps,
+                    FACTOR=indexer.softmax_scale * indexer.n_head**-0.5,
+                    BLOCK_N=128,
+                    num_warps=4,
+                )
+                index_weights = scaled_index_weights
 
             # Sparse indexer: prefill MQA logits and per-row top-k.
             if has_prefill:
@@ -635,7 +664,6 @@ def transformer_layer(
 
             # Sparse indexer: decode paged MQA logits and top-k.
             if has_decode:
-                decode_metadata = index_metadata.decode
                 assert decode_metadata is not None
                 decode_lens = decode_metadata.decode_lens
                 assert not decode_metadata.requires_padding
@@ -646,20 +674,40 @@ def transformer_layer(
                 batch_size = padded_q_fp8_decode_tokens.shape[0]
                 next_n = padded_q_fp8_decode_tokens.shape[1]
                 num_padded_tokens = batch_size * next_n
-                logits = deep_gemm.fp8_paged_mqa_logits(
-                    padded_q_fp8_decode_tokens,
-                    indexer.k_cache.kv_cache.unsqueeze(-2),
-                    index_weights[:num_padded_tokens],
-                    decode_metadata.seq_lens,
-                    decode_metadata.block_table,
-                    decode_metadata.schedule_metadata,
-                    indexer.max_model_len,
-                    clean_logits=False,
-                )
                 topk_indices = topk_indices_buffer[
                     :num_padded_tokens, : indexer.topk_tokens
                 ]
-                if decode_metadata.use_large_context_topk:
+                if short_decode_topk:
+                    logits = torch.empty(
+                        (num_padded_tokens, 1),
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+                    sparse_seq_lens = torch.empty_like(decode_metadata.seq_lens)
+                    torch.ops._C.large_context_topk_physical(
+                        logits,
+                        topk_indices,
+                        decode_metadata.seq_lens,
+                        decode_metadata.block_table,
+                        sparse_seq_lens,
+                        decode_metadata.block_size,
+                        None,
+                    )
+                    topk_indices_physical = topk_indices
+                else:
+                    logits = deep_gemm.fp8_paged_mqa_logits(
+                        padded_q_fp8_decode_tokens,
+                        indexer.k_cache.kv_cache.unsqueeze(-2),
+                        index_weights[:num_padded_tokens],
+                        decode_metadata.seq_lens,
+                        decode_metadata.block_table,
+                        decode_metadata.schedule_metadata,
+                        indexer.max_model_len,
+                        clean_logits=False,
+                    )
+                if short_decode_topk:
+                    pass
+                elif decode_metadata.use_large_context_topk:
                     assert next_n == 1
                     lengths = decode_metadata.seq_lens
                     sparse_seq_lens = torch.empty_like(lengths)
