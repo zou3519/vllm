@@ -144,7 +144,6 @@ class DeepSeekV32IndexerDecodeMetadata:
     block_size: int
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
-    max_seq_len: int
     requires_padding: bool
     schedule_metadata: torch.Tensor
     use_large_context_topk: bool
@@ -431,9 +430,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
-            max_decode_seq_len = int(
-                common_attn_metadata.seq_lens_cpu[:num_decodes].max().item()
-            )
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
             max_decode_len = int(decode_lens_cpu.max().item())
@@ -526,7 +522,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 block_size=self.kv_cache_spec.block_size,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
-                max_seq_len=max_decode_seq_len,
                 requires_padding=False,
                 schedule_metadata=self.scheduler_metadata_buffer,
                 use_large_context_topk=use_large_context_topk,
