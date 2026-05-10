@@ -50,7 +50,7 @@ def transformer_layer(
 
     # Input RMSNorm and residual.
     if residual is None:
-        residual = hidden_states.clone()
+        residual = hidden_states
         norm = layer.input_layernorm
         hidden_states = torch.empty_like(hidden_states)
         ops.rms_norm(
