@@ -1,0 +1,194 @@
+commit	tpit_ms	status	description
+183e6fc	23.161	keep	baseline flat DeepSeek V3.2 NVFP4; -cc.mode=none full_decode_only max-cudagraph-capture-size=1; metric count 1016/1016
+0a1290d	19.348	keep	fused vLLM RMSNorm and fused_add_rms_norm for input/post/final/q_a/kv_a norms; quality passed; metric count 635/635
+b228e10	16.570	keep	use vLLM CUDA rotary_embedding for MLA and sparse indexer RoPE; quality passed; metric count 635/635
+8e1b1d9	14.224	keep	use fused Triton sparse MLA logical-to-physical index conversion with valid-counts; quality passed; metric count 635/635
+13dff41	14.262	discard	replace dense/shared MLP F.silu*mul with torch.ops._C.silu_and_mul; quality passed but TPIT regressed vs 14.224 best
+fcd5f42	14.194	keep	remove redundant sparse topk buffer clear; quality passed; metric count 635/635
+828da65	12.429	keep	use vLLM custom TP allreduce op instead of raw torch.distributed all_reduce; quality passed; metric count 635/635
+9eeb771	crash	revert	unguarded FlashInfer attention allreduce+RMSNorm fusion crashed startup memory profiling at 8192 tokens > 4681 workspace limit
+88164f2	12.120	keep	guarded FlashInfer attention allreduce+residual+RMSNorm fusion for <=4681 tokens; quality passed; metric count 635/635
+cc79c3c	11.881	keep	defer MLP/MoE TP allreduce into next input/final RMSNorm with guarded FlashInfer fusion; quality passed; metric count 635/635
+a323e44	11.905	discard	use BF16 accumulation in FlashInfer fused allreduce norms; quality passed but TPIT regressed vs 11.881 best
+4e2079e	11.908	discard	disable PDL launch in FlashInfer fused allreduce norms; quality passed but TPIT regressed vs 11.881 best
+b994ce1	11.684	keep	fuse shared expert SiLU multiply directly into NVFP4 quant for shared down projection; quality passed; metric count 635/635
+c08d5c9	11.676	keep	fuse dense MLP SiLU multiply directly into NVFP4 quant for dense down projection; quality passed; metric count 635/635
+e1b6ba5	11.606	keep	use empty scale buffers for fused activation NVFP4 quant paths instead of zero fill; quality passed; metric count 635/635
+2090a4b	11.440	keep	use empty swizzled FP4 scale tensors in common scaled_fp4_quant allocation; quality passed; metric count 635/635
+b1476fd	11.989	discard	use separate vLLM custom allreduce plus RMSNorm for deferred norms; quality passed but TPIT regressed vs 11.440 best
+32f2ef7	11.439	discard	switch default FlashInfer allreduce fusion backend to MNNVL; quality passed but delta vs 11.440 best was noise-level and startup/setup risk increased
+9ec06e4	11.437	keep	remove redundant copy after MLA v-up bmm writes directly into attn_output view; quality passed; metric count 635/635
+ce5ca0e	11.461	discard	remove MLA RoPE query padding copy; quality passed but TPIT regressed vs 11.437 best
+3ba20ba	11.524	discard	write MLA decode query directly into final concat buffer; quality passed but TPIT regressed vs 11.437 best
+869459c	11.336	keep	specialize sparse index conversion to one decode tile with direct valid-count store; quality passed; metric count 635/635
+98d3f09	11.114	keep	remove redundant sparse indexer RoPE reconstruction cats; quality passed; metric count 635/635
+3749b49	11.034	keep	fuse MoE routed-output scale with shared-expert add using torch.add alpha; quality passed; metric count 635/635
+76ec7b5	0.0	crash	in-place sparse index weight scaling kept BF16 weights and failed sparse attention float-weight assertion at startup
+b1c0979	10.949	keep	avoid sparse index weight unsqueeze chain while preserving FP32 weights; quality passed; metric count 635/635
+9b3e325	10.820	keep	fuse sparse index weight scaling into one Triton kernel; quality passed; metric count 635/635
+dbd00c6	0.0	crash	drop explicit indexer K LayerNorm upcast; startup failed because BF16 input with FP32 norm weights is invalid
+21a57fb	10.607	keep	fuse sparse indexer K LayerNorm into one Triton kernel with FP32 weights and BF16 output; quality passed; metric count 635/635
+446c36f	10.662	discard	use decode seq_lens for sparse valid counts; quality passed but TPIT regressed vs 10.607 best
+38a76d3	10.528	keep	use Triton MLA decode query concat preserving BMM output layout; quality passed; metric count 635/635
+4720e4d	10.547	discard	use 1024-element tile for Triton MLA concat; quality passed but TPIT regressed vs 10.528 best
+5db3a95	10.712	discard	use 128-element tile for Triton MLA concat; quality passed but TPIT regressed vs 10.528 best
+404c0e8	10.690	discard	use in-place Triton MoE scale-add; quality passed but TPIT regressed vs 10.528 best
+89eb986	10.369	keep	fuse sparse indexer Q RoPE, fp8 quantization, and weight scaling into one Triton kernel; quality passed; metric count 635/635
+2fe67a2	10.177	keep	fuse sparse indexer K LayerNorm, RoPE, fp8 quantization, and cache write; quality passed; metric count 635/635
+7b57fc9	10.024	keep	fuse MLA decode query concat and static FP8 quantization into one Triton kernel; quality passed; metric count 635/635
+2f13a37	9.985	keep	fuse MLA q and kv A RMSNorms into one Triton launch; quality passed; metric count 635/635
+560688d	9.733	keep	use fused MLA RoPE plus KV-cache write CUDA op; quality passed; metric count 635/635
+3ac324f	0.0	crash	combine sparse indexer Q and K prep in one Triton launch; Triton branch type check failed on scalar/vector weight name collision
+c43c477	9.750	discard	retry combined sparse indexer Q/K prep in one Triton launch; quality passed but TPIT regressed vs 9.733 best
+2452f6c	9.606	keep	fuse q_b and sparse indexer q projections with cached concatenated BF16 weight; quality passed; metric count 635/635
+4c55262	9.390	keep	fuse MLA qkv A and sparse indexer K/weight projections with cached concatenated BF16 weight; quality passed; metric count 635/635
+943f64c	9.304	keep	cache MoE routing correction bias cast to BF16; quality passed; metric count 635/635
+9363096	8.050	keep	cache converted MLA and sparse-indexer RoPE tables; quality passed; metric count 635/635
+7cfdaf7	0.0	crash	cache dtype reinterpretation views for KV caches and MoE scales; first request hit illegal memory access
+ee9047d	8.074	discard	install converted RoPE table back onto rotary object; quality passed but repeated TPIT regressed vs 8.050 best
+e73f43a	8.053	discard	tune MLA decode q concat+FP8 quant tile to 512 elems/8 warps; quality passed but TPIT did not improve vs 8.050 best
+4f115b8	8.053	discard	cache MoE FP8 weight-scale views and guard no-op router float32 cast; quality passed but TPIT did not improve vs 8.050 best
+63b0ea9	8.060	discard	share routed non-swizzled MoE input quant with shared gate_up; quality passed but shared GEMM lost fast 8x4 scale layout and TPIT regressed
+775e089	8.167	discard	reuse shared 8x4 FP4 payload for routed MoE and generate row-major MoE scales with Triton scale-only kernel; quality passed but scale kernel regressed TPIT
+9826e9b	8.026	keep	use FlashInfer row-major FP4 quant for routed MoE input while preserving shared gate_up quant path; quality passed; metric count 635/635
+0a940b0	8.015	keep	disable PDL for FlashInfer row-major MoE input FP4 quant; quality passed; metric count 635/635
+4aa1407	8.332	discard	disable PDL for main FlashInfer TRTLLM FP4 MoE kernel; quality passed but TPIT regressed sharply
+9ed2128	8.016	discard	set FlashInfer FP4 MoE tune_max_num_tokens=1 for BS=1 decode; quality passed but no improvement vs 8.015 best
+30842ab	0.0	crash	fuse post-attention allreduce+RMSNorm with shared gate_up FP4 quant; server started but quality failed with repeated digits, likely incompatible quant scale layout
+4404f78	8.019	discard	use FlashInfer direct 8x4 FP4 quant with PDL disabled for shared expert gate_up input; quality passed but TPIT regressed vs 8.015 best
+ef787fe	0.0	crash	pass shared_output as FlashInfer MoE output buffer to fold finalize add; server started but quality failed, output overwrote instead of accumulated
+8791eb5	7.989	keep	use in-place shared_output.add_(routed, alpha=scale) for MoE finalize add; quality passed; metric count 635/635
+4b9a134	7.874	keep	fuse MLA decode q nope projection with concat and static FP8 quant; quality passed; metric count 635/635
+99adac5	8.137	discard	tune fused MLA q projection output tile to 64; quality passed but TPIT regressed vs 7.874 best
+9153d21	7.917	discard	tune fused MLA q projection output tile to 16; quality passed but TPIT regressed vs 7.874 best
+3e8753c	7.928	discard	force fused MLA q projection to num_warps=1; quality passed but TPIT regressed vs 7.874 best
+6a338b5	7.915	discard	pass routed MoE scale into FlashInfer finalize and use plain add; quality passed but TPIT regressed vs 7.874 best
+4dab925	7.854	keep	prune never-run padded MLA query fallback around fused q projection; quality passed; metric count 635/635
+296c1e5	7.846	keep	prune unused dynamic MLA KV scale branch; quality passed; metric count 635/635
+dee5a54	0.0	crash	prune attn_metadata None fallback; startup memory profiling hit AssertionError before server health
+aee66e2	0.0	crash	prune large-context indexer topk branch; startup profiling used large-context topk and hit AssertionError before health
+778ec91	7.850	discard	prune no-shared MoE finalize fallback; quality passed but TPIT regressed vs 7.846 best
+cd1230b	7.923	discard	inline sparse index conversion Triton launch; quality passed but TPIT regressed vs 7.846 best
+aa95c39	7.834	keep	tune sparse index conversion kernel to num_warps=8; quality passed; metric count 635/635
+3903d38	7.854	discard	tune sparse index conversion kernel to num_warps=4; quality passed but TPIT regressed vs 7.834 best
+11c771c	7.862	discard	tune sparse index conversion kernel to num_warps=16; quality passed but TPIT regressed vs 7.834 best
+d9e3ee0	0.0	crash	fuse sparse indexer q/k prep; Triton compile failed on scalar/vector branch variable type mismatch
+7edea4f	7.728	keep	fix fused sparse indexer q/k prep typing; quality passed; metric count 635/635
+4982c6d	7.725	keep	tune fused sparse q/k prep kernel to 8 warps; quality passed; metric count 635/635
+e17d42e	7.867	discard	group sparse q heads by 4 in prep kernel; quality passed but TPIT regressed vs 7.725 best
+caf5a5b	7.735	discard	group sparse q heads by 2 in prep kernel; quality passed but TPIT regressed vs 7.725 best
+657f52a	7.756	discard	tune fused sparse q/k prep kernel to 16 warps; quality passed but TPIT regressed vs 7.725 best
+4cc61d7	7.751	discard	tune fused sparse q/k prep kernel to 2 warps; quality passed but TPIT regressed vs 7.725 best
+2892462	7.803	discard	tune MLA q/kv-A norm kernel to 8 warps; quality passed but TPIT regressed vs 7.725 best
+d9cfef0	7.753	discard	fuse MLA query RoPE into decode prep and replace cache op with K-only Triton cache; quality passed but TPIT regressed vs 7.725 best
+0c54ed3	7.723	discard	fuse shared and routed MoE input quantization with dual 8x4/128x4 NVFP4 CUDA op; later determined target linear backend does not take 8x4 path
+7257015	7.722	discard	skip padded-row math in dual MoE quant; later determined target linear backend does not take 8x4 path
+a3fdf87	7.760	discard	reuse shared MoE input quant for routed MoE 128x4 path; quality passed but TPIT regressed, same-server rerun 8.300ms
+env-flashinfer-trtllm	0.000	crash	force VLLM_NVFP4_GEMM_BACKEND=flashinfer-trtllm; FlashInfer trtllm GEMM JIT failed in std::optional<reference_wrapper<ModuleCache>> compile before health
+env-flashinfer-cudnn	7.498	keep	force VLLM_NVFP4_GEMM_BACKEND=flashinfer-cudnn; quality passed; TPIT 7.497/7.498ms same warm server; metric count 635/635
+env-cutlass	0.000	crash	force VLLM_NVFP4_GEMM_BACKEND=cutlass; startup failed before health with mm_fp4 unsupported backend '' on capability 103
+2836c5c	8.044	discard	disable FlashInfer fused allreduce+norm threshold and use vLLM all_reduce plus fused_add_rms_norm; quality passed but TPIT regressed vs 7.498 best
+env-cudnn-mnnvl	7.412	keep	force VLLM_NVFP4_GEMM_BACKEND=flashinfer-cudnn and VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl; quality passed; TPIT 7.413/7.536/7.412ms; metric count 635/635
+env-moe-throughput	0.000	crash	force VLLM_FLASHINFER_MOE_BACKEND=throughput with cudnn+mnnvl; startup failed before health during worker memory profiling with empty worker error
+33c25c4	7.415	discard	set fused allreduce norm max token threshold to 1 for decode; quality passed but no improvement vs 7.412 best
+ae4fa62	7.329	keep	retest MLA query RoPE/cache fusion under cudnn+mnnvl; quality passed; TPIT 7.328/7.330ms; metric count 635/635
+562d11e	7.333	discard	tune fused MLA K RoPE/cache kernel from 8 to 4 warps; quality passed but TPIT 7.333/7.335ms regressed vs 7.329 best
+4514f54	7.357	discard	tune fused MLA query prep kernel to 8 warps; quality passed but TPIT regressed vs 7.329 best
+52b6d3f	7.363	discard	tune fused MLA query prep kernel to 2 warps; quality passed but TPIT regressed vs 7.329 best
+4e63ce2	7.546	discard	tune fused MLA query prep BLOCK_N from 32 to 64; quality passed but TPIT regressed vs 7.329 best
+8ac1637	7.343	discard	retest shared MoE input quant reuse under cudnn+mnnvl+MLA fusion; quality passed but TPIT 7.343/7.342ms regressed vs 7.329 best
+b9cae9a	6.776	keep	fuse large-context sparse top-k with physical block index conversion; quality passed; TPIT 6.790/6.776ms; metric count 635/635
+de0d5f6	8.023	discard	map sparse top-k physical indices during selection; quality passed but TPIT regressed vs 6.776 best, likely scattered block-table work on atomic output writes
+b799b41	7.257	discard	fuse MLA KV-A RMSNorm into K RoPE/cache FP8 prep; quality passed but steady TPIT 7.254/7.257ms regressed vs 6.776 best before tuning
+93ea68e	7.262	discard	tune fused MLA KV-A RMSNorm/cache prep to 4 warps; quality passed but TPIT still regressed vs 6.776 best
+0ec3041	7.294	discard	disable launch_with_pdl for fused allreduce+norm; quality passed but TPIT regressed vs 6.776 best
+109c573	7.231	discard	disable fp32_acc for fused allreduce+norm; quality passed but TPIT regressed vs 6.776 best
+73ed3ee	7.231	discard	fuse input allreduce+RMSNorm with qkv FP4 quant; quality passed but TPIT regressed vs 6.776 best, quant fusion workspace/backend not worthwhile
+env-moe-masked_gemm	0.000	crash	force VLLM_FLASHINFER_MOE_BACKEND=masked_gemm with cudnn+mnnvl; startup failed before health during worker memory profiling with empty worker error
+cc0fb44	7.114	discard	mega fuse MLA q/kv-A RMSNorm with K RoPE/cache FP8 prep; quality passed but initial 8-warp TPIT regressed vs 6.776 best before tuning
+9598313	7.122	discard	tune MLA norm/KV-cache mega fusion to 4 warps; quality passed but TPIT still regressed vs 6.776 best
+b1e719c	7.382	discard	raw CUDA single-CTA MLA q/kv RMSNorm plus K RoPE/cache FP8 prep; quality passed and metric count 635/635 but TPIT regressed vs 6.776 best and Triton mega fusion
+1bd84af	7.499	discard	tune raw CUDA MLA prep single-CTA from 1024 to 512 threads; quality passed and metric count 635/635 but TPIT regressed vs 7.382 raw and 6.776 best
+ff80a8b	7.549	discard	tune raw CUDA MLA prep single-CTA from 512 to 256 threads; quality passed and metric count 635/635 but TPIT regressed vs raw 1024 and 6.776 best
+a26d122	7.205	discard	split raw CUDA MLA prep into separate Q and KV CTAs in one launch; quality passed and metric count 635/635; faster than single-CTA raw but still regressed vs 7.122 Triton mega fusion and 6.776 best
+00be49c	7.223	discard	tune split raw CUDA MLA prep CTA size from 1024 to 512 threads; quality passed and metric count 635/635 but TPIT regressed vs split 1024 and 6.776 best
+7a14800	7.233	discard	inline and cache o_proj FP4 quant output buffers with scaled_fp4_quant.out; quality passed and metric count 635/635 but TPIT regressed vs 6.776 best, likely graph allocator/wrapper overhead was not the bottleneck
+775f970	7.231	keep	retest restored source baseline after removing regressed MLA-prep experiments and rebuilding _C from current tree; exact count-up benchmark metric count 1016/1016; does not reproduce recorded 6.776 best in current runtime
+note-pypath	0.000	note	measurements before Document source PYTHONPATH may have used installed package metadata/source path ambiguously for Python-only edits; rerun pure-Python experiments with repo root first in PYTHONPATH
+4174f4b	7.235	discard	rerun o_proj FP4 quant buffer cache with repo PYTHONPATH and exact benchmark; quality passed and metric count 1016/1016 but no improvement vs restored baseline ~7.231
+a5aab38	7.425	discard	force MoE router off dsv3_router_gemm and onto BF16 router GEMM path; quality passed and metric count 1016/1016 but TPIT regressed vs restored baseline ~7.231
+env-ar-trtllm	7.337	discard	force VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm under flashinfer-cudnn; exact benchmark count 1016/1016 but regressed vs mnnvl restored baseline ~7.231
+5305b7d	7.490	discard	split sparse wk_weights projection from qkv_a to recover min_latency_fused_qkv_a_proj; quality passed and count 1016/1016 but regressed vs restored baseline ~7.231
+e1ae45b	7.235	discard	retest fused allreduce norm max_token_num=1 under corrected PYTHONPATH/exact benchmark; quality passed and count 1016/1016 but no improvement vs restored baseline ~7.231
+68efcc2	7.235	discard	specialize large_context_topk_physical short seq_len branch to skip padding writes; quality passed and counts 1016/1016, repeat 7.225/7.246 avg no improvement vs restored baseline ~7.231
+env-fisampler	7.256	discard	set VLLM_USE_FLASHINFER_SAMPLER=1 with flat full_decode_only; quality passed and counts 1016/1016 but repeat 7.225/7.287 avg regressed/noise vs restored baseline ~7.231
+ad0b74f	0.000	crash	raw CUDA load_inline MLA v-up projection initial version; startup failed during dummy run because sparse_out/out_view were strided, tuned in 52ce9db
+52ce9db	9.830	discard	tune raw CUDA load_inline MLA v-up projection to support strided tensors; quality passed and count 1016/1016 but scalar GEMV regressed badly vs tensor-core bmm baseline
+f0bdb1e	7.209	keep	retest split raw CUDA MLA q/kv-A RMSNorm plus K RoPE/cache FP8 prep under corrected PYTHONPATH/exact benchmark; quality passed and counts 1016/1016; runs 7.209/7.280/7.210/7.209, median ~7.209 improves vs restored baseline ~7.231
+483974a	7.177	keep	tune raw CUDA MLA prep reduction to warp-shuffle block reductions; quality passed and exact count 1016/1016; runs 7.177/7.177/7.177, improves vs split raw MLA prep ~7.209
+650ff11	7.238	discard	disable PDL for flat fused allreduce norm; quality passed and exact counts 1016/1016, but runs 7.238/7.237 regressed vs kept 7.177
+9e782a1+0875417	7.199	discard	raw CUDA sparse indexer q/k RoPE plus FP8/cache prep; quality passed and counts 1016/1016, but runs 7.253/7.185/7.199 regressed vs kept 7.177
+9ee4148	7.196	discard	tune warp-shuffle MLA prep CTA from 1024 to 512 threads; quality passed and counts 1016/1016, but runs 7.196/7.197 regressed vs kept 7.177
+2056d1a	7.171	keep	disable fp32 accumulation in flat fused allreduce norm; quality passed and exact counts 1016/1016; runs 7.172/7.173/7.171 improve slightly vs kept 7.177
+a0856b4	7.243	discard	disable PDL on top of bf16 fused allreduce norm accumulation; quality passed and counts 1016/1016, but runs 7.265/7.243 regressed vs kept 7.171
+9da77b6	7.180	discard	fuse post-attention allreduce/residual/RMSNorm with routed MoE FP4 input quant; quality passed and counts 1016/1016, but runs 7.172/7.188 no improvement vs kept 7.171
+env-nvfp4-trtllm	0.000	crash	set VLLM_NVFP4_GEMM_BACKEND=flashinfer-trtllm; startup failed while FlashInfer JIT compiled trtllm_gemm_runner.cu with std::optional/reference_wrapper incomplete-type errors
+016101d	7.166	keep	tune sparse indexer q/k RoPE quant/cache Triton kernel from 8 to 4 warps; quality passed and exact counts 1016/1016; runs 7.166/7.165/7.243-noise/7.168/7.166 improve vs kept 7.171
+7be1033	7.171	discard	tune sparse indexer q/k RoPE quant/cache Triton kernel from 4 to 2 warps; quality passed and counts 1016/1016, but runs 7.172/7.171 regressed vs kept 7.166
+5b49bf2	7.180	discard	tune MLA decode Q projection/concat/FP8 Triton BLOCK_N from 32 to 64; quality passed and counts 1016/1016, but runs 7.244/7.171/7.180 no improvement vs kept 7.166
+e54c512	7.172	discard	tune large-context sparse topk kernel from 1024 to 512 threads; quality passed and counts 1016/1016, but runs 7.173/7.172 regressed vs kept 7.166
+env-moe-throughput	0.000	crash	set VLLM_FLASHINFER_MOE_BACKEND=throughput; startup hit flat-path assertion because selected MoE kernel was not monolithic
+89f0ff0	7.175	discard	reuse positions.flatten() once per transformer layer; quality passed and counts 1016/1016, but runs 7.175/7.263 regressed/noised vs kept 7.166
+9d49207	7.832	discard	force flat path off FlashInfer fused allreduce norm by setting threshold to 0; quality passed and counts 1016/1016, but runs 7.828/7.836 regressed badly vs kept 7.166
+5e58b0a	7.201	discard	tune MLA decode Q projection/RoPE/concat/FP8 Triton num_warps from default to 2; quality passed and exact count 1016/1016 but regressed vs kept 7.166
+faa720a	7.193	discard	replace MoE shared+routed output PyTorch add_ with raw CUDA bf16 pair scaled add; direct op smoke and quality passed, exact count 1016/1016, but regressed vs kept 7.166
+env-nvfp4-cutlass	7.372	discard	set VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass with baseline flat source; quality passed and exact count 1016/1016 but regressed vs flashinfer-cudnn kept 7.166
+66199a4	7.356	discard	specialize flat FlashInfer fused allreduce max_token_num/workspace bound to 1 for decode; quality passed and exact count 1016/1016 but regressed vs kept 7.166
+cae7f93	7.167	discard	use direct absmax FP8 scales instead of pow2-rounded scales in sparse indexer prep; quality passed and exact counts 1016/1016, runs 7.168/7.167 but no clear win vs kept 7.166 and changes quantization semantics
+994d533	7.168	discard	tune sparse indexer q/k RoPE quant/cache Triton kernel to num_stages=1 with kept num_warps=4; quality passed and exact count 1016/1016 but no win vs kept 7.166
+e967280	7.241	discard	tune MLA decode Q projection/RoPE/concat/FP8 Triton num_warps from default to 1; quality passed and exact count 1016/1016 but clearly regressed vs kept 7.166
+env-flashinfer-autotune	7.810	discard	set --kernel-config.enable_flashinfer_autotune=True with baseline cudnn/mnnvl flat decode; quality passed and exact count 1016/1016 but regressed badly vs disabled autotune kept 7.166
+8614adc	7.167	discard	tune kept raw CUDA MLA prep CTA size from 1024 to 768 threads; quality passed and exact count 1016/1016 but no clear win vs kept 7.166
+792a330	7.193	discard	tune MLA decode Q projection/RoPE/concat/FP8 Triton BLOCK_N from 32 to 16; quality passed and exact count 1016/1016 but regressed vs kept 7.166
+env-maxseq1	7.347	discard	add --max-num-seqs 1 --max-num-batched-tokens 1024 to baseline flat decode server; quality passed and exact count 1016/1016 but regressed vs default scheduler config kept 7.166
+1756fc2	7.180	keep	retest current source after offline local-snapshot restart with flashinfer-cudnn+mnnvl; quality passed and exact metric count 1016/1016; no improvement vs logged 7.166 best
+a195a16	7.170	discard	avoid flat MoE router logits fp32 cast; quality passed and exact counts 1016/1016, repeat 7.170ms but no clear improvement vs logged 7.166 best
+be55332	7.181	discard	set FlashInfer FP4 MoE tune_max_num_tokens=1 under current source; full GSM8K passed accuracy 0.9560 invalid 0.0000, exact counts 1016/1016, but TPIT 7.183/7.181 regressed vs 7.166 best
+96e42ae	7.196	discard	tune MLA decode Q projection/RoPE/concat/FP8 Triton BLOCK_N from 32 to 128; quality passed and exact count 1016/1016, but runs 7.227/7.196 regressed vs kept 7.166
+188afd6	7.208	discard	tune MLA decode Q projection/RoPE/concat/FP8 Triton num_warps to 8; quality passed and exact count 1016/1016, but runs 7.208/7.230 regressed vs kept 7.166
+bf6e0f6	7.161	keep	specialize large_context_topk_physical seq_len<=TopK branch to write physical indices directly; quality passed and exact counts 1016/1016, runs 7.179/7.163/7.171/7.241-noise/7.165/7.161; full GSM8K passed accuracy 0.956027 invalid 0.0 latency 706s concurrency 32
+4ccb374	7.163	discard	skip clearing unused topk slots for seq_len<TopK and rely on valid_counts; quality passed and exact counts 1016/1016, but runs 7.163/7.173/7.175/7.164 did not improve vs kept bf6e0f6 7.161 and one client stream emitted 128 chunks
+3892551	7.166	discard	specialize large_context_topk_physical block_size==64 division/modulo to shift/mask; quality passed and exact counts 1016/1016, but runs 7.222/7.166/7.170/7.174 did not improve vs kept bf6e0f6 7.161
+6f5a7c5	0.000	discard	skip sparse indexer logits for seq_len<=TopK; quick quality passed but full GSM8K regressed accuracy 0.952995 vs expected 0.956027, invalid 0, concurrency 32
+d7176b18	0.000	note	full GSM8K after reverting 6f5a7c5: current tree identical to bf6e0f6; concurrent wrapper scores 0.947688 then 0.951478 (invalid 0, errors 0, concurrency 32); repeat is within expected lm_eval stderr but samples show batching-sensitive answers; lm_eval package unavailable
+d7176b18	7.161	keep	retest current tree after reverting sparse-indexer skip; quick quality passed; full GSM8K wrapper repeat 0.951478 within expected stderr but noisy; exact TPIT runs 7.188/7.161/7.162 count 1016/1016
+fa589f8	7.064	keep	reuse first short physical topk result across layers within a decode step while still computing per-layer indexer logits; quick quality passed; GSM8K first/repeat 0.947688/0.953753 invalid 0 errors 0, repeat within expected stderr; exact TPIT runs 7.068/7.064/7.068/7.074 plus post-eval 7.066/7.073 count 1016/1016
+284f055	6.764	keep	skip sparse indexer q quant/logits/topk for pure decode when max seq_len<=topk while still updating indexer K cache; quick quality passed; full GSM8K passed accuracy 0.953753 invalid 0 errors 0 latency 655s concurrency 32; exact TPIT runs 6.864/6.765/6.768/6.764 plus post-eval 6.862/6.775 count 1016/1016
+9b81cb1	6.779	discard	avoid q_fp8/scaled_index_weights allocations on short decode path; quick quality passed and exact counts 1016/1016, but runs 6.800/6.779/6.782 regressed vs kept 284f055 6.764
+7a82ceb	6.527	keep	skip sparse indexer Q projection and q/index_q fused output for pure decode when max seq_len<=topk, while retaining K cache update and all-token physical topk; quick quality passed; full GSM8K passed accuracy 0.952995 invalid 0 errors 0 latency 661s concurrency 32; exact TPIT runs 6.566/6.527/6.533 plus post-eval 6.528/6.542 count 1016/1016
+4da1b05	6.517	keep	trim qkv+wk fused projection to qkv+indexer-K only for short decode, avoiding unused indexer weight outputs; quick quality passed; exact TPIT runs 6.523/6.525/6.673-noise/6.526/6.517/6.539 count 1016/1016; full GSM8K covered previous same-guard semantic path at 7a82ceb
+0091b57	6.529	discard	tune short indexer K norm/RoPE/cache Triton kernel to num_warps=8; quick quality passed and exact counts 1016/1016, but runs 6.531/6.540/6.529 regressed vs kept 4da1b05 6.517
+3c12aac	6.517	discard	tune short indexer K norm/RoPE/cache Triton kernel to num_warps=2; quick quality passed and exact counts 1016/1016, but runs 6.560/6.518/6.517 gave no clear improvement vs kept 4da1b05 6.517
+3cc9ba0	6.736	discard	split short decode qkv onto min_latency path and compute indexer-K separately; quick quality passed and exact counts 1016/1016, but runs 6.737/6.740/6.736 regressed vs kept 4da1b05 6.517
+8dd1240	0.000	note	full GSM8K quality gate on current reverted source: bounded concurrency=32 wrapper passed accuracy 0.951478 invalid 0 errors 0 latency 657s; within expected stderr band and matches prior warmed current-tree score; earlier unbounded wrapper run was invalid with all API errors
+5fc744d	0.000	crash	tune short_context_topk_physical launch from 1024 to 256 threads; startup dummy run failed with short_context_topk_physical kernel invalid argument, reverted in 6412019
+dd7b3f7	6.513	discard	add short_context_topk_physical to avoid dummy logits allocation on short decode; quality passed and exact counts 1016/1016, but runs 6.513/6.593/6.560/6.517/6.639/6.713/6.516/6.520 did not clearly improve vs kept 4da1b05 6.517; reverted in bc472b9
+d84d8f6	6.521	discard	avoid first-layer residual clone by reusing embedding tensor as residual; quick quality passed and exact counts 1016/1016, but runs 6.521/6.563/6.522 did not improve vs kept 4da1b05 6.517; reverted in 3ae15dd
+b0a2e22	6.519	discard	use vocab-parallel local argmax fast path for flat DeepSeek plain greedy sampling to avoid full-logit gather; quick quality passed and exact counts 1016/1016, but runs 6.526/6.582/6.519 did not improve vs kept 4da1b05 6.517; reverted in 3509f6f
+7458bd1	6.523	discard	disable FlashInfer fused allreduce one-shot mode for SM103 TP4 to force two-shot path; quick quality passed and exact counts 1016/1016, but runs 6.687/6.523/6.528 regressed or noised vs kept 4da1b05 6.517 and one client stream emitted 128 chunks; reverted in b92d641
+0ae65ea	6.521	discard	tune short indexer K norm/RoPE/cache Triton kernel to num_stages=1; quick quality passed and exact counts 1016/1016, but runs 6.524/6.620/6.526/6.521/6.525 did not improve vs kept 4da1b05 6.517; reverted in 4f781c4
+ca12455	6.499	keep	route short decode fused qkv+indexer-K BF16 projection through extended dsv3 fused-A GEMM supporting 2240 output; quick quality passed and exact counts 1016/1016, runs 6.509/6.504/6.499/6.516/6.518 plus post-eval 6.517/6.508/6.505 vs kept 4da1b05 6.517; full GSM8K passed accuracy 0.952995 invalid 0 errors 0 latency 642s concurrency 32
+974fb80	6.453	keep	route q_b_proj 1536->6144 BF16 projection through extended dsv3 fused-A GEMM; quick quality passed and exact metric counts 1016/1016, runs 6.453/6.458/6.624-noise/6.504/6.453 with two coalesced client streams but valid Prometheus counts vs kept ca12455 6.499; full GSM8K passed accuracy 0.956027 invalid 0 errors 0 latency 653s concurrency 32
+96c6215	6.451	discard	tune fused-A GEMM token tile from 8 to 4 for num_tokens<=4 across qkv/qkv+indexer-K/q_b shapes; direct CUDA smoke and quick quality passed with exact counts 1016/1016, but runs 6.451/6.456/6.469/6.453/6.673-noise did not improve vs kept 974fb80 post-eval 6.446
+env-trtllm-pdl	6.311	keep	enable TRTLLM programmatic dependent launch for dsv3 fused-A GEMM via TRTLLM_ENABLE_PDL=1; quick quality passed and exact counts 1016/1016, runs 6.311/6.313/6.330/6.319/6.320 vs kept 974fb80 post-eval 6.446
+10c2c02	6.372	keep	enable PDL by default for dsv3 fused-A GEMM when TRTLLM_ENABLE_PDL is unset; direct CUDA smoke and quick quality passed, exact counts 1016/1016, runs 6.374/6.374/6.376/6.555-noise/6.372 improve vs kept 974fb80 no-env 6.446 but explicit env-trtllm-pdl remains faster at 6.311 likely via other TRTLLM kernels
+86152fe	6.305	keep	enable PDL by default for DSV3 router GEMM when TRTLLM_ENABLE_PDL is unset; direct CUDA router smoke and quick quality passed, exact counts 1016/1016, runs 6.308/6.316/6.305/6.328/6.314 with one coalesced client stream but valid Prometheus counts; matches explicit env-trtllm-pdl result
+5e7406e	6.300	discard	tune DSV3 router GEMM from 128 to 224 threads to reduce K iterations; direct router smoke and quick quality passed, exact counts 1016/1016, runs 6.355-noise/6.301/6.300/6.307/6.314 were not a clear win vs kept 86152fe 6.305 and changed router reduction order
+881d1d3	6.282	keep	tune dsv3 fused-A GEMM K tile from 256 to 512; direct CUDA smoke and quick quality passed; exact counts 1016/1016, runs 6.298/6.289/6.292/6.282/6.284 plus post-eval 6.285/6.290/6.324; full GSM8K passed accuracy 0.954511 invalid 0 errors 0 latency 685s concurrency 32
+worktree	0.000	crash	try dsv3 fused-A GEMM K tile 1024 globally; compile failed because q_b projection gemm_k=1536 is not divisible by tile_k=1024, restored source to kept 512 tile
+0bb0dc7	6.288	discard	specialize dsv3 fused-A GEMM K tile to 1024 for 7168-input qkv/indexer projections while keeping 512 for q_b; direct CUDA smoke and quick quality passed, exact counts 1016/1016, but runs 6.427-noise/6.330/6.291/6.288/6.326 did not improve vs kept 881d1d3 6.282
+worktree	0.000	crash	try dsv3 fused-A GEMM q_b-only K tile 768; compile failed because kernel static_assert only permits tile_k 128/256/512/1024, restored source to kept 512 tile
+db38ef0	6.344	discard	disable launch_with_pdl for flat fused allreduce+RMS call sites; quick quality passed and exact counts 1016/1016, but runs 6.351/6.353/6.346/6.549-noise/6.344 regressed vs kept 881d1d3 6.282
+483d805	6.286	discard	limit flat fused allreduce+RMS max_token_num threshold to 1 for decode-only target; quick quality passed and exact counts 1016/1016, but runs 6.286/6.299/6.292/6.326/6.317 did not improve vs kept 881d1d3 6.282
+d009913	6.995	discard	disable flat fused allreduce+RMS path entirely by setting threshold to 0; quick quality passed and exact counts 1016/1016, but separate allreduce plus fused RMS regressed hard with runs 7.009/6.995/6.999/7.014/6.998
+23d2a4b	0.000	crash	cap dsv3 fused-A GEMM pipeline stages at 4; direct CUDA smoke passed, but vLLM service disappeared during checkpoint load before startup completed, reverted
