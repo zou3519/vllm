@@ -1,3 +1,8 @@
+---
+name: make-flat-model
+description: Create and validate a flat vLLM model implementation with explicit tensor parameters, no nn.Module dispatch in the forward path, parity checks, and flat-vs-original benchmarking.
+---
+
 # flat_model
 
 **FULL_DECODE_ONLY test target** — flat-model benchmarking and optimization
@@ -6,27 +11,22 @@ definition itself should still preserve prefill/decode behavior unless the user
 explicitly asks for a decode-only specialization.
 
 Create a "flat" model definition for a vLLM-supported model. The forward
-pass becomes a single function with all parameters as plain tensors — no
-nn.Module dispatch. The result must produce identical output to the original.
+pass becomes a single explicit function over plain tensor parameters, with no
+`nn.Module` dispatch. The result must produce identical output to the original
+up to floating point tolerances.
 
-The flat model definition should preserve the original model's forward behavior
-for both prefill and decode, and it should not assume batch size 1 unless the
-target serve command or user explicitly narrows the scope. Some downstream
-auto-optimize workflows may benchmark or specialize for BS=1 decode, but that
-is an optimization target, not the default scope of this program.
+By default, preserve both prefill and decode behavior and do not assume BS=1.
+BS=1 decode is a common downstream optimization target, but only specialize for
+decode-only behavior when the user explicitly asks.
 
-The flat-model test and optimization workflows run with torch.compile disabled
-and full decode CUDA graphs enabled. Use `-cc.mode=none` together with
-`-cc.cudagraph_mode=full_decode_only` for flat-model serve commands unless the
-user explicitly asks for a different experiment. For BS=1 decode-only
-optimization runs, also use `--max-cudagraph-capture-size 1`; larger capture
-sizes only slow down setup for that target. Prefill and mixed prefill/decode
-behavior still need to be preserved by the flat model.
+Flat-model testing and optimization should use torch.compile disabled and full
+decode CUDA graphs enabled:
+- `-cc.mode=none`
+- `-cc.cudagraph_mode=full_decode_only`
 
-If the user's serve command includes throughput/capacity flags such as
-`--max-num-batched-tokens`, keep them fixed when comparing flat-vs-original or
-later optimization results. Changing those flags changes the target and can
-make off-target results look better.
+When comparing flat vs original or later optimization results, keep target
+serve flags fixed, especially throughput/capacity flags such as
+`--max-num-batched-tokens`.
 
 ## Setup
 
@@ -36,25 +36,40 @@ vllm serve <model_name> --arg1 ... --arg2 ...
 ```
 
 Assume the current shell is already inside the correct conda environment.
-That environment should already have `torch` and `vllm` installed. Do not
-create a virtualenv and do not install packages. Confirm the environment
-before doing any work:
+This workflow intentionally uses the active conda environment rather than the
+repo's normal `uv`/`.venv` workflow, because flat-model work must run against
+the serving environment selected by the user. That environment should already
+have `torch` and `vllm` installed. Do not create a virtualenv and do not
+install packages. Confirm the environment before doing any work:
 ```bash
 python -c "import torch, vllm; print(torch.__version__); print(vllm.__file__)"
 command -v vllm
 ```
-If either `torch` or `vllm` is missing, stop immediately and shout to the
-human that the conda environment is broken and needs to be fixed.
+If either `torch` or `vllm` is missing, stop immediately and report that the
+active conda environment is broken, including the command output.
 
 1. **Read the original model** in `vllm/model_executor/models/`. Understand
    the layer structure, parameter names, and forward pass.
+   Also inspect the Hugging Face reference implementation for the target model
+   when available. It is often written in native torch ops and can clarify math,
+   tensor shapes, and operation ordering. If you need the reference
+   implementation and it is not available locally, ask the human to download or
+   provide it. Use vLLM as the source of truth for serving integration, weight
+   loading, attention/KV-cache behavior, and the selected backend path.
 2. **Ensure weights are downloaded.** If not, ask the user to run:
    `huggingface-cli download <model_name>`
-3. **Create branch**: `git checkout -b rzou/flat_<model>`
+3. **Create branch**: `git checkout -b <user-prefix>/flat_<model>`
 
 ## Implementation
 
 Create two files in `vllm/model_executor/models/`:
+
+Registration checklist:
+- Define the new model class name, e.g. `Flat<Model>ForCausalLM`.
+- Use the same class name in `--hf-overrides '{"architectures": [...]}'`.
+- Add any required import or registry wiring so vLLM can discover the class.
+- Confirm the server imports the edited repo source, not an older installed
+  package; when needed, put the repo root first in `PYTHONPATH`.
 
 ### `flat_<model>.py` — Weight loading only
 
@@ -72,7 +87,8 @@ The backbone `forward()` calls `flat_forward()` from the forward file.
 Pull weights/constants out of nn.Modules inside `flat_forward()` or a small
 extraction helper and cache them on the model.
 
-Inline the whole hidden layer body in `transformer_layer()`. Do not add helper
+Inline the whole hidden layer body in `transformer_layer()`. This function
+should not call any helper Python functions. For example, do not add helper
 functions for RMSNorm, rotary embedding, activation, residual handling, or
 linear wrappers. The only non-Python call sites inside `transformer_layer()`
 should be:
@@ -81,6 +97,9 @@ should be:
 - `torch.nn.functional.*` ops
 - vLLM's attention op
 - the concrete CUDA ops used by vLLM's selected MoE backend
+
+Note that you should not include `torch.ops.*` calls because those
+are custom operators.
 
 Add short comments at the original module boundaries in the flat forward, e.g.
 embedding, each decoder layer, attention qkv/rotary/KV-cache/attention/o_proj,
@@ -165,6 +184,9 @@ LOOP FOREVER until the flat model produces correct output:
    - "What is 2+2?" → should answer 4
    - "Name the capital of France in one word" → Paris
    - "Write a recipe for chocolate chip cookies" → coherent, detailed recipe
+   Also run GSM8K as a later, slower correctness check once the flat model is
+   stable. Ask the human for the correct expected GSM8K number for the target
+   model/configuration, then compare the flat model against that number.
 
 3. **If server crashes**: the model runs in a subprocess — errors go to the
    log file, not your terminal. Read `tail -50 /tmp/flat_model_server.log`,
