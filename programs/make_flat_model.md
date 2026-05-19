@@ -151,6 +151,15 @@ LOOP FOREVER until the flat model produces correct output:
    `--hf-overrides '{"architectures": ["Flat<Model>ForCausalLM"]}'` to
    use your flat model. Redirect output to a log file and run in background.
    Wait for "Application startup complete" in the log.
+   If the agent is getting killed by OOM attribution while the vLLM server is
+   alive, start vLLM with `systemd-run --user --collect --unit=<name>` as a
+   transient user service and pass required env vars explicitly, especially
+   `PATH`, `HOME`, backend selector env vars, and offline/cache env vars. When
+   running from a console entry point, put the repo root first in `PYTHONPATH`
+   so the server imports the edited flat-model source instead of an older
+   installed package. Check `systemctl --user status <name>.service` and
+   confirm the server cgroup is under `user@<uid>.service/app.slice/`, then stop it with
+   `systemctl --user stop <name>.service`.
 
 2. **Test correctness** — send these prompts and check the answers:
    - "What is 2+2?" → should answer 4
@@ -215,6 +224,15 @@ LOOP FOREVER until the flat model produces correct output:
 - Expose pointwise/reduction work in the flat forward. The optimizer needs to
   see residual add, RMSNorm, quantization, RoPE, KV-cache write, top-k/routing
   prep, and final reduction boundaries to decide what to fuse.
+- Keep the flat forward shaped so later optimization can attempt aggressive
+  vertical and horizontal fusion across adjacent decode-only operations,
+  especially pointwise, reduction, quantization, RoPE, cache-write, routing, and
+  same-shape independent streams.
+- Do not make the flat structure hostile to tuning fused kernels: preserve clear
+  tensor shapes, strides, backend constants, and cached one-time layout
+  transforms so an optimizer can tune tile sizes, launch grids, branch
+  specialization, and cached buffers before abandoning a quality-preserving
+  fusion.
 - Do not assume custom scalar GEMV is a good MoE replacement. For quantized MoE,
   future custom kernels should preserve tensor-core/blockscaled math or build
   directly on a proven low-latency backend.

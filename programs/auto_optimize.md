@@ -68,6 +68,30 @@ complete" in the log. Before each start, check for and stop stale vLLM
 server/EngineCore processes from previous runs; after each run, stop the server
 and verify none remain.
 
+If the host OOM manager keeps killing the agent because vLLM memory is charged
+to the agent sandbox cgroup, launch vLLM as a separate user systemd service.
+Prefer a transient service over `--scope` when resource delegation fails:
+```bash
+systemd-run --user --collect --unit=vllm-auto-<hash> \
+  --working-directory="$PWD" \
+  --setenv=HOME="$HOME" \
+  --setenv=USER="$USER" \
+  --setenv=PATH="$PATH" \
+  --setenv=PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+  --setenv=VLLM_USE_FLASHINFER_MOE_FP4=1 \
+  /usr/bin/bash -lc 'exec vllm serve ... > /tmp/vllm-auto-<hash>.log 2>&1'
+```
+Pass every required environment variable explicitly, including `PATH` so JIT
+tools such as `ninja` are visible. Put the repo root first in `PYTHONPATH`
+when using a console entry point such as `.venv/bin/vllm`; otherwise the server
+can silently import an older installed package instead of the source tree being
+edited. In offline runs, pass the local checkpoint snapshot path and
+`--served-model-name <original-model-name>`, plus the required offline/cache
+env vars. Verify placement with
+`systemctl --user status vllm-auto-<hash>.service`; the cgroup should be under
+`user@<uid>.service/app.slice/`, not the agent sandbox slice. Stop it with
+`systemctl --user stop vllm-auto-<hash>.service`.
+
 Do not change target-defining serve flags while comparing optimizations. In
 particular, keep `--max-num-batched-tokens` exactly as specified by the target
 serve command, even if smaller values look faster. If you intentionally measure
@@ -197,15 +221,30 @@ LOOP FOREVER:
 6. **Measure TPIT** (3-5 runs).
 7. **Log** the result to results.tsv.
 8. If TPIT improved AND quality is preserved: **keep** the commit.
-9. If TPIT regressed OR quality degraded: **revert with `git revert`** so the
+9. If quality is preserved but TPIT regressed only modestly, decide whether the
+   fused kernel likely has tunable issues before discarding it. Try obvious
+   tuning passes such as tile sizes, launch grid shape, branch specialization,
+   vectorization, cached buffers, avoiding extra copies, and splitting one
+   over-branched fusion into two better-shaped fused kernels. Prefer tuning a
+   launch-reducing fusion when the regression looks like kernel shape overhead
+   rather than extra HBM traffic or worse math.
+10. If TPIT still regressed OR quality degraded: **revert with `git revert`** so the
    failed experiment remains visible in history. Avoid destructive reset unless
    the human explicitly asks for it.
-10. Go to 1.
+11. Go to 1.
 
 ## Optimization ideas (roughly ordered by impact)
 
 ### Kernel fusions
 Fuse adjacent small kernels into one launch. Low risk, no quality impact.
+Bias toward aggressive vertical and horizontal fusions: look across the whole
+decode layer for adjacent pointwise/reduction/cache/quantization work and for
+same-shape independent streams that can reasonably share one kernel launch.
+Prefer one larger guarded BS=1 decode kernel when it removes multiple launches,
+temporary tensors, or repeated HBM reads.
+If a larger fusion initially regresses but keeps quality, do not discard it
+automatically; first check whether the kernel just needs tuning or a less
+branchy decomposition that keeps most of the launch-count reduction.
 - LayerNorm + quantize → one Triton kernel
 - Activation + multiply + quantize → one Triton kernel
 - RoPE + KV cache write → one Triton kernel
