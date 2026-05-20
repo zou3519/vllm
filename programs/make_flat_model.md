@@ -95,11 +95,15 @@ should be:
 - native PyTorch operators (`torch.*`, Tensor methods such as `.to()`/`.view()`,
   indexing, and assignment)
 - `torch.nn.functional.*` ops
-- vLLM's attention op
-- the concrete CUDA ops used by vLLM's selected MoE backend
+- direct calls to checked-in kernels written for the flat model, such as
+  Triton/CuTe DSL/raw CUDA functions imported by name
 
-Note that you should not include `torch.ops.*` calls because those
-are custom operators.
+Do not include `torch.ops.*` calls in the flat forward. Those are custom
+operators, and calling them hides work behind dispatcher boundaries. If the
+original implementation only exposes a needed kernel through `torch.ops.*`,
+do not paper over that by calling it anyway; either inline an equivalent
+torch-native expression, call a checked-in kernel function directly, or record
+the missing direct kernel entry point as a blocker.
 
 Add short comments at the original module boundaries in the flat forward, e.g.
 embedding, each decoder layer, attention qkv/rotary/KV-cache/attention/o_proj,
@@ -107,17 +111,17 @@ MLP router/experts, and final norm.
 
 Specialize on the current target hardware and serve command when that removes
 branches from `transformer_layer()`. Prefer the original model's native PyTorch
-path for ordinary math, but keep attention and MoE on the vLLM CUDA path. If a
-linear layer's quant method is known for the target, inline that specialized
-linear path instead of preserving generic dispatch. The goal is correctness
-first.
+path for ordinary math. If a linear layer's quant method is known for the
+target, inline that specialized linear path instead of preserving generic
+dispatch. The goal is correctness first.
 
 Inline the selected MoE `forward_cuda` path too. Do not call
 `FusedMoE.forward_cuda()` or runner/custom-op wrappers when they only dispatch
 through Python to a concrete backend. Pull the backend's tensor weights,
 scales, biases, routing constants, and workspace/output allocation into
-`flat_forward()`'s cached params, then call the concrete CUDA ops directly in
-`transformer_layer()`. For example, for GPT-OSS on FlashInfer TRTLLM
+`flat_forward()`'s cached params, then call checked-in kernel functions directly
+or inline the torch-native math in `transformer_layer()`. For example, for
+GPT-OSS on FlashInfer TRTLLM
 MXFP4/MXFP8, inline the NoDPEP monolithic prepare, FlashInfer MXFP8 activation
 quantization, and `trtllm_fp4_block_scale_moe(...)` call. This exposes
 pointwise/reduction-shaped work such as activation quantization, scale
@@ -128,7 +132,8 @@ Do the same inspection for any method named `forward_cuda`: the name does not
 mean it is a single CUDA op. If it only validates, reshapes, allocates, selects
 backends, or calls another wrapper before reaching the real kernel, inline that
 body until `transformer_layer()` shows the concrete PyTorch ops and concrete
-CUDA/custom ops that actually run for the target serve command.
+checked-in kernel calls that actually run for the target serve command. Do not
+leave `torch.ops.*` as the boundary.
 
 Record backend selectors that are required for the chosen path. For example,
 GPT-OSS MXFP4/MXFP8 needs `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1` to select
@@ -143,10 +148,10 @@ dimensions to kernel-friendly sizes. These details matter for later BS=1
 custom kernels and prevent wrong half-split assumptions.
 
 Make the KV-cache write explicit in the flat definition. Prefer a torch-native
-cache update specialized to the active attention backend/cache layout/hardware,
-then call vLLM's attention op directly, ideally
-`torch.ops.vllm.unified_attention_with_output(...)`, instead of calling the
-`Attention` module wrapper.
+cache update specialized to the active attention backend/cache layout/hardware.
+Do not call the `Attention` module wrapper or a `torch.ops.*` attention wrapper;
+if the active backend does not expose a direct callable kernel, treat that as a
+flatness blocker and expose the missing boundary clearly.
 
 Do not torch.compile the flat model when testing or benchmarking. Turn it off
 via the serve command, e.g. add `-cc.mode=none` (CompilationMode.NONE) to the

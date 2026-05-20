@@ -168,7 +168,7 @@ broke precision — revert.
 - Inline backend wrappers further when they hide concrete pointwise,
   reduction, routing, quantization, or allocation work. For example, a method
   named `forward_cuda` may still be Python orchestration; inspect until you
-  see the real CUDA/custom ops.
+  see direct torch-native math or checked-in kernel functions.
 
 ## What you CANNOT do
 
@@ -248,6 +248,11 @@ branchy decomposition that keeps most of the launch-count reduction.
 - LayerNorm + quantize → one Triton kernel
 - Activation + multiply + quantize → one Triton kernel
 - RoPE + KV cache write → one Triton kernel
+
+Do not optimize by adding or preserving `torch.ops.*` calls in the flat forward.
+Those calls are custom-operator dispatcher boundaries and are not considered
+flat. If a useful kernel only exists behind `torch.ops.*`, add or expose a
+direct checked-in kernel function and call that instead.
 
 ### GEMV for large-K projections
 For BS=1, the GEMM is really a matrix-vector multiply. A custom GEMV
