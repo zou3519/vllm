@@ -650,6 +650,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "FlatDeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,

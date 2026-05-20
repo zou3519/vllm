@@ -26,9 +26,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    _per_token_group_quant_fp8,
-    get_fp8_min_max,
-    w8a8_triton_block_scaled_mm,
+    per_token_group_quant_fp8_packed_for_deepgemm,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.sparse_attn_indexer import kv_cache_as_quant_view
@@ -52,6 +50,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import triton
 from vllm.utils.deep_gemm import (
+    fp8_gemm_nt,
     fp8_einsum,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -147,6 +146,34 @@ def extract_all_layer_params(model: "FlatDeepseekV4Model") -> FlatDeepseekV4Para
         hc_head_scale=model.hc_head_scale,
         hc_head_base=model.hc_head_base,
     )
+
+
+def _deepgemm_fp8_linear(
+    x_2d: torch.Tensor,
+    linear: Any,
+    output_shape: tuple[int, ...],
+) -> torch.Tensor:
+    q_input, input_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+        x_2d,
+        group_size=128,
+        use_ue8m0=True,
+    )
+    weight_scale = getattr(linear, "weight_scale_inv", None)
+    if weight_scale is None:
+        weight_scale = linear.weight_scale
+    output = torch.empty(
+        (x_2d.shape[0], linear.weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=x_2d.device,
+    )
+    fp8_gemm_nt(
+        (q_input, input_scale),
+        (linear.weight, weight_scale),
+        output,
+        is_deep_gemm_e8m0_used=True,
+    )
+    return output.view(*output_shape)
+
 
 def transformer_layer(
     layer_params: FlatDeepseekV4LayerParams,
@@ -275,44 +302,11 @@ def transformer_layer(
         -1, hidden_states.shape[-1]
     )
     if fused_wqa_wkv.weight.dtype == torch.float8_e4m3fn:
-        fused_wqa_wkv_q = torch.empty_like(
-            fused_wqa_wkv_input, dtype=torch.float8_e4m3fn
-        )
-        fused_wqa_wkv_scale = torch.empty(
-            fused_wqa_wkv_input.shape[:-1]
-            + (fused_wqa_wkv_input.shape[-1] // 128,),
-            dtype=torch.float32,
-            device=fused_wqa_wkv_input.device,
-        )
-        fp8_min, fp8_max = get_fp8_min_max()
-        _per_token_group_quant_fp8[(fused_wqa_wkv_input.numel() // 128,)](
+        qr_kv = _deepgemm_fp8_linear(
             fused_wqa_wkv_input,
-            fused_wqa_wkv_q,
-            fused_wqa_wkv_scale,
-            128,
-            fused_wqa_wkv_input.shape[1],
-            fused_wqa_wkv_input.stride(0),
-            1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            use_ue8m0=True,
-            BLOCK=128,
-            num_warps=1,
-            num_stages=1,
+            fused_wqa_wkv,
+            (*hidden_states.shape[:-1], fused_wqa_wkv.weight.shape[0]),
         )
-        fused_wqa_wkv_weight_scale = getattr(
-            fused_wqa_wkv, "weight_scale_inv", None
-        )
-        if fused_wqa_wkv_weight_scale is None:
-            fused_wqa_wkv_weight_scale = fused_wqa_wkv.weight_scale
-        qr_kv = w8a8_triton_block_scaled_mm(
-            fused_wqa_wkv_q,
-            fused_wqa_wkv.weight,
-            fused_wqa_wkv_scale,
-            fused_wqa_wkv_weight_scale,
-            [128, 128],
-            output_dtype=torch.bfloat16,
-        ).view(*hidden_states.shape[:-1], fused_wqa_wkv.weight.shape[0])
     else:
         fused_wqa_wkv_bias = (
             None
@@ -362,39 +356,11 @@ def transformer_layer(
     wq_b = mla.wq_b
     wq_b_input = qr.contiguous().view(-1, qr.shape[-1])
     if wq_b.weight.dtype == torch.float8_e4m3fn:
-        wq_b_q = torch.empty_like(wq_b_input, dtype=torch.float8_e4m3fn)
-        wq_b_scale = torch.empty(
-            wq_b_input.shape[:-1] + (wq_b_input.shape[-1] // 128,),
-            dtype=torch.float32,
-            device=wq_b_input.device,
-        )
-        fp8_min, fp8_max = get_fp8_min_max()
-        _per_token_group_quant_fp8[(wq_b_input.numel() // 128,)](
+        q = _deepgemm_fp8_linear(
             wq_b_input,
-            wq_b_q,
-            wq_b_scale,
-            128,
-            wq_b_input.shape[1],
-            wq_b_input.stride(0),
-            1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            use_ue8m0=True,
-            BLOCK=128,
-            num_warps=1,
-            num_stages=1,
+            wq_b,
+            (*qr.shape[:-1], wq_b.weight.shape[0]),
         )
-        wq_b_weight_scale = getattr(wq_b, "weight_scale_inv", None)
-        if wq_b_weight_scale is None:
-            wq_b_weight_scale = wq_b.weight_scale
-        q = w8a8_triton_block_scaled_mm(
-            wq_b_q,
-            wq_b.weight,
-            wq_b_scale,
-            wq_b_weight_scale,
-            [128, 128],
-            output_dtype=torch.bfloat16,
-        ).view(*qr.shape[:-1], wq_b.weight.shape[0])
     else:
         wq_b_bias = None if (wq_b.tp_rank > 0 or wq_b.skip_bias_add) else wq_b.bias
         q = F.linear(qr, wq_b.weight, wq_b_bias)
@@ -523,44 +489,11 @@ def transformer_layer(
             indexer_wq_b = indexer.wq_b
             indexer_wq_b_input = qr.contiguous().view(-1, qr.shape[-1])
             if indexer_wq_b.weight.dtype == torch.float8_e4m3fn:
-                indexer_q_in = torch.empty_like(
-                    indexer_wq_b_input, dtype=torch.float8_e4m3fn
-                )
-                indexer_q_scale = torch.empty(
-                    indexer_wq_b_input.shape[:-1]
-                    + (indexer_wq_b_input.shape[-1] // 128,),
-                    dtype=torch.float32,
-                    device=indexer_wq_b_input.device,
-                )
-                fp8_min, fp8_max = get_fp8_min_max()
-                _per_token_group_quant_fp8[(indexer_wq_b_input.numel() // 128,)](
+                indexer_q = _deepgemm_fp8_linear(
                     indexer_wq_b_input,
-                    indexer_q_in,
-                    indexer_q_scale,
-                    128,
-                    indexer_wq_b_input.shape[1],
-                    indexer_wq_b_input.stride(0),
-                    1e-10,
-                    fp8_min=fp8_min,
-                    fp8_max=fp8_max,
-                    use_ue8m0=True,
-                    BLOCK=128,
-                    num_warps=1,
-                    num_stages=1,
+                    indexer_wq_b,
+                    (*qr.shape[:-1], indexer_wq_b.weight.shape[0]),
                 )
-                indexer_wq_b_weight_scale = getattr(
-                    indexer_wq_b, "weight_scale_inv", None
-                )
-                if indexer_wq_b_weight_scale is None:
-                    indexer_wq_b_weight_scale = indexer_wq_b.weight_scale
-                indexer_q = w8a8_triton_block_scaled_mm(
-                    indexer_q_in,
-                    indexer_wq_b.weight,
-                    indexer_q_scale,
-                    indexer_wq_b_weight_scale,
-                    [128, 128],
-                    output_dtype=torch.bfloat16,
-                ).view(*qr.shape[:-1], indexer_wq_b.weight.shape[0])
             else:
                 indexer_wq_b_bias = (
                     None
@@ -1013,39 +946,11 @@ def transformer_layer(
             wo_b_input = split_input[wo_b.tp_rank].contiguous()
         wo_b_bias = None if (wo_b.tp_rank > 0 or wo_b.skip_bias_add) else wo_b.bias
         wo_b_input_2d = wo_b_input.contiguous().view(-1, wo_b_input.shape[-1])
-        wo_b_q = torch.empty_like(wo_b_input_2d, dtype=torch.float8_e4m3fn)
-        wo_b_scale = torch.empty(
-            wo_b_input_2d.shape[:-1] + (wo_b_input_2d.shape[-1] // 128,),
-            dtype=torch.float32,
-            device=wo_b_input_2d.device,
-        )
-        fp8_min, fp8_max = get_fp8_min_max()
-        _per_token_group_quant_fp8[(wo_b_input_2d.numel() // 128,)](
+        hidden_states = _deepgemm_fp8_linear(
             wo_b_input_2d,
-            wo_b_q,
-            wo_b_scale,
-            128,
-            wo_b_input_2d.shape[1],
-            wo_b_input_2d.stride(0),
-            1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            use_ue8m0=True,
-            BLOCK=128,
-            num_warps=1,
-            num_stages=1,
+            wo_b,
+            (*wo_b_input.shape[:-1], wo_b.weight.shape[0]),
         )
-        wo_b_weight_scale = getattr(wo_b, "weight_scale_inv", None)
-        if wo_b_weight_scale is None:
-            wo_b_weight_scale = wo_b.weight_scale
-        hidden_states = w8a8_triton_block_scaled_mm(
-            wo_b_q,
-            wo_b.weight,
-            wo_b_scale,
-            wo_b_weight_scale,
-            [128, 128],
-            output_dtype=torch.bfloat16,
-        ).view(*wo_b_input.shape[:-1], wo_b.weight.shape[0])
         if wo_b_bias is not None:
             hidden_states = hidden_states + wo_b_bias
         if wo_b.reduce_results and wo_b.tp_size > 1:
@@ -1331,39 +1236,11 @@ def transformer_layer(
         wo_b_input = split_input[wo_b.tp_rank].contiguous()
     wo_b_bias = None if (wo_b.tp_rank > 0 or wo_b.skip_bias_add) else wo_b.bias
     wo_b_input_2d = wo_b_input.contiguous().view(-1, wo_b_input.shape[-1])
-    wo_b_q = torch.empty_like(wo_b_input_2d, dtype=torch.float8_e4m3fn)
-    wo_b_scale = torch.empty(
-        wo_b_input_2d.shape[:-1] + (wo_b_input_2d.shape[-1] // 128,),
-        dtype=torch.float32,
-        device=wo_b_input_2d.device,
-    )
-    fp8_min, fp8_max = get_fp8_min_max()
-    _per_token_group_quant_fp8[(wo_b_input_2d.numel() // 128,)](
+    hidden_states = _deepgemm_fp8_linear(
         wo_b_input_2d,
-        wo_b_q,
-        wo_b_scale,
-        128,
-        wo_b_input_2d.shape[1],
-        wo_b_input_2d.stride(0),
-        1e-10,
-        fp8_min=fp8_min,
-        fp8_max=fp8_max,
-        use_ue8m0=True,
-        BLOCK=128,
-        num_warps=1,
-        num_stages=1,
+        wo_b,
+        (*wo_b_input.shape[:-1], wo_b.weight.shape[0]),
     )
-    wo_b_weight_scale = getattr(wo_b, "weight_scale_inv", None)
-    if wo_b_weight_scale is None:
-        wo_b_weight_scale = wo_b.weight_scale
-    hidden_states = w8a8_triton_block_scaled_mm(
-        wo_b_q,
-        wo_b.weight,
-        wo_b_scale,
-        wo_b_weight_scale,
-        [128, 128],
-        output_dtype=torch.bfloat16,
-    ).view(*wo_b_input.shape[:-1], wo_b.weight.shape[0])
     if wo_b_bias is not None:
         hidden_states = hidden_states + wo_b_bias
     if wo_b.reduce_results and wo_b.tp_size > 1:
@@ -1542,39 +1419,11 @@ def transformer_layer(
         shared = layer_params.shared_experts
         gate_up_proj = shared.gate_up_proj
         gate_up_input_2d = normed_x.contiguous().view(-1, normed_x.shape[-1])
-        gate_up_q = torch.empty_like(gate_up_input_2d, dtype=torch.float8_e4m3fn)
-        gate_up_scale = torch.empty(
-            gate_up_input_2d.shape[:-1] + (gate_up_input_2d.shape[-1] // 128,),
-            dtype=torch.float32,
-            device=gate_up_input_2d.device,
-        )
-        fp8_min, fp8_max = get_fp8_min_max()
-        _per_token_group_quant_fp8[(gate_up_input_2d.numel() // 128,)](
+        gate_up = _deepgemm_fp8_linear(
             gate_up_input_2d,
-            gate_up_q,
-            gate_up_scale,
-            128,
-            gate_up_input_2d.shape[1],
-            gate_up_input_2d.stride(0),
-            1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            use_ue8m0=True,
-            BLOCK=128,
-            num_warps=1,
-            num_stages=1,
+            gate_up_proj,
+            (*normed_x.shape[:-1], gate_up_proj.weight.shape[0]),
         )
-        gate_up_weight_scale = getattr(gate_up_proj, "weight_scale_inv", None)
-        if gate_up_weight_scale is None:
-            gate_up_weight_scale = gate_up_proj.weight_scale
-        gate_up = w8a8_triton_block_scaled_mm(
-            gate_up_q,
-            gate_up_proj.weight,
-            gate_up_scale,
-            gate_up_weight_scale,
-            [128, 128],
-            output_dtype=torch.bfloat16,
-        ).view(*normed_x.shape[:-1], gate_up_proj.weight.shape[0])
         if gate_up_proj.bias is not None:
             gate_up = gate_up + gate_up_proj.bias
         d = gate_up.shape[-1] // 2
@@ -1596,39 +1445,11 @@ def transformer_layer(
             down_input = split_input[down.tp_rank].contiguous()
         down_bias = None if (down.tp_rank > 0 or down.skip_bias_add) else down.bias
         down_input_2d = down_input.contiguous().view(-1, down_input.shape[-1])
-        down_q = torch.empty_like(down_input_2d, dtype=torch.float8_e4m3fn)
-        down_scale = torch.empty(
-            down_input_2d.shape[:-1] + (down_input_2d.shape[-1] // 128,),
-            dtype=torch.float32,
-            device=down_input_2d.device,
-        )
-        fp8_min, fp8_max = get_fp8_min_max()
-        _per_token_group_quant_fp8[(down_input_2d.numel() // 128,)](
+        shared_output = _deepgemm_fp8_linear(
             down_input_2d,
-            down_q,
-            down_scale,
-            128,
-            down_input_2d.shape[1],
-            down_input_2d.stride(0),
-            1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            use_ue8m0=True,
-            BLOCK=128,
-            num_warps=1,
-            num_stages=1,
+            down,
+            (*down_input.shape[:-1], down.weight.shape[0]),
         )
-        down_weight_scale = getattr(down, "weight_scale_inv", None)
-        if down_weight_scale is None:
-            down_weight_scale = down.weight_scale
-        shared_output = w8a8_triton_block_scaled_mm(
-            down_q,
-            down.weight,
-            down_scale,
-            down_weight_scale,
-            [128, 128],
-            output_dtype=torch.bfloat16,
-        ).view(*down_input.shape[:-1], down.weight.shape[0])
         if down_bias is not None:
             shared_output = shared_output + down_bias
         if down.reduce_results and down.tp_size > 1:
