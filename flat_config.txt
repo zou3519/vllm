@@ -1,0 +1,9 @@
+serve_cmd: VLLM_USE_FLASHINFER_MOE_FP4=1 vllm serve nvidia/Kimi-K2.6-NVFP4 --trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --attention-config.use_trtllm_ragged_deepseek_prefill=True --tool-call-parser kimi_k2 --enable-auto-tool-choice --reasoning-parser kimi_k2 --mm-encoder-tp-mode data
+flat_serve_cmd: VLLM_USE_FLASHINFER_MOE_FP4=1 PYTHONPATH=/home/rzou/dev/stable0/vllm-stable0:$PYTHONPATH vllm serve nvidia/Kimi-K2.6-NVFP4 --trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --attention-config.use_trtllm_ragged_deepseek_prefill=True --tool-call-parser kimi_k2 --enable-auto-tool-choice --reasoning-parser kimi_k2 --mm-encoder-tp-mode data --hf-overrides '{"architectures":["FlatKimiK26NVFP4ForConditionalGeneration"]}' -cc.mode=none -cc.cudagraph_mode=full_decode_only
+forward_file: vllm/model_executor/models/flat_kimi_k26_nvfp4_forward.py
+model_file: vllm/model_executor/models/flat_kimi_k26_nvfp4.py
+original_tpit_ms: not measured
+flat_baseline_tpit_ms: not measured
+tpit_benchmark: not run; nvidia/Kimi-K2.6-NVFP4 weights are not present in the default Hugging Face cache on this machine
+flatness_status: target-path flat by static audit; transformer_layer contains the explicit RMSNorm, residual, MLA qkv/rotary/KV-cache/prefill/decode/o_proj, dense MLP, shared experts, router, NVFP4 activation quantization, and direct FlashInfer TRT-LLM FP4 MoE kernel call; no helper calls for those layer-body operations remain
+flatness_scope: nvidia/Kimi-K2.6-NVFP4 text path with MLA, unquantized attention/shared experts, FP8 KV cache, TRT-LLM ragged DeepSeek prefill, and FlashInfer TRT-LLM NVFP4 MoE on Blackwell; fail-closed guards reject sparse MLA, MHA, llama_4 scaling, non-NVFP4 MoE, non-SwiGLU MoE, or unexpected quantized dense linears
